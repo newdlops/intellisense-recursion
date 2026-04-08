@@ -1,0 +1,59 @@
+{
+  "name": "intellisense-recursion",
+  "displayName": "IntelliSense Recursion",
+  "description": "Navigate to type definitions from hover tooltips",
+  "version": "0.0.1",
+  "publisher": "lky",
+  "engines": {
+    "vscode": "^1.75.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onLanguage:python"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "intellisenseRecursion.goToType",
+        "title": "Go to Type Definition (from hover)"
+      },
+      {
+        "command": "intellisenseRecursion.peekTypes",
+        "title": "Peek Hover Types"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "intellisenseRecursion.peekTypes",
+        "key": "f12",
+        "mac": "f12",
+        "when": "editorHoverVisible"
+      },
+      {
+        "command": "intellisenseRecursion.peekTypes",
+        "key": "cmd+f12",
+        "mac": "cmd+f12",
+        "when": "editorHoverVisible"
+      }
+    ]
+  },
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "eslint src --ext ts"
+  },
+  "devDependencies": {
+    "@types/node": "^18.0.0",
+    "@types/vscode": "^1.75.0",
+    "@types/ws": "^8.18.1",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "vscode-languageclient": "^9.0.1",
+    "ws": "^8.20.0"
+  }
+}
