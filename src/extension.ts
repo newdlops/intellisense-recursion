@@ -323,41 +323,118 @@ function exploreElectronAccess() {
     }
   }
 
-  // Try 9: scan for renderer CDP endpoints
-  scanForRendererCDP();
+  // Try 9: inject into renderer via main process inspector
+  injectViaMainProcess();
 }
 
-// ---------- Renderer CDP connection ----------
+// ---------- Inject via main process inspector ----------
 
-async function scanForRendererCDP() {
-  const http = require('http');
-  const CDP_PORT = 9222; // Set via --remote-debugging-port in launch.json
-
-  log.info(`[cdp] Checking renderer CDP on port ${CDP_PORT}...`);
+async function injectViaMainProcess() {
+  log.info('[inject] Starting main process injection...');
 
   try {
-    // Get debuggable targets
-    const targetsJson = await httpGet(`http://127.0.0.1:${CDP_PORT}/json/list`);
-    const targets = JSON.parse(targetsJson);
-    log.info(`[cdp] Found ${targets.length} target(s)`);
-
-    for (const t of targets) {
-      log.info(`[cdp] Target: type=${t.type}, title="${t.title?.substring(0, 60)}", wsUrl=${t.webSocketDebuggerUrl?.substring(0, 80)}`);
+    // Step 1: Find main VS Code process and enable its inspector via SIGUSR1
+    const { execSync } = require('child_process');
+    const psOutput = execSync('ps aux | grep "[V]isual Studio Code.app/Contents/MacOS/Code$" || true', { encoding: 'utf8' });
+    const pidMatch = psOutput.match(/\S+\s+(\d+)/);
+    if (!pidMatch) {
+      log.warn('[inject] Could not find main VS Code process');
+      return;
     }
+    const mainPid = parseInt(pidMatch[1]);
+    log.info(`[inject] Main VS Code PID: ${mainPid}`);
 
-    // Find the page target (renderer)
-    const page = targets.find((t: any) => t.type === 'page') || targets[0];
-    if (!page?.webSocketDebuggerUrl) {
-      log.warn('[cdp] No page target with WebSocket URL found');
+    // Send SIGUSR1 to enable Node.js inspector on main process
+    process.kill(mainPid, 'SIGUSR1');
+    log.info('[inject] Sent SIGUSR1 to main process');
+
+    // Wait for inspector to start
+    await new Promise(r => setTimeout(r, 500));
+
+    // Step 2: Find the inspector WebSocket URL
+    const targetsJson = await httpGet('http://127.0.0.1:9229/json/list');
+    const targets = JSON.parse(targetsJson);
+    if (!targets.length || !targets[0].webSocketDebuggerUrl) {
+      log.warn('[inject] No WebSocket URL on main process inspector');
       return;
     }
 
-    log.info(`[cdp] Connecting to renderer: ${page.webSocketDebuggerUrl}`);
-    await injectHoverCmdClick(page.webSocketDebuggerUrl);
+    const wsUrl = targets[0].webSocketDebuggerUrl;
+    log.info(`[inject] Connecting to main process: ${wsUrl}`);
+
+    // Step 3: Connect via WebSocket and execute JS in main process
+    const WS = require('ws');
+    const ws = new WS(wsUrl);
+
+    await new Promise<void>((resolve, reject) => {
+      let msgId = 1;
+
+      ws.on('open', () => {
+        log.info('[inject] Connected to main process inspector');
+
+        // Use webContents.debugger with async/await to properly execute
+        const injectScript = `
+          (async function() {
+            var BW = require('electron').BrowserWindow;
+            var wins = BW.getAllWindows();
+            var results = [];
+            for (var i = 0; i < wins.length; i++) {
+              var w = wins[i];
+              var title = '';
+              try { title = w.getTitle().substring(0,40); } catch(e) {}
+              try {
+                w.webContents.debugger.attach('1.3');
+                var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', {
+                  expression: "document.title='IR INJECTED';document.body.style.background='red';setTimeout(function(){document.body.style.background=''},3000);'done'"
+                });
+                results.push('win' + w.id + '(' + title + '): ' + JSON.stringify(r.result).substring(0,60));
+                w.webContents.debugger.detach();
+              } catch(e) {
+                results.push('win' + w.id + '(' + title + '): ERR ' + e.message.substring(0,80));
+              }
+            }
+            return results.join(' | ');
+          })()
+        `.trim();
+
+        ws.send(JSON.stringify({
+          id: msgId++,
+          method: 'Runtime.evaluate',
+          params: {
+            expression: injectScript,
+            includeCommandLineAPI: true,
+            returnByValue: true,
+          }
+        }));
+      });
+
+      ws.on('message', (data: string) => {
+        try {
+          const resp = JSON.parse(data);
+          if (resp.id) {
+            if (resp.result?.result?.value) {
+              log.info(`[inject] Result: ${resp.result.result.value}`);
+            } else if (resp.result?.exceptionDetails) {
+              log.error(`[inject] Exception: ${JSON.stringify(resp.result.exceptionDetails).substring(0, 300)}`);
+            } else {
+              log.info(`[inject] Response: ${JSON.stringify(resp.result).substring(0, 200)}`);
+            }
+            ws.close();
+            resolve();
+          }
+        } catch {}
+      });
+
+      ws.on('error', (err: Error) => {
+        log.error(`[inject] WebSocket error: ${err}`);
+        reject(err);
+      });
+
+      setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 5000);
+    });
 
   } catch (err) {
-    log.info(`[cdp] Renderer CDP not available on port ${CDP_PORT}: ${err}`);
-    log.info('[cdp] To enable: add "--remote-debugging-port=9222" to launch.json args');
+    log.error(`[inject] Error: ${err}`);
   }
 }
 
@@ -437,6 +514,10 @@ function getHoverPatchScript(): string {
   if (window.__irHoverPatched) return 'already patched';
   window.__irHoverPatched = true;
 
+  // Visual test: brief red border flash to confirm injection
+  document.body.style.outline = '3px solid red';
+  setTimeout(function() { document.body.style.outline = ''; }, 2000);
+
   const observer = new MutationObserver((mutations) => {
     for (const m of mutations) {
       for (const node of m.addedNodes) {
@@ -514,22 +595,37 @@ function getHoverPatchScript(): string {
     e.preventDefault();
     e.stopPropagation();
 
-    // Send command to extension host via VS Code's command system
-    // The workbench exposes commandService on the window
-    try {
-      // Access VS Code's internal command service
-      const commandService = window._commandService ||
-        document.querySelector('.monaco-workbench')?.__proto__?.constructor?._services?.get?.('ICommandService');
+    console.log('[IR] Cmd+Click on type:', typeName);
 
-      if (commandService) {
-        commandService.executeCommand('intellisenseRecursion.goToType',
-          window.activeEditor?.getModel()?.uri?.toString() || '', typeName);
-      } else {
-        // Fallback: use keyboard shortcut simulation or other mechanism
-        console.log('[IR] goToType:', typeName);
+    // Find VS Code's command service through the workbench's service accessor
+    // VS Code stores services on the workbench container element
+    try {
+      // Method 1: VS Code stores a service accessor on the workbench DOM
+      const wb = document.querySelector('.monaco-workbench');
+      if (wb) {
+        // Walk up the prototype chain to find the instantiation service
+        const keys = Object.keys(wb);
+        console.log('[IR] workbench keys sample:', keys.slice(0, 5));
       }
+
+      // Method 2: Use the global require to access VS Code's internal modules
+      // In VS Code's renderer, AMD modules are available via require()
+      if (typeof require === 'function') {
+        try {
+          const commands = require('vs/platform/commands/common/commands');
+          if (commands && commands.CommandsRegistry) {
+            console.log('[IR] Found CommandsRegistry');
+          }
+        } catch(e2) { console.log('[IR] AMD require failed:', e2.message); }
+      }
+
+      // Method 3: Dispatch a custom event that our extension can listen to
+      // (won't work cross-process, but log for debugging)
+      window.postMessage({ type: 'ir-goto-type', typeName: typeName }, '*');
+      console.log('[IR] Posted message for type:', typeName);
+
     } catch(err) {
-      console.error('[IR] Error executing command:', err);
+      console.error('[IR] Error:', err);
     }
   }, true);
 
