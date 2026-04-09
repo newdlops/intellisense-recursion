@@ -10,6 +10,10 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('intellisenseRecursion.goToType', goToTypeHandler)
   );
 
+  startClickServer();
+  // Wait for server to start
+  await new Promise(r => setTimeout(r, 200));
+
   const sharedService = findSharedHoverService();
   if (sharedService) {
     patchSharedService(sharedService);
@@ -372,7 +376,11 @@ async function injectViaMainProcess() {
       ws.on('open', () => {
         log.info('[inject] Connected to main process inspector');
 
-        // Use webContents.debugger with async/await to properly execute
+        // Encode patch script as base64, embed in the inject script
+        const patchScript = getHoverPatchScript().replace('__IR_PORT__', String(irHttpPort));
+        const patchB64 = Buffer.from(patchScript).toString('base64');
+        const evalExpr = "eval(atob('" + patchB64 + "'))";
+
         const injectScript = `
           (async function() {
             var BW = require('electron').BrowserWindow;
@@ -385,7 +393,7 @@ async function injectViaMainProcess() {
               try {
                 w.webContents.debugger.attach('1.3');
                 var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', {
-                  expression: "document.title='IR INJECTED';document.body.style.background='red';setTimeout(function(){document.body.style.background=''},3000);'done'"
+                  expression: ${JSON.stringify(evalExpr)}
                 });
                 results.push('win' + w.id + '(' + title + '): ' + JSON.stringify(r.result).substring(0,60));
                 w.webContents.debugger.detach();
@@ -404,6 +412,7 @@ async function injectViaMainProcess() {
             expression: injectScript,
             includeCommandLineAPI: true,
             returnByValue: true,
+            awaitPromise: true,
           }
         }));
       });
@@ -412,12 +421,15 @@ async function injectViaMainProcess() {
         try {
           const resp = JSON.parse(data);
           if (resp.id) {
-            if (resp.result?.result?.value) {
-              log.info(`[inject] Result: ${resp.result.result.value}`);
-            } else if (resp.result?.exceptionDetails) {
-              log.error(`[inject] Exception: ${JSON.stringify(resp.result.exceptionDetails).substring(0, 300)}`);
+            const r = resp.result;
+            if (r?.exceptionDetails) {
+              log.error(`[inject] Exception: ${JSON.stringify(r.exceptionDetails).substring(0, 300)}`);
+            } else if (r?.result?.value !== undefined) {
+              log.info(`[inject] Result: ${String(r.result.value)}`);
+            } else if (r?.result) {
+              log.info(`[inject] Result type=${r.result.type} desc=${r.result.description?.substring(0, 100)}`);
             } else {
-              log.info(`[inject] Response: ${JSON.stringify(resp.result).substring(0, 200)}`);
+              log.info(`[inject] Raw: ${JSON.stringify(r).substring(0, 200)}`);
             }
             ws.close();
             resolve();
@@ -436,6 +448,35 @@ async function injectViaMainProcess() {
   } catch (err) {
     log.error(`[inject] Error: ${err}`);
   }
+}
+
+let irHttpPort = 0;
+
+function startClickServer() {
+  const http = require('http');
+  const server = http.createServer((req: any, res: any) => {
+    const url = new URL(req.url, 'http://127.0.0.1');
+    if (url.pathname === '/goto') {
+      const typeName = url.searchParams.get('type');
+      if (typeName) {
+        log.info(`[server] Received click: "${typeName}"`);
+        const editor = vscode.window.activeTextEditor;
+        if (editor) {
+          goToTypeHandler(editor.document.uri.toString(), typeName);
+        }
+      }
+      res.writeHead(200, { 'Access-Control-Allow-Origin': '*' });
+      res.end('ok');
+    } else {
+      res.writeHead(404);
+      res.end();
+    }
+  });
+
+  server.listen(0, '127.0.0.1', () => {
+    irHttpPort = server.address().port;
+    log.info(`[server] Click server listening on port ${irHttpPort}`);
+  });
 }
 
 function httpGet(url: string): Promise<string> {
@@ -506,132 +547,73 @@ async function injectHoverCmdClick(wsUrl: string) {
 
 /**
  * JavaScript to inject into VS Code's renderer process.
- * Adds Cmd+Click behavior to type names in hover code blocks.
+ * Uses setInterval polling to detect hover widgets and add Cmd+Click.
  */
 function getHoverPatchScript(): string {
-  return `
-(function() {
-  if (window.__irHoverPatched) return 'already patched';
-  window.__irHoverPatched = true;
+  return `(function(){
+if(window.__irHoverPatched)return 'already patched';
+window.__irHoverPatched=true;
 
-  // Visual test: brief red border flash to confirm injection
-  document.body.style.outline = '3px solid red';
-  setTimeout(function() { document.body.style.outline = ''; }, 2000);
+var style=document.createElement('style');
+style.textContent='.ir-type-link{cursor:default;transition:all 0.1s}body.ir-cmd-held .ir-type-link{text-decoration:underline !important;cursor:pointer !important;color:var(--vscode-textLink-foreground) !important}';
+document.head.appendChild(style);
 
-  const observer = new MutationObserver((mutations) => {
-    for (const m of mutations) {
-      for (const node of m.addedNodes) {
-        if (node.nodeType !== 1) continue;
-        // Look for hover widget
-        const hoverWidget = node.closest?.('.monaco-hover') || node.querySelector?.('.monaco-hover');
-        if (hoverWidget) {
-          patchHoverCodeBlocks(hoverWidget);
+document.addEventListener('keydown',function(e){if(e.metaKey||e.ctrlKey)document.body.classList.add('ir-cmd-held')});
+document.addEventListener('keyup',function(e){if(!e.metaKey&&!e.ctrlKey)document.body.classList.remove('ir-cmd-held')});
+document.addEventListener('click',function(e){
+  if(!(e.metaKey||e.ctrlKey))return;
+  var t=e.target;
+  if(!t||!t.classList||!t.classList.contains('ir-type-link'))return;
+  var typeName=t.getAttribute('data-type');
+  if(!typeName)return;
+  e.preventDefault();e.stopPropagation();
+  fetch('http://127.0.0.1:__IR_PORT__/goto?type='+encodeURIComponent(typeName)).catch(function(){});
+  document.title='IR:clicked:'+typeName;
+},true);
+
+setInterval(function(){
+  var hovers=document.querySelectorAll('.monaco-hover-content');
+  var all=document.querySelectorAll('.monaco-hover, .hover-widget, [class*=hover]');
+  if(all.length>0)document.title='IR:hovers='+hovers.length+' hoverish='+all.length;
+  for(var i=0;i<hovers.length;i++){
+    var h=hovers[i];
+    var codes=h.querySelectorAll('code');
+    if(codes.length>0)document.title='IR:codes='+codes.length+' html='+(codes[0]?codes[0].innerHTML.substring(0,80):'none');
+    for(var j=0;j<codes.length;j++){
+      var block=codes[j];
+      var text=block.textContent||'';
+      var re=/([A-Z][A-Za-z0-9_]+)/g;
+      var m,types=[];
+      while(m=re.exec(text)){if(types.indexOf(m[1])<0)types.push(m[1])}
+      if(!types.length)continue;
+      var walker=document.createTreeWalker(block,NodeFilter.SHOW_TEXT);
+      var node;
+      var replacements=[];
+      while(node=walker.nextNode()){
+        var nodeText=node.nodeValue||'';
+        for(var k=0;k<types.length;k++){
+          var idx=nodeText.indexOf(types[k]);
+          if(idx>=0)replacements.push({node:node,type:types[k],idx:idx});
         }
       }
+      for(var r2=replacements.length-1;r2>=0;r2--){
+        var rep=replacements[r2];
+        var range=document.createRange();
+        range.setStart(rep.node,rep.idx);
+        range.setEnd(rep.node,rep.idx+rep.type.length);
+        var span=document.createElement('span');
+        span.className='ir-type-link';
+        span.setAttribute('data-type',rep.type);
+        span.style.cssText='cursor:default';
+        try{range.surroundContents(span)}catch(e2){}
+      }
+      document.title='IR:patched '+types.join(',')+' reps='+replacements.length;
     }
-  });
-
-  observer.observe(document.body, { childList: true, subtree: true });
-
-  function patchHoverCodeBlocks(hover) {
-    const codeBlocks = hover.querySelectorAll('pre code, code');
-    codeBlocks.forEach(block => {
-      if (block.dataset.irPatched) return;
-      block.dataset.irPatched = 'true';
-
-      // Find PascalCase words (potential type names)
-      const text = block.textContent;
-      const typePattern = /\\b[A-Z][A-Za-z0-9_]+\\b/g;
-      let match;
-      const types = new Set();
-      while ((match = typePattern.exec(text)) !== null) {
-        types.add(match[0]);
-      }
-
-      if (types.size === 0) return;
-
-      // Replace type names with interactive spans
-      let html = block.innerHTML;
-      for (const typeName of types) {
-        const regex = new RegExp('\\\\b(' + typeName + ')\\\\b', 'g');
-        html = html.replace(regex, '<span class="ir-type-link" data-type="$1">$1</span>');
-      }
-      block.innerHTML = html;
-
-      // Style
-      const style = document.createElement('style');
-      style.textContent = \`
-        .ir-type-link {
-          cursor: default;
-          transition: text-decoration 0.1s;
-        }
-        body.ir-cmd-held .ir-type-link {
-          text-decoration: underline;
-          cursor: pointer;
-          color: var(--vscode-textLink-foreground);
-        }
-      \`;
-      hover.appendChild(style);
-    });
   }
+},200);
 
-  // Track Cmd key state
-  document.addEventListener('keydown', (e) => {
-    if (e.metaKey || e.ctrlKey) document.body.classList.add('ir-cmd-held');
-  });
-  document.addEventListener('keyup', (e) => {
-    if (!e.metaKey && !e.ctrlKey) document.body.classList.remove('ir-cmd-held');
-  });
-
-  // Handle Cmd+Click on type names
-  document.addEventListener('click', (e) => {
-    if (!(e.metaKey || e.ctrlKey)) return;
-    const target = e.target;
-    if (!target.classList?.contains('ir-type-link')) return;
-
-    const typeName = target.dataset.type;
-    if (!typeName) return;
-
-    e.preventDefault();
-    e.stopPropagation();
-
-    console.log('[IR] Cmd+Click on type:', typeName);
-
-    // Find VS Code's command service through the workbench's service accessor
-    // VS Code stores services on the workbench container element
-    try {
-      // Method 1: VS Code stores a service accessor on the workbench DOM
-      const wb = document.querySelector('.monaco-workbench');
-      if (wb) {
-        // Walk up the prototype chain to find the instantiation service
-        const keys = Object.keys(wb);
-        console.log('[IR] workbench keys sample:', keys.slice(0, 5));
-      }
-
-      // Method 2: Use the global require to access VS Code's internal modules
-      // In VS Code's renderer, AMD modules are available via require()
-      if (typeof require === 'function') {
-        try {
-          const commands = require('vs/platform/commands/common/commands');
-          if (commands && commands.CommandsRegistry) {
-            console.log('[IR] Found CommandsRegistry');
-          }
-        } catch(e2) { console.log('[IR] AMD require failed:', e2.message); }
-      }
-
-      // Method 3: Dispatch a custom event that our extension can listen to
-      // (won't work cross-process, but log for debugging)
-      window.postMessage({ type: 'ir-goto-type', typeName: typeName }, '*');
-      console.log('[IR] Posted message for type:', typeName);
-
-    } catch(err) {
-      console.error('[IR] Error:', err);
-    }
-  }, true);
-
-  return 'hover patch installed';
-})()
-  `.trim();
+return 'hover patch installed';
+})()`;
 }
 
 
