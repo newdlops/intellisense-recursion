@@ -629,15 +629,8 @@ document.addEventListener('click',function(e){
 
 // Poll ALL code blocks in any hover widget
 setInterval(function(){
-  var visible=document.querySelectorAll('.monaco-hover');
-  if(!visible.length)return;
-  var allPre=document.querySelectorAll('.monaco-hover pre');
-  var allCode=document.querySelectorAll('.monaco-hover code');
-  var allCodeAnywhere=document.querySelectorAll('code');
-  var hoverHtml=visible[0]?visible[0].innerHTML.substring(0,500):'';
-  var info='pre='+allPre.length+' code='+allCode.length+' allCode='+allCodeAnywhere.length+' html='+hoverHtml;
-  if(info!==window.__irLastInfo){window.__irLastInfo=info;if(typeof window.irGoToType==='function')window.irGoToType('LOG:'+info)}
-  var codes=allCodeAnywhere;
+  // Process ALL code elements across ALL hovers
+  var codes=document.querySelectorAll('.rendered-markdown code');
     for(var j=0;j<codes.length;j++){var block=codes[j];
       if(block.querySelector('.ir-type-link'))continue;
       var text=block.textContent||'';
