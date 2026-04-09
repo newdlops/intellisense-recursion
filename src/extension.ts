@@ -629,9 +629,9 @@ document.addEventListener('click',function(e){
 
 // Poll ALL code blocks in any hover widget
 setInterval(function(){
-  // Process ALL code elements across ALL hovers
-  var codes=document.querySelectorAll('.rendered-markdown code');
-    for(var j=0;j<codes.length;j++){var block=codes[j];
+  // Process ALL rendered-markdown containers (covers both <code> and tokenized <span>)
+  var containers=document.querySelectorAll('.rendered-markdown');
+    for(var j=0;j<containers.length;j++){var block=containers[j];
       if(block.querySelector('.ir-type-link'))continue;
       var text=block.textContent||'';
       var re=/([A-Z][A-Za-z0-9_]+)/g;
