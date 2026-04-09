@@ -167,9 +167,7 @@ function patchSharedService(service: any) {
 
   service.$provideHover = async function (handle: number, uri: any, position: any, context: any, token: any) {
     const result = await original.call(this, handle, uri, position, context, token);
-    if (!result || !result.contents || result.contents.length === 0) {
-      return result;
-    }
+    if (!result?.contents?.length) { return result; }
 
     // Extract types from code fences
     const types: string[] = [];
@@ -180,24 +178,22 @@ function patchSharedService(service: any) {
     }
 
     const uniqueTypes = [...new Set(types)];
-    if (uniqueTypes.length === 0) {
-      return result;
-    }
+    if (uniqueTypes.length === 0) { return result; }
 
     const docUriStr = uri?.scheme
       ? `${uri.scheme}://${uri.authority || ''}${uri.path}`
       : String(uri);
 
-    log.info(`[patch] Types: [${uniqueTypes.join(', ')}] — resolving definitions for preview`);
+    log.info(`[patch] Types: [${uniqueTypes.join(', ')}]`);
 
-    // Resolve definitions and read source preview for each type
+    // Add definition previews (original code fence stays untouched for renderer injection)
     try {
       const docUri = vscode.Uri.parse(docUriStr);
       const doc = await vscode.workspace.openTextDocument(docUri);
       const docText = doc.getText();
 
       const previews: string[] = [];
-      for (const typeName of uniqueTypes.slice(0, 3)) { // max 3 types
+      for (const typeName of uniqueTypes.slice(0, 3)) {
         const regex = new RegExp(`\\b${esc(typeName)}\\b`);
         const match = regex.exec(docText);
         if (!match) { continue; }
@@ -206,34 +202,32 @@ function patchSharedService(service: any) {
         const defs = await vscode.commands.executeCommand<vscode.Location[]>(
           'vscode.executeDefinitionProvider', docUri, pos
         );
-        if (!defs || defs.length === 0) { continue; }
+        if (!defs?.length) { continue; }
 
         const def = defs[0];
         const defDoc = await vscode.workspace.openTextDocument(def.uri);
         const startLine = def.range.start.line;
-        const endLine = Math.min(startLine + 10, defDoc.lineCount); // 10 lines preview
-        const previewLines: string[] = [];
-        for (let i = startLine; i < endLine; i++) {
-          previewLines.push(defDoc.lineAt(i).text);
-        }
-        const previewCode = previewLines.join('\n');
+        const endLine = Math.min(startLine + 15, defDoc.lineCount);
+        const lines: string[] = [];
+        for (let i = startLine; i < endLine; i++) { lines.push(defDoc.lineAt(i).text); }
+        const previewCode = lines.join('\n');
         const relPath = vscode.workspace.asRelativePath(def.uri);
         const lang = defDoc.languageId || 'python';
 
         previews.push(`\`${typeName}\` — *${relPath}:${startLine + 1}*\n\`\`\`${lang}\n${previewCode}\n\`\`\``);
-        log.info(`[patch] Preview for "${typeName}": ${relPath}:${startLine + 1}`);
+        log.info(`[patch] Preview: ${typeName} → ${relPath}:${startLine + 1}`);
       }
 
       if (previews.length > 0) {
-        // Append definition previews to hover contents
-        const previewContent = {
-          value: '---\n' + previews.join('\n\n---\n'),
-          isTrusted: true,
-        };
-        return {
-          ...result,
-          contents: [...result.contents, previewContent],
-        };
+        // Merge preview into the first content block's value (separate block gets ignored by VS Code)
+        const newContents = [...result.contents];
+        for (let ci = 0; ci < newContents.length; ci++) {
+          if (newContents[ci]?.value && typeof newContents[ci].value === 'string') {
+            newContents[ci] = { ...newContents[ci], value: newContents[ci].value + '\n\n---\n' + previews.join('\n\n---\n') };
+            break;
+          }
+        }
+        return { ...result, contents: newContents };
       }
     } catch (err) {
       log.error(`[patch] Preview error: ${err}`);
@@ -377,7 +371,8 @@ async function injectViaMainProcess() {
         log.info('[inject] Connected to main process inspector');
 
         // Encode patch script as base64, embed in the inject script
-        const patchScript = getHoverPatchScript().replace('__IR_PORT__', String(irHttpPort));
+        log.info(`[inject] HTTP server port: ${irHttpPort}`);
+        const patchScript = getHoverPatchScript().replace(/__IR_PORT__/g, String(irHttpPort));
         const patchB64 = Buffer.from(patchScript).toString('base64');
         const evalExpr = "eval(atob('" + patchB64 + "'))";
 
@@ -386,6 +381,7 @@ async function injectViaMainProcess() {
             var BW = require('electron').BrowserWindow;
             var wins = BW.getAllWindows();
             var results = [];
+            var devHost = null;
             for (var i = 0; i < wins.length; i++) {
               var w = wins[i];
               var title = '';
@@ -396,9 +392,27 @@ async function injectViaMainProcess() {
                   expression: ${JSON.stringify(evalExpr)}
                 });
                 results.push('win' + w.id + '(' + title + '): ' + JSON.stringify(r.result).substring(0,60));
-                w.webContents.debugger.detach();
+                if (title.indexOf('Extension Development Host') >= 0) {
+                  devHost = w;
+                } else {
+                  w.webContents.debugger.detach();
+                }
               } catch(e) {
                 results.push('win' + w.id + '(' + title + '): ERR ' + e.message.substring(0,80));
+              }
+            }
+            // Set up binding on dev host for click communication
+            if (devHost) {
+              try {
+                await devHost.webContents.debugger.sendCommand('Runtime.addBinding', { name: 'irGoToType' });
+                devHost.webContents.debugger.on('message', function(event, method, params) {
+                  if (method === 'Runtime.bindingCalled' && params.name === 'irGoToType') {
+                    global.__irClickedType = params.payload;
+                  }
+                });
+                results.push('binding:ok');
+              } catch(e) {
+                results.push('binding:ERR ' + e.message.substring(0,50));
               }
             }
             return results.join(' | ');
@@ -417,21 +431,22 @@ async function injectViaMainProcess() {
         }));
       });
 
+      let injectionDone = false;
       ws.on('message', (data: string) => {
         try {
           const resp = JSON.parse(data);
-          if (resp.id) {
+          if (resp.id && !injectionDone) {
+            injectionDone = true;
             const r = resp.result;
             if (r?.exceptionDetails) {
               log.error(`[inject] Exception: ${JSON.stringify(r.exceptionDetails).substring(0, 300)}`);
             } else if (r?.result?.value !== undefined) {
               log.info(`[inject] Result: ${String(r.result.value)}`);
-            } else if (r?.result) {
-              log.info(`[inject] Result type=${r.result.type} desc=${r.result.description?.substring(0, 100)}`);
             } else {
-              log.info(`[inject] Raw: ${JSON.stringify(r).substring(0, 200)}`);
+              log.info(`[inject] Result: ${JSON.stringify(r).substring(0, 200)}`);
             }
-            ws.close();
+            // Start lightweight polling for clicked types (check main process global)
+            startClickPolling(ws);
             resolve();
           }
         } catch {}
@@ -442,12 +457,49 @@ async function injectViaMainProcess() {
         reject(err);
       });
 
-      setTimeout(() => { ws.close(); reject(new Error('timeout')); }, 5000);
+      setTimeout(() => { resolve(); }, 10000); // keep WS open for click polling
     });
 
   } catch (err) {
     log.error(`[inject] Error: ${err}`);
   }
+}
+
+function startClickPolling(mainWs: any) {
+  log.info('[poll] Starting click polling (main process global only)');
+  let pollId = 10000;
+
+  setInterval(() => {
+    try {
+      mainWs.send(JSON.stringify({
+        id: pollId++,
+        method: 'Runtime.evaluate',
+        params: {
+          expression: 'var t=global.__irClickedType;global.__irClickedType=null;t',
+          includeCommandLineAPI: true,
+          returnByValue: true,
+        }
+      }));
+    } catch {}
+  }, 1000);
+
+  mainWs.on('message', (data: string) => {
+    try {
+      const resp = JSON.parse(data);
+      if (resp.id >= 10000 && resp.result?.result?.value) {
+        const val = String(resp.result.result.value);
+        if (val.startsWith('LOG:')) {
+          log.info(`[renderer] ${val}`);
+        } else {
+          log.info(`[poll] Clicked type: "${val}"`);
+          const editor = vscode.window.activeTextEditor;
+          if (editor) {
+            goToTypeHandler(editor.document.uri.toString(), val);
+          }
+        }
+      }
+    } catch {}
+  });
 }
 
 let irHttpPort = 0;
@@ -456,20 +508,23 @@ function startClickServer() {
   const http = require('http');
   const server = http.createServer((req: any, res: any) => {
     const url = new URL(req.url, 'http://127.0.0.1');
+    res.writeHead(200, { 'Access-Control-Allow-Origin': '*' });
     if (url.pathname === '/goto') {
       const typeName = url.searchParams.get('type');
       if (typeName) {
-        log.info(`[server] Received click: "${typeName}"`);
+        log.info(`[renderer] Click: "${typeName}"`);
         const editor = vscode.window.activeTextEditor;
         if (editor) {
           goToTypeHandler(editor.document.uri.toString(), typeName);
         }
       }
-      res.writeHead(200, { 'Access-Control-Allow-Origin': '*' });
+      res.end('ok');
+    } else if (url.pathname === '/log') {
+      const msg = url.searchParams.get('msg') || '';
+      log.info(`[renderer] ${msg}`);
       res.end('ok');
     } else {
-      res.writeHead(404);
-      res.end();
+      res.end('ok');
     }
   });
 
@@ -555,11 +610,13 @@ if(window.__irHoverPatched)return 'already patched';
 window.__irHoverPatched=true;
 
 var style=document.createElement('style');
-style.textContent='.ir-type-link{cursor:default;transition:all 0.1s}body.ir-cmd-held .ir-type-link{text-decoration:underline !important;cursor:pointer !important;color:var(--vscode-textLink-foreground) !important}';
+style.textContent='.ir-type-link{cursor:default}body.ir-cmd-held .ir-type-link:hover{text-decoration:underline !important;cursor:pointer !important;color:var(--vscode-textLink-foreground) !important}';
 document.head.appendChild(style);
 
 document.addEventListener('keydown',function(e){if(e.metaKey||e.ctrlKey)document.body.classList.add('ir-cmd-held')});
 document.addEventListener('keyup',function(e){if(!e.metaKey&&!e.ctrlKey)document.body.classList.remove('ir-cmd-held')});
+
+// Click handler: calls irGoToType binding (set up via Runtime.addBinding, bypasses CSP)
 document.addEventListener('click',function(e){
   if(!(e.metaKey||e.ctrlKey))return;
   var t=e.target;
@@ -567,49 +624,49 @@ document.addEventListener('click',function(e){
   var typeName=t.getAttribute('data-type');
   if(!typeName)return;
   e.preventDefault();e.stopPropagation();
-  fetch('http://127.0.0.1:__IR_PORT__/goto?type='+encodeURIComponent(typeName)).catch(function(){});
-  document.title='IR:clicked:'+typeName;
+  if(typeof window.irGoToType==='function'){window.irGoToType(typeName)}
 },true);
 
+// Poll ALL code blocks in any hover widget
 setInterval(function(){
-  var hovers=document.querySelectorAll('.monaco-hover-content');
-  var all=document.querySelectorAll('.monaco-hover, .hover-widget, [class*=hover]');
-  if(all.length>0)document.title='IR:hovers='+hovers.length+' hoverish='+all.length;
-  for(var i=0;i<hovers.length;i++){
-    var h=hovers[i];
-    var codes=h.querySelectorAll('code');
-    if(codes.length>0)document.title='IR:codes='+codes.length+' html='+(codes[0]?codes[0].innerHTML.substring(0,80):'none');
-    for(var j=0;j<codes.length;j++){
-      var block=codes[j];
+  var visible=document.querySelectorAll('.monaco-hover');
+  if(!visible.length)return;
+  var allPre=document.querySelectorAll('.monaco-hover pre');
+  var allCode=document.querySelectorAll('.monaco-hover code');
+  var allCodeAnywhere=document.querySelectorAll('code');
+  var hoverHtml=visible[0]?visible[0].innerHTML.substring(0,500):'';
+  var info='pre='+allPre.length+' code='+allCode.length+' allCode='+allCodeAnywhere.length+' html='+hoverHtml;
+  if(info!==window.__irLastInfo){window.__irLastInfo=info;if(typeof window.irGoToType==='function')window.irGoToType('LOG:'+info)}
+  var codes=allCodeAnywhere;
+    for(var j=0;j<codes.length;j++){var block=codes[j];
+      if(block.querySelector('.ir-type-link'))continue;
       var text=block.textContent||'';
       var re=/([A-Z][A-Za-z0-9_]+)/g;
       var m,types=[];
       while(m=re.exec(text)){if(types.indexOf(m[1])<0)types.push(m[1])}
       if(!types.length)continue;
       var walker=document.createTreeWalker(block,NodeFilter.SHOW_TEXT);
-      var node;
-      var replacements=[];
+      var node,replacements=[];
       while(node=walker.nextNode()){
-        var nodeText=node.nodeValue||'';
+        var nv=node.nodeValue||'';
         for(var k=0;k<types.length;k++){
-          var idx=nodeText.indexOf(types[k]);
+          var idx=nv.indexOf(types[k]);
           if(idx>=0)replacements.push({node:node,type:types[k],idx:idx});
         }
       }
       for(var r2=replacements.length-1;r2>=0;r2--){
         var rep=replacements[r2];
-        var range=document.createRange();
-        range.setStart(rep.node,rep.idx);
-        range.setEnd(rep.node,rep.idx+rep.type.length);
-        var span=document.createElement('span');
-        span.className='ir-type-link';
-        span.setAttribute('data-type',rep.type);
-        span.style.cssText='cursor:default';
-        try{range.surroundContents(span)}catch(e2){}
+        try{
+          var after=rep.node.splitText(rep.idx);
+          var rest=after.splitText(rep.type.length);
+          var span=document.createElement('span');
+          span.className='ir-type-link';
+          span.setAttribute('data-type',rep.type);
+          after.parentNode.insertBefore(span,after);
+          span.appendChild(after);
+        }catch(e2){}
       }
-      document.title='IR:patched '+types.join(',')+' reps='+replacements.length;
     }
-  }
 },200);
 
 return 'hover patch installed';
