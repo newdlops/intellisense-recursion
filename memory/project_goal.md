@@ -1,19 +1,43 @@
 ---
 name: project_goal
-description: IntelliSense Recursion extension - make hover type names navigable like IntelliJ, using V8 Inspector monkey-patch on $provideHover
+description: IntelliSense Recursion - hover Cmd+Click navigation via V8 Inspector + CDP renderer injection
 type: project
 ---
 
-VS Code extension that enables navigating to type definitions from hover tooltips, like IntelliJ IDEA.
+VS Code extension: Cmd+Click on type names in hover tooltips → navigate to definition.
 
-**Why:** VS Code hover code fences are static HTML — no Cmd+Click. IntelliJ allows clicking type names in quick docs to navigate.
+**Architecture (3 layers):**
 
-**How to apply:**
-- Core technique: V8 Inspector extracts shared `ExtHostLanguageFeatures` (variable `et`) from `registerHoverProvider` closure
-- Patch `$provideHover` on the shared instance to intercept ALL hover results (including Pylance)
-- Current approach: suppress hover, open Peek Editor instead (real Monaco Editor with Cmd+Click)
-- User wants peek to look/feel more like hover with descriptions, not just raw definition peek
+1. **$provideHover monkey-patch** (Extension Host, V8 Inspector)
+   - Extracts shared `ExtHostLanguageFeatures` (var `et`) from `registerHoverProvider` closure
+   - Patches `$provideHover` to intercept ALL hover results (Pylance included)
+   - Adds definition preview to hover content
 
-**Key files:**
-- `src/extension.ts` — all logic in one file
-- V8 Inspector closure extraction is fragile (minified var name `et` may change across VS Code versions)
+2. **Renderer DOM injection** (SIGUSR1 → Main Process CDP → Renderer debugger)
+   - SIGUSR1 to VS Code main process → inspector on port 9229
+   - WebSocket CDP → `BrowserWindow.webContents.debugger.sendCommand('Runtime.evaluate')`
+   - base64-encoded script injected into Extension Dev Host renderer
+   - setInterval polls `.rendered-markdown code` → splitText wrapping of PascalCase types
+   - CSS: `body.ir-cmd-held .ir-type-link:hover { underline }` (Cmd + mouse position)
+
+3. **Click communication** (Runtime.addBinding → global polling)
+   - `Runtime.addBinding({name: 'irGoToType'})` on renderer (CSP bypass)
+   - Click handler calls `window.irGoToType(typeName)`
+   - Main process `debugger.on('message')` sets `global.__irClickedType`
+   - Extension host polls `global.__irClickedType` every 1s via main process CDP
+
+**Working:**
+- Hover type signature: Cmd+hover underline + Cmd+Click → definition navigation
+- Runtime.addBinding CSP bypass
+- 1s polling (no hover interference)
+
+**Issues:**
+- Preview code fences appended to hover value don't render as `<code>` DOM elements
+- Possible cause: Pylance's `<!--moduleHash:-->` comment breaks markdown parsing
+- Renderer `.rendered-markdown code` selector sometimes finds 0 elements (window switching?)
+
+**Key fragilities:**
+- V8 Inspector var name `et` is minified, changes across VS Code versions
+- SIGUSR1 + port 9229 assumption
+- Main process PID detection via `ps aux` grep (macOS only)
+- Multiple Extension Dev Host windows can confuse injection target

@@ -3,6 +3,10 @@ import * as inspector from 'node:inspector';
 
 const log = vscode.window.createOutputChannel('IntelliSense Recursion', { log: true });
 
+// Last preview locations from $provideHover
+const lastPreviewLocations = new Map<string, vscode.Location>();
+let lastHoverDocUri: string = ''; // URI of the document where hover was triggered
+
 export async function activate(context: vscode.ExtensionContext) {
   log.info('=== Extension activating ===');
 
@@ -21,8 +25,11 @@ export async function activate(context: vscode.ExtensionContext) {
     log.warn('[patch] Shared service not found');
   }
 
-  // Explore main thread access via electron
+  // Inject renderer + re-inject periodically (handles new windows/workspaces)
   exploreElectronAccess();
+  setInterval(() => {
+    try { reinjectRenderer(); } catch {}
+  }, 10000);
 
   log.info('=== Extension activated ===');
 }
@@ -184,6 +191,7 @@ function patchSharedService(service: any) {
       ? `${uri.scheme}://${uri.authority || ''}${uri.path}`
       : String(uri);
 
+    lastHoverDocUri = docUriStr;
     log.info(`[patch] Types: [${uniqueTypes.join(', ')}]`);
 
     // Add definition previews (original code fence stays untouched for renderer injection)
@@ -216,6 +224,13 @@ function patchSharedService(service: any) {
 
         previews.push(`\`${typeName}\` — *${relPath}:${startLine + 1}*\n\`\`\`${lang}\n${previewCode}\n\`\`\``);
         log.info(`[patch] Preview: ${typeName} → ${relPath}:${startLine + 1}`);
+
+        // Store preview location for all identifiers in preview code
+        const previewLoc = new vscode.Location(def.uri, new vscode.Range(startLine, 0, endLine, 0));
+        lastPreviewLocations.set(typeName, previewLoc);
+        // Also store for identifiers within the preview code
+        const previewIds = previewCode.match(/([a-zA-Z_][a-zA-Z0-9_]{2,})/g) || [];
+        for (const pid of previewIds) { lastPreviewLocations.set(pid, previewLoc); }
       }
 
       if (previews.length > 0) {
@@ -465,6 +480,68 @@ async function injectViaMainProcess() {
   }
 }
 
+async function reinjectRenderer() {
+  try {
+    const targetsJson = await httpGet('http://127.0.0.1:9229/json/list');
+    const targets = JSON.parse(targetsJson);
+    if (!targets.length || !targets[0].webSocketDebuggerUrl) { return; }
+
+    const WS = require('ws');
+    const ws = new WS(targets[0].webSocketDebuggerUrl);
+
+    await new Promise<void>((resolve) => {
+      ws.on('open', () => {
+        const patchScript = getHoverPatchScript().replace(/__IR_PORT__/g, String(irHttpPort));
+        const patchB64 = Buffer.from(patchScript).toString('base64');
+        const evalExpr = "eval(atob('" + patchB64 + "'))";
+
+        // Inject into ALL windows (idempotent — __irHoverPatched prevents double-injection)
+        const injectScript = `
+          (async function() {
+            var BW = require('electron').BrowserWindow;
+            var wins = BW.getAllWindows();
+            var injected = 0;
+            for (var i = 0; i < wins.length; i++) {
+              try {
+                wins[i].webContents.debugger.attach('1.3');
+                var r = await wins[i].webContents.debugger.sendCommand('Runtime.evaluate', {
+                  expression: ${JSON.stringify(evalExpr)}
+                });
+                if (r.result && r.result.value === 'hover patch installed') injected++;
+                wins[i].webContents.debugger.detach();
+              } catch(e) {}
+            }
+            return 'reinject:' + injected;
+          })()
+        `.trim();
+
+        ws.send(JSON.stringify({
+          id: 1,
+          method: 'Runtime.evaluate',
+          params: { expression: injectScript, includeCommandLineAPI: true, returnByValue: true, awaitPromise: true }
+        }));
+      });
+
+      ws.on('message', (data: string) => {
+        try {
+          const resp = JSON.parse(data);
+          if (resp.id === 1) {
+            const val = resp.result?.result?.value;
+            if (val && !val.includes('reinject:0')) {
+              log.info(`[reinject] ${val}`);
+            }
+            ws.close();
+            resolve();
+          }
+        } catch {}
+      });
+
+      ws.on('error', () => { resolve(); });
+      setTimeout(() => { try { ws.close(); } catch {} resolve(); }, 3000);
+    });
+  } catch {}
+}
+
 function startClickPolling(mainWs: any) {
   log.info('[poll] Starting click polling (main process global only)');
   let pollId = 10000;
@@ -634,9 +711,10 @@ setInterval(function(){
     for(var j=0;j<containers.length;j++){var block=containers[j];
       if(block.querySelector('.ir-type-link'))continue;
       var text=block.textContent||'';
-      var re=/([A-Z][A-Za-z0-9_]+)/g;
+      var skip={'class':1,'def':1,'if':1,'else':1,'elif':1,'for':1,'while':1,'return':1,'import':1,'from':1,'as':1,'with':1,'try':1,'except':1,'finally':1,'raise':1,'pass':1,'break':1,'continue':1,'and':1,'or':1,'not':1,'is':1,'in':1,'lambda':1,'yield':1,'async':1,'await':1,'True':1,'False':1,'None':1,'self':1,'cls':1,'str':1,'int':1,'float':1,'bool':1,'list':1,'dict':1,'tuple':1,'set':1,'type':1,'bytes':1,'object':1,'property':1,'staticmethod':1,'classmethod':1,'super':1,'print':1,'len':1,'range':1,'isinstance':1,'hasattr':1,'getattr':1,'setattr':1,'var':1,'let':1,'const':1,'function':1,'new':1,'delete':1,'typeof':1,'instanceof':1,'void':1,'this':1,'switch':1,'case':1,'default':1,'throw':1,'catch':1,'export':1,'extends':1,'implements':1,'interface':1,'enum':1,'abstract':1,'static':1,'public':1,'private':1,'protected':1,'readonly':1,'override':1,'final':1,'native':1,'volatile':1,'synchronized':1,'transient':1,'null':1,'undefined':1,'true':1,'false':1,'number':1,'string':1,'boolean':1,'any':1,'never':1,'unknown':1,'symbol':1,'bigint':1,'sizeof':1,'struct':1,'union':1,'typedef':1,'extern':1,'register':1,'signed':1,'unsigned':1,'char':1,'short':1,'long':1,'double':1,'auto':1,'goto':1,'include':1,'define':1,'ifdef':1,'endif':1,'pragma':1,'namespace':1,'using':1,'template':1,'typename':1,'virtual':1,'inline':1,'constexpr':1,'nullptr':1,'the':1,'The':1,'that':1,'will':1,'are':1,'was':1,'has':1,'have':1,'can':1,'should':1,'may':1,'must':1,'been':1,'being':1,'does':1,'did':1,'its':1,'also':1,'than':1,'then':1,'when':1,'where':1,'which':1,'what':1,'how':1,'who':1,'all':1,'each':1,'every':1,'some':1,'any':1,'Returns':1,'Raises':1,'Args':1,'Parameters':1,'Note':1,'Example':1,'param':1,'return':1,'throws':1,'since':1,'see':1,'deprecated':1};
+      var re=/([a-zA-Z_][a-zA-Z0-9_]{2,})/g;
       var m,types=[];
-      while(m=re.exec(text)){if(types.indexOf(m[1])<0)types.push(m[1])}
+      while(m=re.exec(text)){if(types.indexOf(m[1])<0&&!skip[m[1]])types.push(m[1])}
       if(!types.length)continue;
       var walker=document.createTreeWalker(block,NodeFilter.SHOW_TEXT);
       var node,replacements=[];
@@ -701,24 +779,67 @@ function findTypeNames(text: string): string[] {
 
 // ---------- goToType ----------
 
-async function goToTypeHandler(docUriStr: string, typeName: string) {
-  log.info(`[goToType] "${typeName}"`);
+async function goToTypeHandler(docUriStr: string, identifier: string) {
+  log.info(`[goToType] "${identifier}"`);
+
+  // Collect candidate documents to search: preview doc first, then hover doc, then active editor
+  const searchDocs: string[] = [];
+  const previewLoc = lastPreviewLocations.get(identifier);
+  if (previewLoc?.uri) { searchDocs.push(previewLoc.uri.toString()); }
+  if (lastHoverDocUri) { searchDocs.push(lastHoverDocUri); }
+  if (docUriStr) { searchDocs.push(docUriStr); }
+  const editor = vscode.window.activeTextEditor;
+  if (editor) { searchDocs.push(editor.document.uri.toString()); }
+
+  // Deduplicate
+  const uniqueDocs = [...new Set(searchDocs)];
+
+  for (const docStr of uniqueDocs) {
+    try {
+      const uri = vscode.Uri.parse(docStr);
+      const doc = await vscode.workspace.openTextDocument(uri);
+      const m = new RegExp(`\\b${esc(identifier)}\\b`).exec(doc.getText());
+      if (!m) { continue; }
+
+      const pos = doc.positionAt(m.index);
+
+      // Use language server's definition provider — just like editor Cmd+Click
+      const defs = await vscode.commands.executeCommand<vscode.Location[]>(
+        'vscode.executeDefinitionProvider', uri, pos
+      );
+      if (defs?.length && defs[0]?.uri && defs[0]?.range) {
+        log.info(`[goToType] → ${defs[0].uri.fsPath}:${defs[0].range.start.line}`);
+        await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(defs[0].uri), {
+          selection: defs[0].range, preserveFocus: false
+        });
+        return;
+      }
+
+      // Definition provider returned nothing — open at the identifier's position in this doc
+      log.info(`[goToType] → ${uri.fsPath}:${pos.line} (identifier position)`);
+      await vscode.window.showTextDocument(doc, {
+        selection: new vscode.Range(pos, pos), preserveFocus: false
+      });
+      return;
+    } catch {}
+  }
+
+  // Last resort: workspace symbols
   try {
-    const uri = vscode.Uri.parse(docUriStr);
-    const doc = await vscode.workspace.openTextDocument(uri);
-    const m = new RegExp(`\\b${esc(typeName)}\\b`).exec(doc.getText());
-    if (!m) { vscode.window.showWarningMessage(`"${typeName}" not found.`); return; }
-    const pos = doc.positionAt(m.index);
-    const defs = await vscode.commands.executeCommand<vscode.Location[]>(
-      'vscode.executeDefinitionProvider', uri, pos
+    const symbols = await vscode.commands.executeCommand<vscode.SymbolInformation[]>(
+      'vscode.executeWorkspaceSymbolProvider', identifier
     );
-    if (!defs?.length) { vscode.window.showWarningMessage(`No definition for "${typeName}".`); return; }
-    const d = defs[0];
-    log.info(`[goToType] → ${d.uri.fsPath}:${d.range.start.line}`);
-    await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(d.uri), {
-      selection: d.range, preserveFocus: false
-    });
-  } catch (err) { log.error(`[goToType] ${err}`); }
+    const exact = symbols?.find(s => s.name === identifier);
+    if (exact?.location?.uri && exact.location.range) {
+      log.info(`[goToType] → ${exact.location.uri.fsPath}:${exact.location.range.start.line} (workspace)`);
+      await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(exact.location.uri), {
+        selection: exact.location.range, preserveFocus: false
+      });
+      return;
+    }
+  } catch {}
+
+  log.warn(`[goToType] "${identifier}" not found`);
 }
 
 function esc(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
