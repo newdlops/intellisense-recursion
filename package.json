@@ -1,13 +1,28 @@
 {
   "name": "intellisense-recursion",
   "displayName": "IntelliSense Recursion",
-  "description": "Navigate to type definitions from hover tooltips",
-  "version": "0.0.1",
-  "publisher": "lky",
+  "description": "Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA",
+  "version": "0.1.3",
+  "publisher": "newdlops",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/newdlops/intellisense-recursion"
+  },
+  "keywords": [
+    "hover",
+    "go to definition",
+    "type navigation",
+    "intellisense",
+    "cmd+click",
+    "intellij"
+  ],
+  "icon": "icon.png",
   "engines": {
     "vscode": "^1.75.0"
   },
   "categories": [
+    "Programming Languages",
     "Other"
   ],
   "activationEvents": [
@@ -32,42 +47,26 @@
     "commands": [
       {
         "command": "intellisenseRecursion.goToType",
-        "title": "Go to Type Definition (from hover)"
-      },
-      {
-        "command": "intellisenseRecursion.peekTypes",
-        "title": "Peek Hover Types"
-      }
-    ],
-    "keybindings": [
-      {
-        "command": "intellisenseRecursion.peekTypes",
-        "key": "f12",
-        "mac": "f12",
-        "when": "editorHoverVisible"
-      },
-      {
-        "command": "intellisenseRecursion.peekTypes",
-        "key": "cmd+f12",
-        "mac": "cmd+f12",
-        "when": "editorHoverVisible"
+        "title": "Go to Definition (from hover)"
       }
     ]
   },
   "scripts": {
-    "vscode:prepublish": "npm run compile",
+    "vscode:prepublish": "npm run bundle",
     "compile": "tsc -p ./",
+    "bundle": "tsc -p ./ && node esbuild.js",
     "watch": "tsc -watch -p ./",
-    "lint": "eslint src --ext ts"
+    "package": "npx @vscode/vsce package",
+    "deploy:local": "npm run package && code --install-extension intellisense-recursion-0.1.3.vsix --force && echo 'Installed! Restart VS Code to activate.'"
   },
   "devDependencies": {
     "@types/node": "^18.0.0",
     "@types/vscode": "^1.75.0",
     "@types/ws": "^8.18.1",
+    "esbuild": "^0.28.0",
     "typescript": "^5.0.0"
   },
   "dependencies": {
-    "vscode-languageclient": "^9.0.1",
     "ws": "^8.20.0"
   }
 }
