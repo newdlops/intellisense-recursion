@@ -8,6 +8,9 @@ const lastPreviewLocations = new Map<string, vscode.Location>();
 let lastHoverDocUri = '';
 let hoverRecursionDepth = 0;
 let reinjectTimer: ReturnType<typeof setInterval> | undefined;
+let lastClickId = '';
+let lastClickTime = 0;
+let goToTypeBusy = false;
 
 export async function activate(context: vscode.ExtensionContext) {
   log.info('Extension activating...');
@@ -362,7 +365,14 @@ function startClickListener(mainWs: any) {
       const resp = JSON.parse(data);
       if (resp.method === 'Runtime.bindingCalled' && resp.params?.name === 'irClickNotify') {
         const val = String(resp.params.payload);
-        if (val.startsWith('LOG:')) { log.info(`[renderer] ${val.slice(4)}`); return; }
+        if (val.startsWith('LOG:')) { return; }
+
+        // Debounce: ignore duplicate clicks for same identifier within 300ms
+        const now = Date.now();
+        if (val === lastClickId && now - lastClickTime < 300) { return; }
+        lastClickId = val;
+        lastClickTime = now;
+
         log.info(`Click: "${val}"`);
         const editor = vscode.window.activeTextEditor;
         if (editor) { goToTypeHandler(editor.document.uri.toString(), val); }
@@ -508,6 +518,12 @@ function findTypeNames(text: string): string[] {
 // ── Go to definition handler ──
 
 async function goToTypeHandler(docUriStr: string, identifier: string) {
+  if (goToTypeBusy) { log.info(`goToType: "${identifier}" skipped (busy)`); return; }
+  goToTypeBusy = true;
+  try { await goToTypeHandlerInner(docUriStr, identifier); } finally { goToTypeBusy = false; }
+}
+
+async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
   log.info(`goToType: "${identifier}"`);
   const t0 = Date.now();
   const regex = new RegExp(`\\b${esc(identifier)}\\b`);
