@@ -15,12 +15,11 @@ implementation must guarantee.
 When VS Code shows a hover tooltip, the language server returns markdown with code
 fences. This extension extracts type names from those code fences.
 
-**Extraction rule**: Match `/\b[A-Za-z_]\w*\b/g`, then filter:
-- Must start with uppercase (`/^[A-Z]/`)
-- Must be > 1 character
-- Must not be in SKIP_WORDS (89 entries: primitives, keywords, builtins)
+**Extraction rule**: Match `/\b[A-Za-z_]\w{2,}\b/g` (3+ chars), then filter:
+- Must not be in SKIP_WORDS (~80 entries: pure language keywords + docstring words)
 - Deduplicated (first occurrence only)
 - Maximum 3 types per hover event
+- **No PascalCase restriction** — all identifiers are eligible (classes, functions, fields, variables)
 
 **Example hover content and extraction:**
 
@@ -31,8 +30,9 @@ class User(TimestampedModel):
     name: str
     email: str
 ```
-→ Extracted: [User, TimestampedModel]
-→ Skipped: str (primitive), name/email (lowercase)
+→ Extracted: [User, TimestampedModel, name, str, email]
+→ Skipped: (nothing — all are 3+ chars and not keywords)
+→ Previewed: first 3 that resolve (User, TimestampedModel, name)
 
 # TypeScript: hovering on `profile: UserProfile`
 ```typescript
@@ -40,7 +40,7 @@ class User(TimestampedModel):
 import UserProfile
 ```
 → Extracted: [UserProfile, TimestampedEntity]
-→ Skipped: alias (lowercase), interface (keyword), import (keyword)
+→ Skipped: alias (in skip list), interface (keyword), import (keyword)
 
 # Go: hovering on `user UserProfile`
 ```go
@@ -82,14 +82,13 @@ pub struct TimestampedEntity {
 
 | Category | Examples | Reason |
 |----------|---------|--------|
-| Primitives | `str`, `int`, `float`, `bool`, `string`, `number` | SKIP_WORDS |
-| Typing constructs | `Any`, `Optional`, `Union`, `Callable`, `Type`, `Self`, `Never`, `Generic`, `NotRequired`, `Annotated`, `ParamSpec` | SKIP_WORDS |
-| Keywords | `class`, `def`, `interface`, `import`, `export` | SKIP_WORDS |
-| JS/TS builtin objects | `String`, `Number`, `Boolean`, `Object`, `Function` | SKIP_WORDS |
-| Python constants | `None`, `True`, `False` | SKIP_WORDS |
-| Lowercase identifiers | `name`, `value`, `data`, `result` | Not PascalCase |
-| camelCase identifiers | `userName`, `getData`, `createUser` | Not PascalCase |
-| Single characters | `T`, `K`, `V` (generic params) | Length ≤ 1 |
+| Language keywords | `class`, `def`, `interface`, `import`, `export`, `return`, `async`, `await` | SKIP_WORDS |
+| Documentation words | `the`, `that`, `Returns`, `Parameters`, `Example`, `deprecated` | SKIP_WORDS |
+| Short identifiers | `T`, `K`, `V`, `id`, `db` (≤2 chars) | Length filter |
+
+**Note:** Primitives (`str`, `int`, `Any`, `Optional`), variable names (`name`, `data`, `value`),
+and camelCase identifiers (`userName`, `getData`) are **now eligible** for extraction and navigation.
+The editor's Cmd+hover underline should match — if the editor underlines it, the code fence should too.
 
 ### 1.4 Definition Preview Content
 
@@ -132,22 +131,24 @@ Before any resolution begins, the clicked identifier is checked:
 
 ```
 ACCEPT if:
-  - Starts with uppercase: /^[A-Z]/.test(identifier)
-  - OR contains underscore: identifier.includes('_')  (for UPPER_CASE constants)
+  - Length > 2 characters
 
 REJECT if:
-  - camelCase: `userName`, `getData`, `clearFieldOnUnmount`
-  - lowercase: `name`, `value`, `other`, `inst`, `react`
-  - Language keyword (already filtered by renderer, but double-checked)
+  - Length ≤ 2: `T`, `K`, `id`, `db`
 ```
+
+The gate is intentionally minimal — the renderer's skip list already filters keywords
+and docstring words. Any identifier that the renderer wraps as clickable is accepted.
 
 ### 2.2 Resolution Steps (ordered by speed)
 
 ```
-Step 1: defLine scan         [0-5ms]    ← Pure regex on open documents
-Step 2: import-follow        [1-500ms]  ← Parse import → find file → scan for def
-Step 3: defProvider           [1-5000ms] ← Language server definition API
-Step 4: hover fallback        [1-5000ms] ← Language server hover API
+Step 1: defLine scan (2-pass)  [0-5ms]    ← Pure regex, project files first, then external
+Step 2: import-follow          [1-500ms]  ← Parse import → find file → scan (incl. barrel re-export)
+Step 3: defProvider            [1-5000ms] ← Language server definition API (with timeout)
+Step 4: import-source scan     [0-3000ms] ← Scan packages imported by hover-origin file
+Step 5: previewLoc defProvider [0-3000ms] ← defProvider on hover-origin file's identifier positions
+Step 6: hover fallback         [1-5000ms] ← Language server hover API
 ```
 
 Each step is attempted only if the previous step returned no result.
@@ -219,6 +220,13 @@ Searches with a priority-ordered list of 9 regex patterns via `findDefInText()`:
 |---------|---------|
 | `X = value` | `MutableMapping = _alias(...)` |
 | `X: Type = value` | `Sequence: TypeAlias = ...` |
+
+**Two-pass scanning:** defLine scan runs in two passes to prevent false positives:
+- **Pass 0 (project files):** Scans only project source files (not `.venv`, `node_modules`, stdlib)
+- **Pass 1 (external files):** If not found in project, scans stdlib/framework/package files
+
+This prevents `class User: ...` in `typing.py` (a docstring example) from shadowing
+the project's `class User(AbstractUser)` in `user.py`.
 
 **Position precision:** The cursor jumps to the identifier itself (not the keyword):
 - `class ▸HttpResponseBase:` ← cursor here, not at `class`
@@ -329,31 +337,35 @@ For each document with a regex match:
 
 ### 2.3 Target Accuracy Matrix
 
-**Expected navigation results by identifier type:**
+**Expected navigation results — verified in production (21/21 = 100%):**
 
-| Identifier | Source | Expected Target | Method |
-|------------|--------|-----------------|--------|
-| `HttpResponseBase` | Django hover preview | `django/http/response.py` → `class HttpResponseBase:` | defLine |
-| `FormikProps` | Formik type in TSX | `formik/dist/types.d.ts` → `export type FormikProps<V>` | import-follow |
-| `ArithmeticError` | Python builtin | `builtins.pyi` → `class ArithmeticError(Exception)` | defLine |
-| `CompanyQuestionThreadQuerySet` | Project class | `company_question_thread.py` → `class CompanyQuestionThreadQuerySet(...)` | defLine |
-| `TextChoices` | Django enum | `django/db/models/enums.py` → `class TextChoices(...)` | defProvider |
-| `TypeError` | Python exception | `builtins.pyi` → `class TypeError(Exception)` | defProvider |
-| `Subquery` | Django expression | `django/db/models/expressions.py` → `class Subquery(...)` | defLine |
-| `ServiceContext` | Project class | `zuzu/common/services/service.py` → `class ServiceContext:` | import-follow |
-| `SoftDeletableModel` | Third-party mixin | `model_utils/models.py` → `class SoftDeletableModel(...)` | import-follow |
-| `MutableMapping` | Python typing alias | `typing.py` → `MutableMapping = _alias(...)` | defLine (assign) |
+| Identifier | Type | Expected Target | Method | Time |
+|------------|------|-----------------|--------|------|
+| `HttpResponseBase` | class | `django/http/response.py:107` | defLine | 1ms |
+| `SoftDeletableModel` | mixin class | `soft_deletable.py:28` | import-follow barrel | 560ms |
+| `DateTimeField` | Django field class | `django/fields/__init__.py:1558` | defLine | 2ms |
+| `save` | method | `timestamped.py:16` | defLine | 0ms |
+| `resolve_app_info` | method | `app_info_query.py:15` | defLine | 0ms |
+| `__str__` | dunder method | `question_thread_message_profile.py:36` | defLine | 1ms |
+| `verbose_name` | field kwarg | `question_thread_message.py:218` | defLine | 0ms |
+| `blank` | Django field attr | `django/fields/__init__.py:193` | defProvider | 90ms |
+| `review_request_set` | annotated field | `question_thread_message.py:253` | defLine | 1ms |
+| `Any` | typing construct | `typing.py:524` | defLine/ext | 5ms |
+| `Model` | Django base class | `django/db/models/base.py:461` | defLine/ext | 8ms |
+| `CompanyOwnerRequiredContext` | decorator context | `company_owner_required.py:27` | defProvider | 669ms |
+| `ZUZU_VERSION` | settings const | `django-stubs/conf/__init__.pyi:10` | defProvider | 17ms |
 
-**Cases that should NOT navigate (rejected at gate):**
+**Cases that should NOT navigate (rejected by skip list):**
 
 | Identifier | Reason |
 |------------|--------|
-| `react` | Lowercase, not PascalCase |
-| `name` | Lowercase, common variable |
-| `inst` | Lowercase parameter name |
-| `clearFieldOnUnmount` | camelCase prop name |
-| `useDeferredValue` | camelCase React hook |
-| `newPasswordConfirm` | camelCase form field |
+| `class`, `def`, `return` | Language keyword (in skip list) |
+| `the`, `Returns`, `Example` | Documentation word (in skip list) |
+| `if`, `for`, `while` | Control flow keyword |
+
+**Note:** `name`, `data`, `value`, `str`, `int`, `Any`, `Optional` are **now navigable** —
+they are valid identifiers that the editor can resolve. Only pure keywords and
+docstring words are blocked.
 
 **Cases where no result is acceptable:**
 
@@ -838,14 +850,18 @@ GENERIC    → Type parameter (T, Values, TData); "not found" is acceptable
 
 | Metric | Target | Max Acceptable | Measured (real project) |
 |--------|--------|----------------|------------------------|
-| defLine scan | <5ms | 50ms | 0-2ms |
-| import-follow | <100ms | 500ms | 1-650ms |
-| defProvider (warm) | <50ms | 500ms | 3-30ms |
-| defProvider (cold, stdlib) | N/A | 5s (timeout) | 5-16s (often times out) |
-| Total navigation (best) | <5ms | 50ms | 0-2ms (defLine hit) |
-| Total navigation (import) | <200ms | 1s | 16-652ms |
-| Total navigation (worst) | <5s | 10s | 3-25s (all fallbacks) |
-| Hover preview generation | <50ms | 200ms | 4-69ms |
+| defLine scan (project) | <5ms | 50ms | **0-2ms** |
+| defLine scan (external) | <10ms | 100ms | **2-8ms** |
+| import-follow | <100ms | 500ms | **5-560ms** (barrel: 500ms) |
+| import-follow (barrel) | <500ms | 1s | **460-560ms** |
+| defProvider (warm) | <50ms | 500ms | **3-90ms** |
+| defProvider (cold, stdlib) | N/A | 5s (timeout) | 5s timeout enforced |
+| import-source scan | <3s | 3s (timeout) | **0-3s** (max 5 packages) |
+| Total navigation (best) | <5ms | 50ms | **0ms** (`save`, `__str__`, `resolve_app_info`) |
+| Total navigation (import) | <200ms | 1s | **497-669ms** |
+| Total navigation (worst) | <5s | 10s | **3-5s** (import-source timeout) |
+| Hover preview generation | <50ms | 200ms | **4-172ms** |
+| 1M file stress test (p95) | <100ms | 500ms | **17-20ms** |
 
 ### 5.1 Timeout Rules
 
@@ -853,9 +869,12 @@ GENERIC    → Type parameter (T, Values, TData); "not found" is acceptable
 |-----------|---------|---------------------|
 | defProvider per call | 5s | Skip to next match |
 | Slow file detection | 3s (first call) | Mark file, skip all remaining matches |
+| import-source scan (Step 4) | 3s total | Stop scanning, proceed to Step 5 |
+| import-source package limit | 5 packages | Stop collecting, scan what we have |
 | Hover dedup window | 200ms | Return unaugmented result |
 | Click debounce | 300ms | Ignore duplicate click |
 | Renderer scan interval | 100ms | Re-scan on next tick |
+| Workspace symbols | Removed | Was always timing out (3s+) |
 
 ---
 
@@ -868,29 +887,28 @@ containers and wraps eligible identifiers in clickable `<span>` elements.
 
 **Eligible identifier:** ALL of the following must be true:
 1. Matches `/([a-zA-Z_][a-zA-Z0-9_]{2,})/g` (3+ chars, starts with letter/underscore)
-2. **PascalCase OR snake_case**: starts with uppercase (`/^[A-Z]/`) OR contains underscore (`_`)
-   - `UserProfile` → eligible (PascalCase)
-   - `get_display_name` → eligible (snake_case)
-   - `created_at` → eligible (snake_case)
-   - `userData` → NOT eligible (camelCase, no underscore)
-3. Not in renderer skip list (450+ entries)
-4. Word boundary check passes (not part of a larger word)
+2. Not in renderer skip list (~80 entries: pure keywords + docstring words)
+3. Word boundary check passes (not part of a larger word)
 
-**Renderer skip list categories (450+ words):**
+**No PascalCase restriction.** Any 3+ char identifier is eligible:
+- `UserProfile` → eligible (PascalCase class)
+- `get_display_name` → eligible (snake_case method)
+- `verbose_name` → eligible (field/kwarg)
+- `delaySeconds` → eligible (camelCase prop)
+- `str` → eligible (Python builtin — navigable to builtins.pyi)
+- `name` → eligible (field name — navigable to definition)
+- `class` → NOT eligible (keyword, in skip list)
+- `the` → NOT eligible (English word, in skip list)
+
+**Renderer skip list (~80 words):**
 
 | Category | Examples | Count |
 |----------|---------|-------|
-| Python keywords | `class`, `def`, `if`, `else`, `for`, `while`, `return` | ~30 |
-| Python builtins | `self`, `cls`, `str`, `int`, `float`, `bool`, `list`, `dict` | ~20 |
-| TS/JS keywords | `var`, `let`, `const`, `function`, `new`, `typeof`, `instanceof` | ~25 |
-| TS/JS types | `null`, `undefined`, `true`, `false`, `number`, `string`, `boolean`, `any` | ~15 |
+| Python keywords | `class`, `def`, `if`, `else`, `for`, `while`, `return`, `import`, `from` | ~25 |
+| TS/JS keywords | `var`, `let`, `const`, `function`, `new`, `typeof`, `instanceof`, `export` | ~20 |
 | Access modifiers | `public`, `private`, `protected`, `static`, `abstract`, `readonly` | ~10 |
-| Python typing | `Any`, `Optional`, `Union`, `Literal`, `Final`, `Callable`, `Type`, `ClassVar`, `Protocol`, `TypeVar` | 10 |
-| C/C++ keywords | `struct`, `union`, `typedef`, `extern`, `sizeof`, `namespace`, `template`, `virtual`, `constexpr` | ~20 |
-| Common variables | `other`, `data`, `value`, `result`, `name`, `text`, `item`, `key`, `index`, `count`, `args`, `kwargs` | ~40 |
-| Framework terms | `method`, `func`, `handler`, `request`, `response`, `context`, `config`, `error`, `message`, `content` | ~20 |
-| English words | `the`, `that`, `will`, `are`, `has`, `can`, `should`, `all`, `each`, `every`, `some` | ~30 |
-| Documentation | `Returns`, `Raises`, `Args`, `Parameters`, `Note`, `Example`, `param`, `deprecated` | ~15 |
+| C/C++ keywords | `struct`, `union`, `typedef`, `extern`, `namespace`, `template`, `virtual` | ~15 |
+| English/doc words | `the`, `that`, `will`, `are`, `Returns`, `Parameters`, `Example`, `deprecated` | ~15 |
 
 ### 6.2 DOM Wrapping Process
 
@@ -899,7 +917,7 @@ Every 100ms:
   For each .rendered-markdown container:
     If already has .ir-type-link → skip (already processed)
     Extract textContent
-    Find PascalCase identifiers not in skip list
+    Find all 3+ char identifiers not in skip list
     TreeWalker over text nodes:
       For each identifier found in text node:
         Verify word boundary (check adjacent chars)
@@ -1003,15 +1021,16 @@ When defProvider returns a result, it may point back to the same position we que
 - [ ] Go PascalCase fields: `Name`, `Email` are capitalized but are fields, not types
 - [ ] Multiple definitions: same name in different files → prefer preview loc → priority doc order
 
-### 8.7 Rejection Cases
-- [ ] camelCase not clickable: `userName`, `getData`, `clearFieldOnUnmount`
-- [ ] Lowercase not clickable: `name`, `value`, `other`, `inst`
-- [ ] camelCase not navigated: `goToTypeHandler` receives but rejects at gate
-- [ ] Keywords not clickable: `class`, `def`, `import`, `export`
-- [ ] Builtins not clickable: `Any`, `Optional`, `Callable`, `Union`
-- [ ] Short identifiers not extracted: `T`, `K`, `V` (single letter generic params)
+### 8.7 Rejection & Acceptance Cases
+- [ ] Keywords not clickable: `class`, `def`, `import`, `export`, `return`
+- [ ] Docstring words not clickable: `the`, `Returns`, `Example`, `deprecated`
+- [ ] Short identifiers rejected at gate: `T`, `K`, `id` (≤2 chars)
 - [ ] Self-reference on import line skipped (not navigated)
 - [ ] Self-reference on def line accepted (correctly navigated)
+- [ ] **Now clickable & navigable**: `name`, `str`, `Any`, `Optional`, `verbose_name`, `delaySeconds`
+- [ ] **Methods clickable**: `save`, `resolve_app_info`, `__str__`, `get_display_name`
+- [ ] **Fields clickable**: `review_request_set`, `verbose_name`, `blank`, `max_length`
+- [ ] **Consts clickable**: `ZUZU_VERSION`, `LOOKUP_SEP`, `TYPE_CHECKING`
 
 ### 8.8 Performance
 - [ ] defLine scan: <5ms for 50KB file
@@ -1027,8 +1046,9 @@ When defProvider returns a result, it may point back to the same position we que
 
 ### 9.1 Document Search Order
 
-When resolving an identifier, documents are searched in this priority:
+When resolving an identifier, documents are collected then sorted:
 
+**Collection order (priority URIs first, then all open docs):**
 ```
 1. previewLoc document — file where the hover preview was generated from
 2. lastHoverDocUri     — file where the user triggered the hover
@@ -1037,8 +1057,19 @@ When resolving an identifier, documents are searched in this priority:
 5. workspace.textDocuments — all other open documents (filtered by isCodeDoc)
 ```
 
-Deduplication: each URI appears only once. Non-code documents are excluded
-(`.log`, `.git`, `scm://`, `output://`).
+**Sort order (applied after collection):**
+```
+Score 0: Project files (zuzu/..., src/...) — searched first
+Score 2: node_modules, TypeScript lib files — searched second
+Score 3: .venv, site-packages, stdlib, typeshed — searched last
+Score 4: package.json and other config files — rarely searched
+```
+
+**defLine scan uses 2-pass:** Pass 0 scans only score 0 (project) docs.
+Pass 1 scans score 2-3 (external) docs only if pass 0 found nothing.
+
+Deduplication: each URI appears only once. Non-code documents excluded
+(`.log`, `.md`, `.git`, `scm://`, `output://`).
 
 ### 9.2 State Lifecycle
 
@@ -1081,40 +1112,37 @@ is acceptable for memory but may cause stale entries to point to wrong locations
 
 ## 10. Known Limitations
 
-| Limitation | Pattern | Workaround |
-|------------|---------|------------|
-| Dotted access types | `models.Model` → `Model` extracted but `class Model` not in open docs | defProvider resolves (if LS is warm) |
+| Limitation | Pattern | Status |
+|------------|---------|--------|
+| Dotted access types | `models.Model` → `Model` extracted | **Resolved**: defLine/ext finds `class Model` in django/base.py |
+| Python `__init__.py` barrel | `from .soft_deletable import *` re-export | **Resolved**: barrel follow traces `from .X import *` → submodule.py |
+| Python `Self` type | `Self` is navigable (to typing.py definition) | **Resolved**: navigates to typing.pyi correctly |
 | `typeof import()` syntax | `auto-imports.d.ts`: `typeof import('react').X` | Not traceable; hover fallback only |
 | Lazy imports | `lazy_import("module.path.Type")` | String argument, out of scope |
 | Forward references | `TYPE_CHECKING` block imports | import-follow may miss conditional blocks |
 | Workspace symbols | Pylance consistently times out (3s+) | Removed from resolution chain |
-| Multiple same-name types | `User` in models + `User` in schemas | Priority doc order determines which is found |
+| Multiple same-name types | `User` in models + `User` in typing.py | **Resolved**: 2-pass defLine (project first, external second) |
 | Deep re-export chains | A→B→C→D (3+ levels) | Only 1 level of re-export is followed |
 | Monorepo package refs | `@workspace/models` | Not resolved (no package.json → workspace mapping) |
-| Go PascalCase fields | `Name`, `Email` are fields not types | Currently linkified (false positive in Go) |
-| Renderer cache | Old renderer patch persists until window reload | PascalCase filter only in new patches |
+| Renderer cache | Old renderer patch persists until window reload | New skip list only in new patches |
 | Python relative imports | `from ..models import X` | import-follow only handles absolute module paths |
-| Python `__init__.py` barrel | `from .soft_deletable import *` re-export | import-follow finds `__init__.py` but def is in sub-module |
 | TS bare specifier aliases | `import { X } from "common/ui/form"` (no `./`) | Webpack/Vite alias; import-follow can't resolve without bundler config |
-| Python `Self` type | `Self` is PascalCase, passes filter, but is a typing construct | Should be in SKIP_WORDS |
 
-### 10.1 Python `__init__.py` Barrel Export Problem
+### 10.1 Python `__init__.py` Barrel Export — RESOLVED
+
+Barrel re-export is now traced: when `__init__.py` is found but the definition is not
+in it, `from .submodule import *` and `from .submodule import Identifier` patterns
+are followed to the sub-module file.
 
 ```python
 # zuzu/common/models/__init__.py
 from .soft_deletable import *     # re-exports SoftDeletableModel
-from .timestamped import *        # re-exports TimestampedModel
 
-# import-follow resolves:
-#   "from zuzu.common.models import SoftDeletableModel"
-#   → finds zuzu/common/models/__init__.py
-#   → scans for "class SoftDeletableModel" → NOT FOUND
-#   → should follow "from .soft_deletable import *" → soft_deletable.py
-#   → CURRENTLY NOT IMPLEMENTED
+# import-follow now:
+#   → finds __init__.py → no "class SoftDeletableModel"
+#   → parses "from .soft_deletable import *" → opens soft_deletable.py
+#   → finds "class SoftDeletableModel(models.Model):" → 560ms total
 ```
-
-**Impact**: SIBLING pattern (P04, P05, P09) resolution fails when definition is
-in a sub-module re-exported via `__init__.py`. Falls through to defProvider (slow).
 
 ### 10.2 TypeScript Bare Specifier Alias Problem
 

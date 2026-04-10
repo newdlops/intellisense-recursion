@@ -866,22 +866,35 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
   log.info(`  docs: [${allDocs.map(d => vscode.workspace.asRelativePath(d.uri)).join(', ')}] (${ms()})`);
 
   // ── Step 1: Fast definition-line scan (no language server, pure regex) ──
-  // Look for lines like: class X, interface X, def X, struct X, X = _alias(...), etc.
+  // Two-pass: project files first, then stdlib/.venv/node_modules
   log.info(`  [1] defLine scan... (${ms()})`);
-  for (let di = 0; di < allDocs.length; di++) {
-    const doc = allDocs[di];
-    const relPath = vscode.workspace.asRelativePath(doc.uri);
-    const text = doc.getText();
+  const isExternalDoc = (d: vscode.TextDocument) => {
+    const p = d.uri.fsPath;
+    return p.includes('.venv') || p.includes('site-packages') || p.includes('.asdf')
+      || p.includes('typeshed') || p.includes('/lib/python') || p.includes('node_modules')
+      || p.includes('lib.dom.d.ts') || p.includes('lib.es');
+  };
+  for (let pass = 0; pass < 2; pass++) {
+    for (let di = 0; di < allDocs.length; di++) {
+      const doc = allDocs[di];
+      const external = isExternalDoc(doc);
+      if (pass === 0 && external) { continue; }  // pass 0: project only
+      if (pass === 1 && !external) { continue; }  // pass 1: external only
 
-    const pos = findDefInText(text, identifier, doc);
-    if (pos) {
-      const line = doc.lineAt(pos.line).text.trim();
-      log.info(`→ ${relPath}:${pos.line + 1} "${line.substring(0, 60)}" (defLine, ${ms()})`);
-      await vscode.window.showTextDocument(doc, {
-        selection: new vscode.Range(pos, pos), preserveFocus: false
-      });
-      return;
+      const relPath = vscode.workspace.asRelativePath(doc.uri);
+      const text = doc.getText();
+
+      const pos = findDefInText(text, identifier, doc);
+      if (pos) {
+        const line = doc.lineAt(pos.line).text.trim();
+        log.info(`→ ${relPath}:${pos.line + 1} "${line.substring(0, 60)}" (defLine${pass === 1 ? '/ext' : ''}, ${ms()})`);
+        await vscode.window.showTextDocument(doc, {
+          selection: new vscode.Range(pos, pos), preserveFocus: false
+        });
+        return;
+      }
     }
+    if (pass === 0) { log.info(`  [1] not in project docs, checking external... (${ms()})`); }
   }
 
   // ── Step 2: Import-follow (trace import statements to source file) ──
