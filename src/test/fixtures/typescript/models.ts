@@ -38,3 +38,26 @@ export class CompanyService {
     return company.owner;
   }
 }
+
+// §8.6 Edge Cases: Generics
+export interface Repository<T extends BaseEntity> {
+  findById(id: number): T | null;
+  findAll(): T[];
+}
+
+// §8.6 Edge Cases: Union & Intersection types
+export type AdminOrUser = UserProfile | CompanyInfo;
+export type AuditedEntity = BaseEntity & { auditLog: string[] };
+
+// §8.6 Edge Cases: Assignment-style type alias
+export type ProfileMap = Record<string, UserProfile>;
+
+// §8.6 Edge Cases: Deep inheritance (4 levels)
+export interface AuditedTimestampedEntity extends TimestampedEntity {
+  auditLog: string[];
+}
+
+export interface AdminProfile extends AuditedTimestampedEntity {
+  role: string;
+  permissions: string[];
+}

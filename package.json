@@ -2,7 +2,7 @@
   "name": "intellisense-recursion",
   "displayName": "IntelliSense Recursion",
   "description": "Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
@@ -70,6 +70,9 @@
     "test:dart": "TEST_FIXTURE=dart node ./out/test/runTest.js",
     "test:integration": "TEST_FIXTURE=typescript node ./out/test/integration/runTest.js",
     "test:integration:python": "TEST_FIXTURE=python node ./out/test/integration/runTest.js",
+    "perf:generate": "node ./out/test/perf/generate-fixtures.js",
+    "perf:run": "node ./out/test/perf/runTest.js",
+    "perf": "npm run compile && npm run perf:generate && npm run perf:run",
     "package": "npx @vscode/vsce package",
     "deploy:local": "npm run package && code --install-extension intellisense-recursion-0.1.3.vsix --force && echo 'Installed! Restart VS Code to activate.'"
   },

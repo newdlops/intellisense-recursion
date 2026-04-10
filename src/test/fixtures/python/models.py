@@ -40,3 +40,19 @@ class Stakeholder(BaseModel):
     company: Company
     user: User
     role: str
+
+
+# §8.6 Deep inheritance (4 levels: BaseModel → TimestampedModel → AuditModel → AdminUser)
+class AuditModel(TimestampedModel):
+    """Model with audit logging."""
+    audit_log: str
+
+
+class AdminUser(AuditModel):
+    """Admin user with role."""
+    role: str
+    permissions: str
+
+
+# §8.6 Assignment-style definition
+UserOrCompany = User
