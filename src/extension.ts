@@ -112,18 +112,31 @@ function patchSharedService(service: any) {
       const doc = await vscode.workspace.openTextDocument(docUri);
       const docText = doc.getText();
       const previews: string[] = [];
+      const resolvedDefDocs: { uri: vscode.Uri; doc: vscode.TextDocument }[] = [];
 
       for (const typeName of uniqueTypes.slice(0, 3)) {
         const regex = new RegExp(`\\b${esc(typeName)}\\b`);
-        const match = regex.exec(docText);
-        if (!match) { continue; }
-        const pos = doc.positionAt(match.index);
-        const defs = await vscode.commands.executeCommand<vscode.Location[]>('vscode.executeDefinitionProvider', docUri, pos);
+        let match = regex.exec(docText);
+        let matchUri = docUri;
+        let matchDoc = doc;
+
+        // If not found in hovered doc, search already-resolved definition files
+        if (!match) {
+          for (const rd of resolvedDefDocs) {
+            match = regex.exec(rd.doc.getText());
+            if (match) { matchUri = rd.uri; matchDoc = rd.doc; break; }
+          }
+          if (!match) { continue; }
+        }
+
+        const pos = matchDoc.positionAt(match.index);
+        const defs = await vscode.commands.executeCommand<vscode.Location[]>('vscode.executeDefinitionProvider', matchUri, pos);
         if (!defs?.length) { continue; }
 
         const def = defs[0];
         if (!def?.uri || !def?.range?.start) { continue; }
         const defDoc = await vscode.workspace.openTextDocument(def.uri);
+        resolvedDefDocs.push({ uri: def.uri, doc: defDoc });
         const startLine = def.range.start.line;
         const endLine = Math.min(startLine + 15, defDoc.lineCount);
         const lines: string[] = [];
@@ -300,7 +313,7 @@ async function reinjectRenderer() {
 }
 
 function startClickPolling(mainWs: any) {
-  log.info('[poll] Click polling started (1s interval on main process global)');
+  log.info('[poll] Click polling started (50ms interval on main process global)');
   let pollId = 10000;
   setInterval(() => {
     try {
@@ -310,7 +323,7 @@ function startClickPolling(mainWs: any) {
         params: { expression: 'var t=global.__irClickedType;global.__irClickedType=null;t', includeCommandLineAPI: true, returnByValue: true }
       }));
     } catch {}
-  }, 1000);
+  }, 50);
 
   mainWs.on('message', (data: string) => {
     try {
@@ -424,7 +437,7 @@ setInterval(function(){
     }
     if(replacements.length>0)irLog('renderer: total wrapped='+irWrapCount);
   }
-},200);
+},100);
 
 irLog('renderer: setInterval started');
 return 'hover patch installed';
@@ -465,38 +478,50 @@ function findTypeNames(text: string): string[] {
 async function goToTypeHandler(docUriStr: string, identifier: string) {
   log.info(`goToType: "${identifier}"`);
   const t0 = Date.now();
+  const regex = new RegExp(`\\b${esc(identifier)}\\b`);
 
-  const searchDocs: string[] = [];
+  // Build priority doc list, then append all open docs
+  const priorityUris: string[] = [];
   const previewLoc = lastPreviewLocations.get(identifier);
   if (previewLoc?.uri) {
-    searchDocs.push(previewLoc.uri.toString());
+    priorityUris.push(previewLoc.uri.toString());
     log.info(`  [1] preview doc: ${vscode.workspace.asRelativePath(previewLoc.uri)}`);
   } else {
     log.info(`  [1] no preview location (map size=${lastPreviewLocations.size})`);
   }
-  if (lastHoverDocUri) { searchDocs.push(lastHoverDocUri); }
-  if (docUriStr) { searchDocs.push(docUriStr); }
+  if (lastHoverDocUri) { priorityUris.push(lastHoverDocUri); }
+  if (docUriStr) { priorityUris.push(docUriStr); }
   const editor = vscode.window.activeTextEditor;
-  if (editor) { searchDocs.push(editor.document.uri.toString()); }
+  if (editor) { priorityUris.push(editor.document.uri.toString()); }
 
-  const uniqueDocs = [...new Set(searchDocs)];
-  log.info(`  [2] searching ${uniqueDocs.length} doc(s)`);
+  // Merge priority + all open docs (priority first, deduped)
+  const seen = new Set<string>();
+  const allDocs: vscode.TextDocument[] = [];
+  for (const uriStr of priorityUris) {
+    if (seen.has(uriStr)) { continue; }
+    seen.add(uriStr);
+    try { allDocs.push(await vscode.workspace.openTextDocument(vscode.Uri.parse(uriStr))); } catch {}
+  }
+  for (const openDoc of vscode.workspace.textDocuments) {
+    const uriStr = openDoc.uri.toString();
+    if (seen.has(uriStr)) { continue; }
+    seen.add(uriStr);
+    allDocs.push(openDoc);
+  }
 
-  for (let di = 0; di < uniqueDocs.length; di++) {
-    const docStr = uniqueDocs[di];
+  log.info(`  [2] searching ${allDocs.length} doc(s)`);
+
+  // Fast text scan → first hit gets definitionProvider call
+  for (let di = 0; di < allDocs.length; di++) {
+    const doc = allDocs[di];
     try {
-      const uri = vscode.Uri.parse(docStr);
-      const relPath = vscode.workspace.asRelativePath(uri);
-      const doc = await vscode.workspace.openTextDocument(uri);
-      const m = new RegExp(`\\b${esc(identifier)}\\b`).exec(doc.getText());
-      if (!m) {
-        log.info(`  [2.${di}] "${identifier}" not in ${relPath}`);
-        continue;
-      }
+      const m = regex.exec(doc.getText());
+      if (!m) { continue; }
 
       const pos = doc.positionAt(m.index);
+      const relPath = vscode.workspace.asRelativePath(doc.uri);
       log.info(`  [2.${di}] found in ${relPath}:${pos.line}, calling definitionProvider...`);
-      const defs = await vscode.commands.executeCommand<vscode.Location[]>('vscode.executeDefinitionProvider', uri, pos);
+      const defs = await vscode.commands.executeCommand<vscode.Location[]>('vscode.executeDefinitionProvider', doc.uri, pos);
       log.info(`  [2.${di}] definitionProvider returned ${defs?.length || 0} result(s) (${Date.now() - t0}ms)`);
 
       if (defs?.length && defs[0]?.uri && defs[0]?.range) {
