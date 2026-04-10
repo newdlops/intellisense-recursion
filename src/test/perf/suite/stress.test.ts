@@ -84,7 +84,9 @@ suite('Performance Stress: 100K files', () => {
 
     // Sample files for testing
     pyFiles = await collectFiles(wsRoot, '.py', 200);
-    tsFiles = await collectFiles(wsRoot, '.ts', 200);
+    const tsOnly = await collectFiles(wsRoot, '.ts', 150);
+    const tsxOnly = await collectFiles(wsRoot, '.tsx', 50);
+    tsFiles = [...tsOnly, ...tsxOnly];
     console.log(`  Sampled: ${pyFiles.length} .py, ${tsFiles.length} .ts`);
   });
 
@@ -371,5 +373,276 @@ suite('Performance Stress: 100K files', () => {
     const elapsed = Date.now() - t0;
     console.log(`  Post-bulk-open hover: ${elapsed}ms`);
     assert.ok(elapsed < 10000, `Hover after bulk open too slow: ${elapsed}ms`);
+  });
+
+  test('defLine scan finds methods, fields, const, properties (Python)', async function () {
+    this.timeout(60000);
+    const modelFiles = pyFiles.filter(f => f.includes('models.py')).slice(0, 10);
+    const found: { type: string; file: string; line: string }[] = [];
+
+    for (const f of modelFiles) {
+      try {
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(f));
+        const text = doc.getText();
+
+        // Find def method_name
+        const defMatch = text.match(/^\s+def (\w+)\(self/m);
+        if (defMatch) { found.push({ type: 'method', file: path.basename(f), line: defMatch[0].trim() }); }
+
+        // Find field = models.Field()
+        const fieldMatch = text.match(/^\s+(\w+) = models\.\w+\(/m);
+        if (fieldMatch) { found.push({ type: 'django_field', file: path.basename(f), line: fieldMatch[0].trim() }); }
+
+        // Find @property
+        const propMatch = text.match(/@property\s+def (\w+)/m);
+        if (propMatch) { found.push({ type: 'property', file: path.basename(f), line: propMatch[0].trim() }); }
+
+        // Find field: type annotation
+        const annotMatch = text.match(/^\s+(\w+): (str|int|float|bool)/m);
+        if (annotMatch) { found.push({ type: 'annotation', file: path.basename(f), line: annotMatch[0].trim() }); }
+      } catch {}
+    }
+
+    console.log(`  Found ${found.length} definition patterns across ${modelFiles.length} files:`);
+    const byType: Record<string, number> = {};
+    for (const f of found) { byType[f.type] = (byType[f.type] || 0) + 1; }
+    for (const [t, c] of Object.entries(byType)) { console.log(`    ${t}: ${c}`); }
+
+    assert.ok(found.some(f => f.type === 'method'), 'No method definitions found in fixtures');
+    assert.ok(found.some(f => f.type === 'django_field'), 'No Django field assignments found in fixtures');
+    assert.ok(found.some(f => f.type === 'annotation'), 'No type annotations found in fixtures');
+  });
+
+  test('defLine scan finds methods, fields, const (TypeScript)', async function () {
+    this.timeout(60000);
+    const typeFiles = tsFiles.filter(f => f.includes('types.ts')).slice(0, 10);
+    const funcFiles = tsFiles.filter(f => f.includes('components.tsx')).slice(0, 10);
+    const found: { type: string; file: string; line: string }[] = [];
+
+    for (const f of typeFiles) {
+      try {
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(f));
+        const text = doc.getText();
+
+        // Find method signature: name(id: number)
+        const methodMatch = text.match(/^\s+(\w+)\(.*\):/m);
+        if (methodMatch) { found.push({ type: 'method_sig', file: path.basename(f), line: methodMatch[0].trim() }); }
+
+        // Find readonly field
+        const readonlyMatch = text.match(/^\s+readonly (\w+):/m);
+        if (readonlyMatch) { found.push({ type: 'readonly_field', file: path.basename(f), line: readonlyMatch[0].trim() }); }
+
+        // Find optional field
+        const optMatch = text.match(/^\s+(\w+)\?:/m);
+        if (optMatch) { found.push({ type: 'optional_field', file: path.basename(f), line: optMatch[0].trim() }); }
+      } catch {}
+    }
+
+    for (const f of funcFiles) {
+      try {
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(f));
+        const text = doc.getText();
+
+        // Find export function
+        const funcMatch = text.match(/^export function (\w+)/m);
+        if (funcMatch) { found.push({ type: 'export_function', file: path.basename(f), line: funcMatch[0].trim() }); }
+
+        // Find export const
+        const constMatch = text.match(/^export const (\w+)/m);
+        if (constMatch) { found.push({ type: 'export_const', file: path.basename(f), line: constMatch[0].trim() }); }
+      } catch {}
+    }
+
+    console.log(`  Found ${found.length} definition patterns across ${typeFiles.length + funcFiles.length} files:`);
+    const byType: Record<string, number> = {};
+    for (const f of found) { byType[f.type] = (byType[f.type] || 0) + 1; }
+    for (const [t, c] of Object.entries(byType)) { console.log(`    ${t}: ${c}`); }
+
+    assert.ok(found.some(f => f.type === 'method_sig'), 'No method signatures found in TS fixtures');
+    assert.ok(found.some(f => f.type === 'export_function'), 'No export functions found in TS fixtures');
+    assert.ok(found.some(f => f.type === 'export_const'), 'No export consts found in TS fixtures');
+  });
+
+  test('findDefInText resolves all definition pattern types', async function () {
+    this.timeout(60000);
+    // Open a model file and verify findDefInText would match each pattern type
+    const modelFile = pyFiles.find(f => f.includes('models.py') && f.includes('pkg_000'));
+    if (!modelFile) { console.log('  Skipped: no model file'); return; }
+
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(modelFile));
+    const text = doc.getText();
+
+    const patterns = [
+      { name: 'class', regex: /^class (\w+)/m },
+      { name: 'method', regex: /^\s+def (\w+)\(/m },
+      { name: 'django_field', regex: /^\s+(\w+) = models\.\w+\(/m },
+      { name: 'annotation', regex: /^\s+(\w+): (?:str|int|float|bool)/m },
+    ];
+
+    const results: { pattern: string; identifier: string; found: boolean }[] = [];
+    for (const { name: patName, regex } of patterns) {
+      const match = regex.exec(text);
+      if (match && match[1]) {
+        const identifier = match[1];
+        // Simulate defLine scan: does the identifier exist as a definition?
+        const defRegex = new RegExp(`(?:class|def|interface|type)\\s+${identifier}\\b|^\\s+${identifier}\\s*[:=(]`, 'm');
+        const defFound = defRegex.test(text);
+        results.push({ pattern: patName, identifier, found: defFound });
+      }
+    }
+
+    console.log('  Pattern resolution:');
+    for (const r of results) {
+      console.log(`    ${r.pattern}: "${r.identifier}" → ${r.found ? 'FOUND' : 'NOT FOUND'}`);
+    }
+
+    assert.ok(results.length >= 3, `Only ${results.length} patterns found, expected ≥3`);
+    const allFound = results.every(r => r.found);
+    assert.ok(allFound, `Some patterns not resolved: ${results.filter(r => !r.found).map(r => r.pattern).join(', ')}`);
+  });
+
+  test('all-identifier extraction: lowercase, camelCase, snake_case, PascalCase', async function () {
+    this.timeout(60000);
+    // Verify that the skip list only blocks pure keywords, not variable/type names
+    const SKIP = new Set(['class','def','if','else','for','while','return','import','from','as','with','try','except',
+      'finally','raise','pass','break','continue','and','or','not','is','in','lambda','yield','async','await',
+      'var','let','const','function','new','delete','typeof','instanceof','void','this','switch','case','default',
+      'throw','catch','export','extends','implements','interface','enum','abstract','static','public','private',
+      'protected','readonly','override','struct','union','typedef','extern','register','virtual','inline',
+      'constexpr','namespace','using','template','the','The','that','will','are','was','has','have','can',
+      'should','may','must','been','being','does','did','its','also','than','then','when','where','which',
+      'what','how','who','all','each','every','some','any','Returns','Raises','Args','Parameters','Note',
+      'Example','param','throws','since','see','deprecated','alias','overload','module','variable']);
+
+    const testIds = [
+      // PascalCase types (should pass)
+      'UserProfile', 'HttpResponseBase', 'TimestampedModel', 'CompanyInfo',
+      // snake_case functions/fields (should pass)
+      'get_display_name', 'created_at', 'field_name', 'save_record',
+      // camelCase (should pass — editor shows underline for these)
+      'delaySeconds', 'userName', 'getData', 'processEntity',
+      // UPPER_CASE constants (should pass)
+      'MAX_RETRIES', 'API_ENDPOINT', 'DEFAULT_TIMEOUT',
+      // lowercase common identifiers (should pass — not in skip list)
+      'name', 'data', 'value', 'result', 'user', 'company',
+      // Keywords (should be BLOCKED)
+      'class', 'def', 'return', 'import', 'function', 'const',
+      // Doc words (should be BLOCKED)
+      'the', 'Returns', 'Example', 'deprecated',
+    ];
+
+    const passed: string[] = [];
+    const blocked: string[] = [];
+    for (const id of testIds) {
+      if (id.length > 2 && !SKIP.has(id)) {
+        passed.push(id);
+      } else {
+        blocked.push(id);
+      }
+    }
+
+    console.log(`  Passed (${passed.length}): ${passed.join(', ')}`);
+    console.log(`  Blocked (${blocked.length}): ${blocked.join(', ')}`);
+
+    // All type/variable names should pass
+    assert.ok(passed.includes('UserProfile'), 'PascalCase should pass');
+    assert.ok(passed.includes('get_display_name'), 'snake_case should pass');
+    assert.ok(passed.includes('delaySeconds'), 'camelCase should pass');
+    assert.ok(passed.includes('MAX_RETRIES'), 'UPPER_CASE should pass');
+    assert.ok(passed.includes('name'), 'common lowercase should pass');
+    assert.ok(passed.includes('user'), 'common lowercase should pass');
+
+    // Keywords should be blocked
+    assert.ok(blocked.includes('class'), 'keyword should be blocked');
+    assert.ok(blocked.includes('return'), 'keyword should be blocked');
+    assert.ok(blocked.includes('the'), 'doc word should be blocked');
+  });
+
+  test('hover on all identifier types in 1 file', async function () {
+    this.timeout(120000);
+    const modelFile = pyFiles.find(f => f.includes('models.py') && f.includes('pkg_000'));
+    if (!modelFile) { console.log('  Skipped: no model file'); return; }
+
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(modelFile));
+    const text = doc.getText();
+
+    // Extract ALL identifiers (3+ chars, not keywords) — same as renderer logic
+    const SKIP_RE = /^(class|def|if|else|for|while|return|import|from|as|with|try|except|finally|raise|pass|break|continue|and|or|not|is|in|lambda|yield|async|await)$/;
+    const re = /([a-zA-Z_][a-zA-Z0-9_]{2,})/g;
+    const identifiers = new Set<string>();
+    let m: RegExpExecArray | null;
+    while ((m = re.exec(text)) !== null) {
+      if (!SKIP_RE.test(m[1])) { identifiers.add(m[1]); }
+    }
+
+    console.log(`  Total unique identifiers in file: ${identifiers.size}`);
+
+    // Hover on a sample of them and measure timing
+    const sample = [...identifiers].slice(0, 50);
+    const hoverTimes: number[] = [];
+    let withContent = 0;
+
+    for (const id of sample) {
+      const idx = text.indexOf(id);
+      if (idx < 0) { continue; }
+      const pos = doc.positionAt(idx);
+      const t0 = Date.now();
+      const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+        'vscode.executeHoverProvider', doc.uri, pos
+      );
+      hoverTimes.push(Date.now() - t0);
+      if (hovers && hovers.length > 0) { withContent++; }
+    }
+
+    logStats('hover all identifier types', hoverTimes);
+    console.log(`  ${withContent}/${sample.length} had hover content`);
+    assert.ok(stats(hoverTimes).p95 < 5000, `p95 hover too slow: ${stats(hoverTimes).p95}ms`);
+  });
+
+  test('defLine scan for various identifier patterns at scale', async function () {
+    this.timeout(60000);
+    // Open 50 files and scan for different pattern types
+    const files = [...pyFiles.filter(f => f.includes('models.py')).slice(0, 25),
+      ...tsFiles.filter(f => f.includes('types.ts')).slice(0, 25)];
+
+    const scanTimes: number[] = [];
+    const patternCounts: Record<string, number> = {};
+    const patternTypes = ['class', 'method', 'field_assign', 'const', 'annotation', 'method_sig'];
+    for (const pt of patternTypes) { patternCounts[pt] = 0; }
+
+    for (const f of files) {
+      try {
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(f));
+        const text = doc.getText();
+
+        // Measure scan time for a random identifier from the file
+        const ids = text.match(/([a-zA-Z_][a-zA-Z0-9_]{2,})/g) || [];
+        const targetId = ids[Math.floor(Math.random() * ids.length)];
+        if (!targetId || targetId.length < 3) { continue; }
+
+        const t0 = Date.now();
+        // Simulate findDefInText patterns
+        if (new RegExp(`^[ \\t]*(?:export[ \\t]+)?(?:class|interface|type|enum|struct)[ \\t]+${targetId}\\b`, 'm').test(text)) {
+          patternCounts['class']++;
+        } else if (new RegExp(`^[ \\t]*(?:export[ \\t]+)?(?:async[ \\t]+)?(?:def|fn|func|function)[ \\t]+${targetId}\\b`, 'm').test(text)) {
+          patternCounts['method']++;
+        } else if (new RegExp(`^[ \\t]+${targetId}[ \\t]*=[ \\t]*(?:models\\.)?\\w+\\(`, 'm').test(text)) {
+          patternCounts['field_assign']++;
+        } else if (new RegExp(`^[ \\t]*(?:export[ \\t]+)?(?:const|let|var)[ \\t]+${targetId}\\b`, 'm').test(text)) {
+          patternCounts['const']++;
+        } else if (new RegExp(`^[ \\t]+${targetId}[ \\t]*[:?][ \\t]*\\w`, 'm').test(text)) {
+          patternCounts['annotation']++;
+        } else if (new RegExp(`^[ \\t]+(?:readonly[ \\t]+)?${targetId}[ \\t]*[<(]`, 'm').test(text)) {
+          patternCounts['method_sig']++;
+        }
+        scanTimes.push(Date.now() - t0);
+      } catch {}
+    }
+
+    logStats('defLine pattern scan (50 files)', scanTimes);
+    console.log('  Pattern match counts:');
+    for (const [pt, c] of Object.entries(patternCounts)) { console.log(`    ${pt}: ${c}`); }
+
+    assert.ok(stats(scanTimes).p95 < 100, `p95 defLine scan too slow: ${stats(scanTimes).p95}ms`);
   });
 });

@@ -156,39 +156,74 @@ Each step is attempted only if the previous step returned no result.
 
 Scans all open documents for definition-like patterns:
 
-**Definition keyword regex:**
-```regex
-^[ \t]*(?:export[ \t]+)?(?:class|interface|struct|enum|type|def|fn|func|
-  pub[ \t]+(?:struct|enum|fn))[ \t]+IDENTIFIER\b
-```
+Searches with a priority-ordered list of 9 regex patterns via `findDefInText()`:
 
-**Assignment regex** (for PascalCase identifiers only):
-```regex
-^IDENTIFIER[ \t]*(?::[ \t]*\w+)?[ \t]*=[ \t]*
-```
+**Priority 1 — Class-level definitions:**
+| Pattern | Example |
+|---------|---------|
+| `class X` | `class HttpResponseBase:`, `export class UserService {` |
+| `interface X` | `export interface UserProfile extends ...` |
+| `type X` | `export type FormikProps<V> = ...` |
+| `enum X` | `enum Status {`, `class TextChoices(StrEnum)` |
+| `struct X` | `type UserProfile struct {` (Go) |
 
-**Matches:**
-| Language | Pattern | Example |
-|----------|---------|---------|
-| Python | `class X:` | `class HttpResponseBase:` |
-| Python | `class X(Parent):` | `class User(TimestampedModel):` |
-| Python | `def X(` | `def get_display_name(self):` |
-| TypeScript | `interface X` | `export interface UserProfile extends ...` |
-| TypeScript | `type X =` | `export type FormikProps<V> = ...` |
-| TypeScript | `class X` | `export class UserService {` |
-| TypeScript | `enum X` | `enum Status {` |
-| Go | `type X struct` | `type UserProfile struct {` |
-| Go | `type X interface` | `type Reader interface {` |
-| Rust | `pub struct X` | `pub struct UserProfile {` |
-| Rust | `pub enum X` | `pub enum Status {` |
-| Java | `class X` | `public class UserProfile extends ...` |
-| C# | `class X` | `public class UserProfile : ...` |
-| Dart | `class X` | `class UserProfile extends ...` |
-| Assignment | `X = value` | `MutableMapping = _alias(...)` |
-| Assignment | `X: Type = value` | `Sequence: TypeAlias = ...` |
+**Priority 2 — Function/method definitions:**
+| Pattern | Example |
+|---------|---------|
+| `def X(` | `def get_display_name(self) -> str:` |
+| `function X(` | `export function createUser(name: string)` |
+| `async def X(` | `async def fetch_data(url: str):` |
+| `async function X(` | `export async function loadData()` |
+| `fn X(` | `pub fn get_owner(&self) -> &UserProfile` |
+| `func X(` | `func GetCompanyOwner(company CompanyInfo)` |
+
+**Priority 3 — Rust pub items:**
+| Pattern | Example |
+|---------|---------|
+| `pub struct/enum/fn/type/const X` | `pub struct UserProfile {`, `pub const MAX: i32 = 100` |
+
+**Priority 4 — Variable declarations:**
+| Pattern | Example |
+|---------|---------|
+| `const X` | `const VALIDATE_TOKEN = gql\`...\`` |
+| `let X` | `let currentUser = null;` |
+| `var X` | `var config = {};` |
+| `export const X` | `export const API_URL = '...'` |
+
+**Priority 5 — Method signatures (TS interface/class body):**
+| Pattern | Example |
+|---------|---------|
+| `  X(` or `  X<T>(` | `  getUser(id: number): UserProfile` |
+| `  readonly X(` | `  readonly getId(): number` |
+
+**Priority 6 — Field/property declarations:**
+| Pattern | Example |
+|---------|---------|
+| `  X: Type` | `  name: string;`, `  owner: UserProfile;` |
+| `  readonly X: Type` | `  readonly id: number;` |
+| `  X?: Type` | `  email?: string;` |
+
+**Priority 7 — Django/Python field assignments:**
+| Pattern | Example |
+|---------|---------|
+| `  X = models.Field(...)` | `  name = models.CharField(max_length=100)` |
+| `  X = SomeType(...)` | `  created_at = DateTimeField(auto_now_add=True)` |
+
+**Priority 8 — Python @property:**
+| Pattern | Example |
+|---------|---------|
+| `@property` + `def X` | `@property\ndef full_name(self) -> str:` |
+
+**Priority 9 — Top-level assignment:**
+| Pattern | Example |
+|---------|---------|
+| `X = value` | `MutableMapping = _alias(...)` |
+| `X: Type = value` | `Sequence: TypeAlias = ...` |
 
 **Position precision:** The cursor jumps to the identifier itself (not the keyword):
 - `class ▸HttpResponseBase:` ← cursor here, not at `class`
+- `def ▸get_display_name(self):` ← cursor here
+- `  ▸name: string;` ← cursor here
 
 #### Step 2: Import-Follow (file resolution, no language server)
 
@@ -833,7 +868,11 @@ containers and wraps eligible identifiers in clickable `<span>` elements.
 
 **Eligible identifier:** ALL of the following must be true:
 1. Matches `/([a-zA-Z_][a-zA-Z0-9_]{2,})/g` (3+ chars, starts with letter/underscore)
-2. Starts with uppercase: `/^[A-Z]/`
+2. **PascalCase OR snake_case**: starts with uppercase (`/^[A-Z]/`) OR contains underscore (`_`)
+   - `UserProfile` → eligible (PascalCase)
+   - `get_display_name` → eligible (snake_case)
+   - `created_at` → eligible (snake_case)
+   - `userData` → NOT eligible (camelCase, no underscore)
 3. Not in renderer skip list (450+ entries)
 4. Word boundary check passes (not part of a larger word)
 

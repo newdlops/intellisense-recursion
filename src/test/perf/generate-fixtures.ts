@@ -29,11 +29,12 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 const ROOT = path.resolve(__dirname, '../../../perf-fixtures');
-const NUM_PACKAGES = 100;
+const SCALE = process.env.PERF_SCALE === '1M' ? 10 : 1;
+const NUM_PACKAGES = 100 * SCALE;
 const SUB_PACKAGES_PER_PKG = 10;
 const CLASSES_PER_MODEL = 50;
 const CLASSES_PER_SUB = 20;
-const STUB_FILES_TARGET = 100_000;
+const STUB_FILES_TARGET = SCALE === 10 ? 1_000_000 : 100_000;
 
 function rand(n: number) { return Math.floor(Math.random() * n); }
 function randItem<T>(arr: T[]): T { return arr[rand(arr.length)]; }
@@ -43,13 +44,31 @@ const MIXIN_NAMES = ['TimestampedMixin', 'AuditMixin', 'SoftDeleteMixin', 'Cache
 const BASE_CLASSES = ['BaseModel', 'BaseEntity', 'AbstractHandler', 'BaseService'];
 const FIELD_TYPES_PY = ['str', 'int', 'float', 'bool', 'list', 'dict'];
 const FIELD_TYPES_TS = ['string', 'number', 'boolean', 'Date', 'string[]'];
+const DJANGO_FIELDS = ['CharField', 'IntegerField', 'BooleanField', 'DateTimeField', 'TextField', 'ForeignKey'];
+const METHOD_NAMES_PY = ['get_display_name', 'save_record', 'delete_item', 'validate_data', 'process_entry'];
+const METHOD_NAMES_TS = ['getById', 'createNew', 'updateRecord', 'deleteItem', 'validateInput'];
 
 function genPythonClass(name: string, parents: string[], fields: number): string {
   const parentStr = parents.length ? `(${parents.join(', ')})` : '';
   let out = `class ${name}${parentStr}:\n`;
   out += `    """${name} model."""\n`;
-  for (let f = 0; f < fields; f++) {
+  // Type-annotated fields
+  for (let f = 0; f < Math.min(fields, 2); f++) {
     out += `    field_${f}: ${randItem(FIELD_TYPES_PY)}\n`;
+  }
+  // Django-style field assignments
+  for (let f = 2; f < Math.min(fields, 4); f++) {
+    out += `    field_${f} = models.${randItem(DJANGO_FIELDS)}()\n`;
+  }
+  // Methods
+  if (fields > 2) {
+    const methodName = `${randItem(METHOD_NAMES_PY)}_${padNum(rand(100))}`;
+    out += `\n    def ${methodName}(self) -> ${randItem(FIELD_TYPES_PY)}:\n`;
+    out += `        return self.field_0\n`;
+  }
+  // Property
+  if (fields > 4) {
+    out += `\n    @property\n    def computed_value(self) -> str:\n        return str(self.field_0)\n`;
   }
   out += '\n';
   return out;
@@ -58,10 +77,51 @@ function genPythonClass(name: string, parents: string[], fields: number): string
 function genTSInterface(name: string, parents: string[], fields: number): string {
   const ext = parents.length ? ` extends ${parents.join(', ')}` : '';
   let out = `export interface ${name}${ext} {\n`;
-  for (let f = 0; f < fields; f++) {
+  // Regular fields
+  for (let f = 0; f < Math.min(fields, 3); f++) {
     out += `  field_${f}: ${randItem(FIELD_TYPES_TS)};\n`;
   }
+  // Optional fields
+  if (fields > 2) {
+    out += `  optional_field?: ${randItem(FIELD_TYPES_TS)};\n`;
+  }
+  // Readonly field
+  if (fields > 3) {
+    out += `  readonly readonly_field: ${randItem(FIELD_TYPES_TS)};\n`;
+  }
+  // Method signature
+  if (fields > 1) {
+    const methodName = `${randItem(METHOD_NAMES_TS)}${padNum(rand(100))}`;
+    out += `  ${methodName}(id: number): ${name} | null;\n`;
+  }
   out += '}\n\n';
+  return out;
+}
+
+// Generate standalone function files
+function genPythonFunctions(pkg: string, classes: string[]): string {
+  let out = `from .models import ${classes.slice(0, 3).join(', ')}\n\n`;
+  for (let i = 0; i < 5; i++) {
+    const fnName = `${randItem(METHOD_NAMES_PY)}_${pkg.replace(/_/g, '')}`;
+    const cls = randItem(classes);
+    out += `def ${fnName}(obj: ${cls}) -> None:\n    obj.field_0\n\n`;
+  }
+  // const-style assignments
+  out += `MAX_RETRIES = 3\nDEFAULT_TIMEOUT = 30\n`;
+  out += `${pkg.replace(/_/g, '')}Config = ${randItem(classes)}\n`;
+  return out;
+}
+
+function genTSFunctions(pkg: string, interfaces: string[]): string {
+  let out = `import { ${interfaces.slice(0, 3).join(', ')} } from './types';\n\n`;
+  for (let i = 0; i < 5; i++) {
+    const fnName = `${randItem(METHOD_NAMES_TS)}${pkg.replace(/_/g, '')}`;
+    const iface = randItem(interfaces);
+    out += `export function ${fnName}(id: number): ${iface} | null { return null; }\n\n`;
+  }
+  // const declarations
+  out += `export const API_ENDPOINT = '/api/${pkg}';\n`;
+  out += `export const DEFAULT_PAGE_SIZE = 20;\n`;
   return out;
 }
 
@@ -152,38 +212,12 @@ function generate() {
     fs.writeFileSync(path.join(pkgDir, 'index.ts'), `export * from './types';\n`);
     fileCount += 2;
 
-    // ── Package-level service.py (cross-package imports) ──
-    let servicePy = `from .models import ${pyClasses.slice(0, 5).join(', ')}\n`;
-    if (p > 0) {
-      const otherPkg = `pkg_${padNum(rand(p))}`;
-      const otherClasses = allPyClasses.filter(c => c.pkg === otherPkg).slice(0, 2);
-      if (otherClasses.length) {
-        servicePy += `from ${otherPkg}.models import ${otherClasses.map(c => c.name).join(', ')}\n`;
-      }
-    }
-    servicePy += '\n';
-    for (let s = 0; s < 5; s++) {
-      const cls = randItem(pyClasses);
-      servicePy += `def process_${cls.toLowerCase()}(obj: ${cls}) -> None:\n    obj.field_0\n\n`;
-    }
-    fs.writeFileSync(path.join(pkgDir, 'service.py'), servicePy);
+    // ── Package-level service.py (cross-package imports + functions) ──
+    fs.writeFileSync(path.join(pkgDir, 'service.py'), genPythonFunctions(pkgName, pyClasses));
     fileCount += 1;
 
-    // ── Package-level components.tsx (cross-package imports) ──
-    let componentsTsx = `import { ${tsInterfaces.slice(0, 5).join(', ')} } from './types';\n`;
-    if (p > 0) {
-      const otherPkg = `pkg_${padNum(rand(p))}`;
-      const otherTypes = allTsInterfaces.filter(t => t.pkg === otherPkg).slice(0, 2);
-      if (otherTypes.length) {
-        componentsTsx += `import { ${otherTypes.map(t => t.name).join(', ')} } from '../${otherPkg}';\n`;
-      }
-    }
-    componentsTsx += '\n';
-    for (let s = 0; s < 5; s++) {
-      const iface = randItem(tsInterfaces);
-      componentsTsx += `export function render${iface}(props: ${iface}): string { return props.field_0; }\n\n`;
-    }
-    fs.writeFileSync(path.join(pkgDir, 'components.tsx'), componentsTsx);
+    // ── Package-level components.tsx (cross-package imports + functions) ──
+    fs.writeFileSync(path.join(pkgDir, 'components.tsx'), genTSFunctions(pkgName, tsInterfaces));
     fileCount += 1;
 
     // ── Sub-packages ──

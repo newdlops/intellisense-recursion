@@ -479,10 +479,10 @@ setInterval(function(){
     if(block.querySelector('.ir-type-link'))continue;
     var text=block.textContent||'';
     if(text.length<3)continue;
-    var skip={'class':1,'def':1,'if':1,'else':1,'elif':1,'for':1,'while':1,'return':1,'import':1,'from':1,'as':1,'with':1,'try':1,'except':1,'finally':1,'raise':1,'pass':1,'break':1,'continue':1,'and':1,'or':1,'not':1,'is':1,'in':1,'lambda':1,'yield':1,'async':1,'await':1,'True':1,'False':1,'None':1,'self':1,'cls':1,'str':1,'int':1,'float':1,'bool':1,'list':1,'dict':1,'tuple':1,'set':1,'type':1,'bytes':1,'object':1,'property':1,'staticmethod':1,'classmethod':1,'super':1,'print':1,'len':1,'range':1,'isinstance':1,'hasattr':1,'getattr':1,'setattr':1,'var':1,'let':1,'const':1,'function':1,'new':1,'delete':1,'typeof':1,'instanceof':1,'void':1,'this':1,'switch':1,'case':1,'default':1,'throw':1,'catch':1,'export':1,'extends':1,'implements':1,'interface':1,'enum':1,'abstract':1,'static':1,'public':1,'private':1,'protected':1,'readonly':1,'override':1,'final':1,'native':1,'volatile':1,'synchronized':1,'transient':1,'null':1,'undefined':1,'true':1,'false':1,'number':1,'string':1,'boolean':1,'any':1,'Any':1,'never':1,'unknown':1,'symbol':1,'bigint':1,'sizeof':1,'Optional':1,'Union':1,'Literal':1,'Final':1,'Callable':1,'Type':1,'ClassVar':1,'Protocol':1,'TypeVar':1,'Self':1,'Never':1,'Generic':1,'NotRequired':1,'Required':1,'Annotated':1,'Unpack':1,'TypeAlias':1,'TypeGuard':1,'ParamSpec':1,'Concatenate':1,'other':1,'data':1,'value':1,'result':1,'name':1,'text':1,'item':1,'items':1,'key':1,'keys':1,'index':1,'count':1,'args':1,'kwargs':1,'self':1,'cls':1,'none':1,'method':1,'func':1,'handler':1,'request':1,'response':1,'context':1,'config':1,'error':1,'message':1,'content':1,'source':1,'target':1,'output':1,'input':1,'state':1,'status':1,'info':1,'debug':1,'level':1,'path':1,'file':1,'struct':1,'union':1,'typedef':1,'extern':1,'register':1,'signed':1,'unsigned':1,'char':1,'short':1,'long':1,'double':1,'auto':1,'goto':1,'include':1,'define':1,'ifdef':1,'endif':1,'pragma':1,'namespace':1,'using':1,'template':1,'typename':1,'virtual':1,'inline':1,'constexpr':1,'nullptr':1,'the':1,'The':1,'that':1,'will':1,'are':1,'was':1,'has':1,'have':1,'can':1,'should':1,'may':1,'must':1,'been':1,'being':1,'does':1,'did':1,'its':1,'also':1,'than':1,'then':1,'when':1,'where':1,'which':1,'what':1,'how':1,'who':1,'all':1,'each':1,'every':1,'some':1,'any':1,'Returns':1,'Raises':1,'Args':1,'Parameters':1,'Note':1,'Example':1,'param':1,'return':1,'throws':1,'since':1,'see':1,'deprecated':1};
+    var skip={'class':1,'def':1,'if':1,'else':1,'elif':1,'for':1,'while':1,'return':1,'import':1,'from':1,'as':1,'with':1,'try':1,'except':1,'finally':1,'raise':1,'pass':1,'break':1,'continue':1,'and':1,'or':1,'not':1,'is':1,'in':1,'lambda':1,'yield':1,'async':1,'await':1,'var':1,'let':1,'const':1,'function':1,'new':1,'delete':1,'typeof':1,'instanceof':1,'void':1,'this':1,'switch':1,'case':1,'default':1,'throw':1,'catch':1,'export':1,'extends':1,'implements':1,'interface':1,'enum':1,'abstract':1,'static':1,'public':1,'private':1,'protected':1,'readonly':1,'override':1,'struct':1,'union':1,'typedef':1,'extern':1,'register':1,'signed':1,'unsigned':1,'auto':1,'goto':1,'include':1,'define':1,'ifdef':1,'endif':1,'pragma':1,'namespace':1,'using':1,'template':1,'virtual':1,'inline':1,'constexpr':1,'nullptr':1,'the':1,'The':1,'that':1,'will':1,'are':1,'was':1,'has':1,'have':1,'can':1,'should':1,'may':1,'must':1,'been':1,'being':1,'does':1,'did':1,'its':1,'also':1,'than':1,'then':1,'when':1,'where':1,'which':1,'what':1,'how':1,'who':1,'all':1,'each':1,'every':1,'some':1,'any':1,'Returns':1,'Raises':1,'Args':1,'Parameters':1,'Note':1,'Example':1,'param':1,'throws':1,'since':1,'see':1,'deprecated':1,'alias':1,'overload':1,'module':1,'variable':1};
     var re=/([a-zA-Z_][a-zA-Z0-9_]{2,})/g;
     var m,types=[];
-    while(m=re.exec(text)){var w=m[1];if(types.indexOf(w)<0&&!skip[w]&&/^[A-Z]/.test(w))types.push(w)}
+    while(m=re.exec(text)){var w=m[1];if(types.indexOf(w)<0&&!skip[w])types.push(w)}
     if(!types.length)continue;
     irScanCount++;
     irLog('renderer: scan#'+irScanCount+' block['+j+'] types=['+types.slice(0,5).join(',')+']'+(types.length>5?' +'+( types.length-5)+' more':''));
@@ -528,16 +528,9 @@ return 'hover patch installed';
 
 // ── Type detection (for $provideHover preview) ──
 
+// Only language keywords and documentation words — NOT type/variable names
 const SKIP_WORDS = new Set([
-  'str', 'bool', 'dict', 'list', 'tuple', 'set', 'frozenset', 'bytes',
-  'int', 'float', 'double', 'char', 'byte', 'short', 'long',
-  'string', 'number', 'boolean', 'void', 'any', 'null', 'undefined',
-  'never', 'unknown', 'object', 'symbol', 'bigint', 'true', 'false',
-  'String', 'Number', 'Boolean', 'Object', 'Symbol', 'Function',
-  'None', 'True', 'False', 'Optional', 'Union', 'Literal', 'Final',
-  'Callable', 'Any', 'Type', 'ClassVar', 'Protocol', 'TypeVar',
-  'Self', 'Never', 'Generic', 'NotRequired', 'Required', 'Annotated',
-  'Unpack', 'TypeAlias', 'TypeGuard', 'ParamSpec', 'Concatenate',
+  // Language keywords (not navigable)
   'class', 'interface', 'type', 'enum', 'function', 'const', 'let', 'var',
   'return', 'if', 'else', 'for', 'while', 'do', 'switch', 'case',
   'break', 'continue', 'new', 'this', 'super', 'extends', 'implements',
@@ -545,13 +538,22 @@ const SKIP_WORDS = new Set([
   'async', 'await', 'yield', 'throw', 'try', 'catch', 'finally',
   'def', 'self', 'pass', 'with', 'isinstance', 'property',
   'public', 'private', 'protected', 'static', 'abstract',
+  'struct', 'union', 'typedef', 'extern', 'register',
+  'virtual', 'inline', 'constexpr', 'namespace', 'using', 'template',
+  // Documentation/markup words
+  'the', 'The', 'that', 'will', 'are', 'was', 'has', 'have', 'can',
+  'should', 'may', 'must', 'been', 'being', 'does', 'did', 'its',
+  'also', 'than', 'then', 'when', 'where', 'which', 'what', 'how', 'who',
+  'all', 'each', 'every', 'some', 'any', 'Returns', 'Raises', 'Args',
+  'Parameters', 'Note', 'Example', 'param', 'throws', 'since', 'see',
+  'deprecated', 'alias', 'overload', 'module', 'variable',
 ]);
 
 function findTypeNames(text: string): string[] {
   const ids = text.match(/\b[A-Za-z_]\w*\b/g) || [];
   const seen = new Set<string>();
   return ids.filter(id => {
-    if (seen.has(id) || !/^[A-Z]/.test(id) || SKIP_WORDS.has(id) || id.length <= 1) return false;
+    if (seen.has(id) || SKIP_WORDS.has(id) || id.length <= 2) return false;
     seen.add(id);
     return true;
   });
@@ -561,9 +563,8 @@ function findTypeNames(text: string): string[] {
 
 async function goToTypeHandler(docUriStr: string, identifier: string) {
   if (goToTypeBusy) { log.info(`goToType: "${identifier}" skipped (busy)`); return; }
-  // Skip non-PascalCase identifiers (variables, camelCase props, etc.)
-  if (!/^[A-Z]/.test(identifier) && !identifier.includes('_')) {
-    log.info(`goToType: "${identifier}" skipped (not PascalCase/UPPER_CASE)`);
+  if (identifier.length <= 2) {
+    log.info(`goToType: "${identifier}" skipped (too short)`);
     return;
   }
   goToTypeBusy = true;
@@ -586,7 +587,7 @@ const CODE_SCHEMES = new Set(['file', 'untitled', 'vscode-userdata']);
 function isCodeDoc(doc: vscode.TextDocument): boolean {
   if (!CODE_SCHEMES.has(doc.uri.scheme)) { return false; }
   const p = doc.uri.fsPath;
-  if (p.endsWith('.log') || p.endsWith('.git') || p.includes('/scm')) { return false; }
+  if (p.endsWith('.log') || p.endsWith('.md') || p.endsWith('.git') || p.includes('/scm')) { return false; }
   return true;
 }
 
@@ -597,19 +598,38 @@ const ASSIGN_DEF_PATTERN_PREFIX = /^[A-Z]/;
 
 // ── Import-follow engine: resolve identifier by tracing import statements ──
 
-// Scan a file for a definition of identifier (class/def/interface/assignment)
+// Scan a file for a definition of identifier.
+// Priority: class/interface > function/method > const/let/var > field/property > assignment
 function findDefInText(text: string, identifier: string, doc: vscode.TextDocument): vscode.Position | null {
-  const defRegex = new RegExp(`^[ \\t]*(?:export[ \\t]+)?(?:class|def|interface|type|enum|struct|fn|func)[ \\t]+${esc(identifier)}\\b`, 'm');
-  const defMatch = defRegex.exec(text);
-  if (defMatch) {
-    const idIdx = text.indexOf(identifier, defMatch.index);
-    return doc.positionAt(idIdx >= 0 ? idIdx : defMatch.index);
-  }
-  // Assignment: Identifier = ...
-  const assignRegex = new RegExp(`^${esc(identifier)}[ \\t]*(?::[ \\t]*\\w+)?[ \\t]*=[ \\t]*`, 'm');
-  const assignMatch = assignRegex.exec(text);
-  if (assignMatch) {
-    return doc.positionAt(assignMatch.index);
+  const escaped = esc(identifier);
+  const patterns: RegExp[] = [
+    // 1. Class-level: class X, interface X, type X, enum X, struct X
+    new RegExp(`^[ \\t]*(?:export[ \\t]+)?(?:class|interface|type|enum|struct)[ \\t]+${escaped}\\b`, 'm'),
+    // 2. Function/method: def X, fn X, func X, function X, async def X, async function X
+    new RegExp(`^[ \\t]*(?:export[ \\t]+)?(?:async[ \\t]+)?(?:def|fn|func|function)[ \\t]+${escaped}\\b`, 'm'),
+    // 3. Rust pub items: pub struct/enum/fn/type X
+    new RegExp(`^[ \\t]*pub[ \\t]+(?:struct|enum|fn|type|const|static)[ \\t]+${escaped}\\b`, 'm'),
+    // 4. const/let/var declaration: const X, let X, var X, export const X
+    new RegExp(`^[ \\t]*(?:export[ \\t]+)?(?:const|let|var)[ \\t]+${escaped}\\b`, 'm'),
+    // 5. Method signature (TS interface/class): X(... or X<T>(... at indented line
+    new RegExp(`^[ \\t]+(?:readonly[ \\t]+)?${escaped}[ \\t]*[<(]`, 'm'),
+    // 6. Field/property declaration: X: Type (indented, in class/interface body)
+    new RegExp(`^[ \\t]+(?:readonly[ \\t]+)?${escaped}[ \\t]*[:?][ \\t]*\\w`, 'm'),
+    // 7. Django/Python field: X = models.SomeField(...) or X = SomeType(...)
+    new RegExp(`^[ \\t]+${escaped}[ \\t]*=[ \\t]*(?:models\\.)?\\w+\\(`, 'm'),
+    // 8. Python @property: @property followed by def X
+    new RegExp(`^[ \\t]*@property\\s+def[ \\t]+${escaped}\\b`, 'ms'),
+    // 9. Top-level assignment: X = ... (PascalCase only, no indent)
+    new RegExp(`^${escaped}[ \\t]*(?::[ \\t]*\\w+)?[ \\t]*=[ \\t]*`, 'm'),
+  ];
+
+  for (const regex of patterns) {
+    const match = regex.exec(text);
+    if (match) {
+      // Find exact identifier position within the match
+      const idIdx = text.indexOf(identifier, match.index);
+      return doc.positionAt(idIdx >= 0 ? idIdx : match.index);
+    }
   }
   return null;
 }
@@ -831,47 +851,36 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
     seen.add(uriStr);
     if (isCodeDoc(openDoc)) { allDocs.push(openDoc); }
   }
+  // Sort: project files first, then node_modules/@types, then stdlib/.venv last
+  allDocs.sort((a, b) => {
+    const score = (d: vscode.TextDocument) => {
+      const p = d.uri.fsPath;
+      if (p.includes('.venv') || p.includes('site-packages') || p.includes('.asdf')
+        || p.includes('typeshed') || p.includes('/lib/python')) { return 3; } // stdlib/.venv last
+      if (p.includes('node_modules') || p.includes('lib.dom.d.ts') || p.includes('lib.es')) { return 2; } // TS lib
+      if (p.includes('package.json')) { return 4; } // config files last
+      return 0; // project files first
+    };
+    return score(a) - score(b);
+  });
   log.info(`  docs: [${allDocs.map(d => vscode.workspace.asRelativePath(d.uri)).join(', ')}] (${ms()})`);
 
   // ── Step 1: Fast definition-line scan (no language server, pure regex) ──
   // Look for lines like: class X, interface X, def X, struct X, X = _alias(...), etc.
   log.info(`  [1] defLine scan... (${ms()})`);
-  const defLineRegex = new RegExp(
-    `^[ \\t]*(?:export[ \\t]+)?(?:class|interface|struct|enum|type|def|fn|func|pub[ \\t]+(?:struct|enum|fn))[ \\t]+${esc(identifier)}\\b`, 'm'
-  );
-  const assignRegex = new RegExp(`^${esc(identifier)}[ \\t]*(?::[ \\t]*\\w+)?[ \\t]*=[ \\t]*`, 'm');
-
   for (let di = 0; di < allDocs.length; di++) {
     const doc = allDocs[di];
     const relPath = vscode.workspace.asRelativePath(doc.uri);
     const text = doc.getText();
 
-    // Try class/def/interface pattern
-    const defMatch = defLineRegex.exec(text);
-    if (defMatch) {
-      // Find the exact identifier position within the matched line
-      const idIdx = text.indexOf(identifier, defMatch.index);
-      const pos = doc.positionAt(idIdx >= 0 ? idIdx : defMatch.index);
+    const pos = findDefInText(text, identifier, doc);
+    if (pos) {
       const line = doc.lineAt(pos.line).text.trim();
       log.info(`→ ${relPath}:${pos.line + 1} "${line.substring(0, 60)}" (defLine, ${ms()})`);
       await vscode.window.showTextDocument(doc, {
         selection: new vscode.Range(pos, pos), preserveFocus: false
       });
       return;
-    }
-
-    // Try assignment pattern (X = ...) — only at top-level (no leading whitespace)
-    if (ASSIGN_DEF_PATTERN_PREFIX.test(identifier)) {
-      const assignMatch = assignRegex.exec(text);
-      if (assignMatch) {
-        const pos = doc.positionAt(assignMatch.index);
-        const line = doc.lineAt(pos.line).text.trim();
-        log.info(`→ ${relPath}:${pos.line + 1} "${line.substring(0, 60)}" (assignDef, ${ms()})`);
-        await vscode.window.showTextDocument(doc, {
-          selection: new vscode.Range(pos, pos), preserveFocus: false
-        });
-        return;
-      }
     }
   }
 
@@ -962,14 +971,107 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
     }
   }
 
-  // ── Step 4: Workspace-wide findFiles + defLine scan for types not in open docs ──
-  log.info(`  [4] findFiles scan... (${ms()})`);
+  // ── Step 4: Scan import sources of the hover-origin file (max 3s) ──
+  const step4Deadline = Date.now() + 3000;
+  log.info(`  [4] import-source scan... (${ms()})`);
   try {
-    // Search workspace for files containing "class/interface/type/struct Identifier"
-    // Use vscode.workspace.findFiles to locate candidate files, then scan them
+    // Find the file where hover was triggered, scan its imports for packages that might define this type
+    let hoverDoc: vscode.TextDocument | null = null;
+    if (lastHoverDocUri) {
+      try { hoverDoc = await vscode.workspace.openTextDocument(vscode.Uri.parse(lastHoverDocUri)); } catch {}
+    }
+    if (hoverDoc) {
+      const hoverText = hoverDoc.getText();
+      // Collect all import sources from the hover file
+      const importSources: vscode.Uri[] = [];
+
+      if (hoverDoc.languageId === 'typescript' || hoverDoc.languageId === 'typescriptreact'
+        || hoverDoc.languageId === 'javascript' || hoverDoc.languageId === 'javascriptreact') {
+        // TS: extract all "from 'package'" paths, resolve to type files
+        const fromRegex = /from\s+['"]([^'"]+)['"]/g;
+        let fm: RegExpExecArray | null;
+        const seenPkgs = new Set<string>();
+        const MAX_PKG_SCAN = 5;
+        while ((fm = fromRegex.exec(hoverText)) !== null) {
+          if (Date.now() > step4Deadline || seenPkgs.size >= MAX_PKG_SCAN) { break; }
+          const pkg = fm[1];
+          if (pkg.startsWith('.') || seenPkgs.has(pkg)) { continue; }
+          seenPkgs.add(pkg);
+          // Try @types/<pkg>/index.d.ts and <pkg> package.json → types
+          const candidates = [
+            `**/node_modules/@types/${pkg.replace(/^@[^/]+\//, '')}/index.d.ts`,
+            `**/node_modules/${pkg}/index.d.ts`,
+          ];
+          for (const pat of candidates) {
+            try {
+              const files = await vscode.workspace.findFiles(pat, undefined, 1);
+              for (const f of files) { if (!seen.has(f.toString())) { importSources.push(f); seen.add(f.toString()); } }
+            } catch {}
+          }
+          // Also try package.json → types field
+          try {
+            const pkgFiles = await vscode.workspace.findFiles(`**/node_modules/${pkg}/package.json`, undefined, 1);
+            for (const pkgUri of pkgFiles) {
+              const pkgDoc = await vscode.workspace.openTextDocument(pkgUri);
+              const pkgJson = JSON.parse(pkgDoc.getText());
+              const typesPath = pkgJson.types || pkgJson.typings;
+              if (typesPath) {
+                const typesUri = vscode.Uri.joinPath(pkgUri, '..', typesPath);
+                if (!seen.has(typesUri.toString())) { importSources.push(typesUri); seen.add(typesUri.toString()); }
+              }
+            }
+          } catch {}
+        }
+      }
+
+      if (hoverDoc.languageId === 'python') {
+        const pyFromRegex = /^[ \t]*from[ \t]+([\w.]+)[ \t]+import/gm;
+        let pfm: RegExpExecArray | null;
+        let pyPkgCount = 0;
+        while ((pfm = pyFromRegex.exec(hoverText)) !== null) {
+          if (Date.now() > step4Deadline || pyPkgCount >= 5) { break; }
+          pyPkgCount++;
+          const modPath = pfm[1].replace(/\./g, '/');
+          const pats = [`**/${modPath}.py`, `**/${modPath}/__init__.py`, `**/${modPath}.pyi`];
+          for (const pat of pats) {
+            if (Date.now() > step4Deadline) { break; }
+            try {
+              const files = await vscode.workspace.findFiles(pat, '**/node_modules/**', 2);
+              for (const f of files) { if (!seen.has(f.toString())) { importSources.push(f); seen.add(f.toString()); } }
+            } catch {}
+          }
+        }
+      }
+
+      log.info(`  [4] scanning ${importSources.length} import source(s) (${ms()})`);
+      for (const srcUri of importSources) {
+        if (Date.now() > step4Deadline) {
+          log.info(`  [4] timeout after 3s (${ms()})`);
+          break;
+        }
+        try {
+          const srcDoc = await vscode.workspace.openTextDocument(srcUri);
+          const pos = findDefInText(srcDoc.getText(), identifier, srcDoc);
+          if (pos) {
+            const line = srcDoc.lineAt(pos.line).text.trim();
+            log.info(`→ ${vscode.workspace.asRelativePath(srcUri)}:${pos.line + 1} "${line.substring(0, 60)}" (importSource, ${ms()})`);
+            await vscode.window.showTextDocument(srcDoc, {
+              selection: new vscode.Range(pos, pos), preserveFocus: false
+            });
+            return;
+          }
+        } catch {}
+      }
+    }
+
+    // Fallback: file-name based search (only if still within deadline)
+    if (Date.now() > step4Deadline) {
+      log.info(`  [4] timeout before findFiles (${ms()})`);
+    } else {
     const wsPatterns = [`**/${identifier}.py`, `**/${identifier}.ts`, `**/${identifier}.d.ts`,
       `**/${identifier}.tsx`, `**/${identifier.toLowerCase()}.py`, `**/${identifier.toLowerCase()}.ts`];
     for (const wsPat of wsPatterns) {
+      if (Date.now() > step4Deadline) { break; }
       const wsFiles = await vscode.workspace.findFiles(wsPat, '**/node_modules/**', 3);
       for (const wsFileUri of wsFiles) {
         if (seen.has(wsFileUri.toString())) { continue; }
@@ -987,8 +1089,9 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
         } catch {}
       }
     }
+    } // end if deadline check
   } catch (err) {
-    log.warn(`  [4] findFiles error: ${err} (${ms()})`);
+    log.warn(`  [4] error: ${err} (${ms()})`);
   }
 
   // ── Step 5: Direct defProvider on previewLoc (for types the LS knows about) ──
