@@ -6,6 +6,7 @@ const log = vscode.window.createOutputChannel('IntelliSense Recursion', { log: t
 
 const lastPreviewLocations = new Map<string, vscode.Location>();
 let lastHoverDocUri = '';
+let hoverRecursionDepth = 0;
 let reinjectTimer: ReturnType<typeof setInterval> | undefined;
 
 export async function activate(context: vscode.ExtensionContext) {
@@ -92,6 +93,7 @@ function patchSharedService(service: any) {
   service.$provideHover = async function (handle: number, uri: any, position: any, context: any, token: any) {
     const result = await original.call(this, handle, uri, position, context, token);
     if (!result?.contents?.length) { return result; }
+    if (hoverRecursionDepth > 1) { return result; }
 
     // Extract PascalCase types from code fences
     const types: string[] = [];
@@ -106,7 +108,8 @@ function patchSharedService(service: any) {
     const docUriStr = uri?.scheme ? `${uri.scheme}://${uri.authority || ''}${uri.path}` : String(uri);
     lastHoverDocUri = docUriStr;
 
-    // Resolve definition previews for types
+    // Resolve definition previews for types (with hover fallback for doc-only symbols)
+    hoverRecursionDepth++;
     try {
       const docUri = vscode.Uri.parse(docUriStr);
       const doc = await vscode.workspace.openTextDocument(docUri);
@@ -131,27 +134,58 @@ function patchSharedService(service: any) {
 
         const pos = matchDoc.positionAt(match.index);
         const defs = await vscode.commands.executeCommand<vscode.Location[]>('vscode.executeDefinitionProvider', matchUri, pos);
-        if (!defs?.length) { continue; }
 
-        const def = defs[0];
-        if (!def?.uri || !def?.range?.start) { continue; }
-        const defDoc = await vscode.workspace.openTextDocument(def.uri);
-        resolvedDefDocs.push({ uri: def.uri, doc: defDoc });
-        const startLine = def.range.start.line;
-        const endLine = Math.min(startLine + 15, defDoc.lineCount);
-        const lines: string[] = [];
-        for (let i = startLine; i < endLine; i++) { lines.push(defDoc.lineAt(i).text); }
-        const previewCode = lines.join('\n');
-        const relPath = vscode.workspace.asRelativePath(def.uri);
-        const lang = defDoc.languageId || 'python';
+        if (defs?.length && defs[0]?.uri && defs[0]?.range?.start) {
+          // Definition found → show file preview (existing)
+          const def = defs[0];
+          const defDoc = await vscode.workspace.openTextDocument(def.uri);
+          resolvedDefDocs.push({ uri: def.uri, doc: defDoc });
+          const startLine = def.range.start.line;
+          const endLine = Math.min(startLine + 15, defDoc.lineCount);
+          const lines: string[] = [];
+          for (let i = startLine; i < endLine; i++) { lines.push(defDoc.lineAt(i).text); }
+          const previewCode = lines.join('\n');
+          const relPath = vscode.workspace.asRelativePath(def.uri);
+          const lang = defDoc.languageId || 'python';
 
-        previews.push(`\`${typeName}\` — *${relPath}:${startLine + 1}*\n\`\`\`${lang}\n${previewCode}\n\`\`\``);
+          previews.push(`\`${typeName}\` — *${relPath}:${startLine + 1}*\n\`\`\`${lang}\n${previewCode}\n\`\`\``);
 
-        // Store preview location for all identifiers in preview code
-        const previewLoc = new vscode.Location(def.uri, new vscode.Range(startLine, 0, endLine, 0));
-        lastPreviewLocations.set(typeName, previewLoc);
-        const previewIds = previewCode.match(/([a-zA-Z_][a-zA-Z0-9_]{2,})/g) || [];
-        for (const pid of previewIds) { lastPreviewLocations.set(pid, previewLoc); }
+          // Store preview location for all identifiers in preview code
+          const previewLoc = new vscode.Location(def.uri, new vscode.Range(startLine, 0, endLine, 0));
+          lastPreviewLocations.set(typeName, previewLoc);
+          const previewIds = previewCode.match(/([a-zA-Z_][a-zA-Z0-9_]{2,})/g) || [];
+          for (const pid of previewIds) { lastPreviewLocations.set(pid, previewLoc); }
+        } else {
+          // No definition → hover fallback (recursive: doc preview)
+          try {
+            const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+              'vscode.executeHoverProvider', matchUri, pos
+            );
+            if (hovers?.length) {
+              const hoverParts: string[] = [];
+              for (const h of hovers) {
+                for (const c of (h.contents as any[])) {
+                  const val = typeof c === 'string' ? c
+                    : c instanceof vscode.MarkdownString ? c.value
+                    : (c && typeof c.value === 'string') ? c.value
+                    : null;
+                  if (val) { hoverParts.push(val); }
+                }
+              }
+              if (hoverParts.length > 0) {
+                previews.push(`\`${typeName}\` — *doc*\n${hoverParts.join('\n')}`);
+                const hoverLoc = new vscode.Location(matchUri, new vscode.Range(pos, pos));
+                lastPreviewLocations.set(typeName, hoverLoc);
+                // Extract identifiers from hover content for click tracking
+                const hoverText = hoverParts.join('\n');
+                const hoverIds = hoverText.match(/([a-zA-Z_][a-zA-Z0-9_]{2,})/g) || [];
+                for (const hid of hoverIds) { lastPreviewLocations.set(hid, hoverLoc); }
+              }
+            }
+          } catch (hoverErr) {
+            log.warn(`Hover fallback error for ${typeName}: ${hoverErr}`);
+          }
+        }
       }
 
       if (previews.length > 0) {
@@ -166,6 +200,8 @@ function patchSharedService(service: any) {
       }
     } catch (err) {
       log.error(`Preview error: ${err}`);
+    } finally {
+      hoverRecursionDepth--;
     }
     return result;
   };
@@ -204,7 +240,12 @@ async function injectRenderer() {
 
     await new Promise<void>((resolve) => {
       let msgId = 1;
+      let evalMsgId = -1;
       ws.on('open', () => {
+        // Enable Runtime events & add main-process binding for instant click notification
+        ws.send(JSON.stringify({ id: msgId++, method: 'Runtime.enable', params: {} }));
+        ws.send(JSON.stringify({ id: msgId++, method: 'Runtime.addBinding', params: { name: 'irClickNotify' } }));
+
         const patchB64 = Buffer.from(getHoverPatchScript()).toString('base64');
         const evalExpr = "eval(atob('" + patchB64 + "'))";
 
@@ -226,7 +267,7 @@ async function injectRenderer() {
                     await w.webContents.debugger.sendCommand('Runtime.addBinding', { name: 'irGoToType' });
                     w.webContents.debugger.on('message', function(event, method, params) {
                       if (method === 'Runtime.bindingCalled' && params.name === 'irGoToType') {
-                        global.__irClickedType = params.payload;
+                        if(typeof global.irClickNotify==='function'){global.irClickNotify(params.payload)}
                       }
                     });
                     results.push('binding:' + w.id + ':ok');
@@ -241,18 +282,19 @@ async function injectRenderer() {
           })()
         `.trim();
 
-        ws.send(JSON.stringify({ id: msgId++, method: 'Runtime.evaluate', params: { expression: injectScript, includeCommandLineAPI: true, returnByValue: true, awaitPromise: true } }));
+        evalMsgId = msgId++;
+        ws.send(JSON.stringify({ id: evalMsgId, method: 'Runtime.evaluate', params: { expression: injectScript, includeCommandLineAPI: true, returnByValue: true, awaitPromise: true } }));
       });
 
       let done = false;
       ws.on('message', (data: string) => {
         try {
           const resp = JSON.parse(data);
-          if (resp.id && !done) {
+          if (resp.id === evalMsgId && !done) {
             done = true;
             const val = resp.result?.result?.value;
             if (val) { log.info(`Renderer injection: ${val}`); }
-            startClickPolling(ws);
+            startClickListener(ws);
             resolve();
           }
         } catch {}
@@ -312,24 +354,14 @@ async function reinjectRenderer() {
   } catch {}
 }
 
-function startClickPolling(mainWs: any) {
-  log.info('[poll] Click polling started (50ms interval on main process global)');
-  let pollId = 10000;
-  setInterval(() => {
-    try {
-      mainWs.send(JSON.stringify({
-        id: pollId++,
-        method: 'Runtime.evaluate',
-        params: { expression: 'var t=global.__irClickedType;global.__irClickedType=null;t', includeCommandLineAPI: true, returnByValue: true }
-      }));
-    } catch {}
-  }, 50);
+function startClickListener(mainWs: any) {
+  log.info('[listen] Click event listener started (binding-driven)');
 
   mainWs.on('message', (data: string) => {
     try {
       const resp = JSON.parse(data);
-      if (resp.id >= 10000 && resp.result?.result?.value) {
-        const val = String(resp.result.result.value);
+      if (resp.method === 'Runtime.bindingCalled' && resp.params?.name === 'irClickNotify') {
+        const val = String(resp.params.payload);
         if (val.startsWith('LOG:')) { log.info(`[renderer] ${val.slice(4)}`); return; }
         log.info(`Click: "${val}"`);
         const editor = vscode.window.activeTextEditor;
@@ -559,6 +591,23 @@ async function goToTypeHandler(docUriStr: string, identifier: string) {
     }
   } catch (err) {
     log.warn(`  [3] workspace error: ${err}`);
+  }
+
+  // Hover fallback — navigate and trigger hover for doc-only symbols
+  log.info(`  [4] trying hover fallback... (${Date.now() - t0}ms)`);
+  for (const doc of allDocs) {
+    try {
+      const m = regex.exec(doc.getText());
+      if (!m) { continue; }
+      const pos = doc.positionAt(m.index);
+      const hovers = await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', doc.uri, pos);
+      if (hovers?.length) {
+        log.info(`→ hover at ${vscode.workspace.asRelativePath(doc.uri)}:${pos.line} (${Date.now() - t0}ms)`);
+        await vscode.window.showTextDocument(doc, { selection: new vscode.Range(pos, pos), preserveFocus: false });
+        await vscode.commands.executeCommand('editor.action.showHover');
+        return;
+      }
+    } catch {}
   }
 
   log.warn(`"${identifier}" not found (${Date.now() - t0}ms)`);
