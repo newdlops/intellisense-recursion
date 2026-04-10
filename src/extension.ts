@@ -11,12 +11,17 @@ let reinjectTimer: ReturnType<typeof setInterval> | undefined;
 let lastClickId = '';
 let lastClickTime = 0;
 let goToTypeBusy = false;
+let hoverPatchActive = false;
 
 export async function activate(context: vscode.ExtensionContext) {
   log.info('Extension activating...');
 
   context.subscriptions.push(
-    vscode.commands.registerCommand('intellisenseRecursion.goToType', goToTypeHandler)
+    vscode.commands.registerCommand('intellisenseRecursion.goToType', goToTypeHandler),
+    vscode.commands.registerCommand('intellisenseRecursion.getPatchStatus', () => ({
+      hoverPatchActive,
+      hoverRecursionDepth,
+    }))
   );
 
   // Patch $provideHover on shared ExtHostLanguageFeatures
@@ -55,10 +60,10 @@ function findSharedHoverService(): any | null {
             session.post('Runtime.getProperties', { objectId: entry.value.objectId }, (err4, varsResult: any) => {
               if (err4) { return; }
               for (const v of (varsResult?.result || [])) {
-                if (v.name === 'et' && v.value?.objectId) {
+                if (v.value?.objectId) {
                   session.post('Runtime.callFunctionOn', {
                     objectId: v.value.objectId,
-                    functionDeclaration: 'function() { globalThis.__irEt = this; }',
+                    functionDeclaration: 'function() { if (typeof this.$provideHover === "function") { globalThis.__irEt = this; } }',
                   }, () => {});
                 }
               }
@@ -209,6 +214,7 @@ function patchSharedService(service: any) {
     return result;
   };
 
+  hoverPatchActive = true;
   log.info('$provideHover patched');
 }
 

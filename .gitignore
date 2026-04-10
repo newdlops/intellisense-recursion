@@ -2,3 +2,10 @@ out/
 node_modules/
 .vscode-test/
 *.vsix
+
+# Test fixture build artifacts
+src/test/fixtures/rust/target/
+src/test/fixtures/dart/.dart_tool/
+src/test/fixtures/csharp/bin/
+src/test/fixtures/csharp/obj/
+src/test/fixtures/java/*.class
