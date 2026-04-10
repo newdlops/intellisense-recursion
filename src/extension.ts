@@ -650,11 +650,36 @@ async function followImports(identifier: string, docs: vscode.TextDocument[], ms
             for (const fileUri of files) {
               try {
                 const targetDoc = await vscode.workspace.openTextDocument(fileUri);
-                const pos = findDefInText(targetDoc.getText(), identifier, targetDoc);
+                const targetText = targetDoc.getText();
+                const pos = findDefInText(targetText, identifier, targetDoc);
                 if (pos) {
                   const line = targetDoc.lineAt(pos.line).text.trim();
                   log.info(`  [import] → ${vscode.workspace.asRelativePath(fileUri)}:${pos.line + 1} "${line.substring(0, 60)}" (${ms()})`);
                   return new vscode.Location(fileUri, new vscode.Range(pos, pos));
+                }
+                // __init__.py barrel: follow "from .submodule import *" or "from .submodule import Identifier"
+                if (fileUri.fsPath.endsWith('__init__.py')) {
+                  const reExportNamed = new RegExp(`^[ \\t]*from[ \\t]+(\\.\\w+)[ \\t]+import[ \\t]+.*\\b${esc(identifier)}\\b`, 'm');
+                  const reExportStar = /^[ \t]*from[ \t]+(\.\w+)[ \t]+import[ \t]+\*/gm;
+                  const subModules: string[] = [];
+                  const namedMatch = reExportNamed.exec(targetText);
+                  if (namedMatch) { subModules.push(namedMatch[1]); }
+                  let starMatch: RegExpExecArray | null;
+                  while ((starMatch = reExportStar.exec(targetText)) !== null) {
+                    subModules.push(starMatch[1]);
+                  }
+                  for (const relModule of subModules) {
+                    try {
+                      const subUri = vscode.Uri.joinPath(fileUri, '..', relModule.replace('.', '') + '.py');
+                      const subDoc = await vscode.workspace.openTextDocument(subUri);
+                      const subPos = findDefInText(subDoc.getText(), identifier, subDoc);
+                      if (subPos) {
+                        const subLine = subDoc.lineAt(subPos.line).text.trim();
+                        log.info(`  [import] → ${vscode.workspace.asRelativePath(subUri)}:${subPos.line + 1} "${subLine.substring(0, 60)}" (barrel, ${ms()})`);
+                        return new vscode.Location(subUri, new vscode.Range(subPos, subPos));
+                      }
+                    } catch {}
+                  }
                 }
               } catch {}
             }
@@ -937,8 +962,73 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
     }
   }
 
-  // ── Step 5: Hover fallback ──
-  log.info(`  [4] hover fallback... (${ms()})`);
+  // ── Step 4: Workspace-wide findFiles + defLine scan for types not in open docs ──
+  log.info(`  [4] findFiles scan... (${ms()})`);
+  try {
+    // Search workspace for files containing "class/interface/type/struct Identifier"
+    // Use vscode.workspace.findFiles to locate candidate files, then scan them
+    const wsPatterns = [`**/${identifier}.py`, `**/${identifier}.ts`, `**/${identifier}.d.ts`,
+      `**/${identifier}.tsx`, `**/${identifier.toLowerCase()}.py`, `**/${identifier.toLowerCase()}.ts`];
+    for (const wsPat of wsPatterns) {
+      const wsFiles = await vscode.workspace.findFiles(wsPat, '**/node_modules/**', 3);
+      for (const wsFileUri of wsFiles) {
+        if (seen.has(wsFileUri.toString())) { continue; }
+        try {
+          const wsDoc = await vscode.workspace.openTextDocument(wsFileUri);
+          const wsPos = findDefInText(wsDoc.getText(), identifier, wsDoc);
+          if (wsPos) {
+            const wsLine = wsDoc.lineAt(wsPos.line).text.trim();
+            log.info(`→ ${vscode.workspace.asRelativePath(wsFileUri)}:${wsPos.line + 1} "${wsLine.substring(0, 60)}" (findFiles, ${ms()})`);
+            await vscode.window.showTextDocument(wsDoc, {
+              selection: new vscode.Range(wsPos, wsPos), preserveFocus: false
+            });
+            return;
+          }
+        } catch {}
+      }
+    }
+  } catch (err) {
+    log.warn(`  [4] findFiles error: ${err} (${ms()})`);
+  }
+
+  // ── Step 5: Direct defProvider on previewLoc (for types the LS knows about) ──
+  if (previewLoc?.uri) {
+    log.info(`  [5] previewLoc defProvider... (${ms()})`);
+    try {
+      const pvDoc = await vscode.workspace.openTextDocument(previewLoc.uri);
+      const pvText = pvDoc.getText();
+      regex.lastIndex = 0;
+      let pvMatch: RegExpExecArray | null;
+      while ((pvMatch = regex.exec(pvText)) !== null) {
+        const pvPos = pvDoc.positionAt(pvMatch.index);
+        const callT0 = Date.now();
+        const pvDefs = await vscode.commands.executeCommand<any[]>('vscode.executeDefinitionProvider', pvDoc.uri, pvPos);
+        const callMs = Date.now() - callT0;
+        const pvDef = pvDefs?.length ? normalizeDef(pvDefs[0]) : null;
+        if (pvDef) {
+          const isSelf = pvDef.uri.toString() === pvDoc.uri.toString()
+            && pvDef.range.start.line === pvPos.line
+            && Math.abs(pvDef.range.start.character - pvPos.character) < 3;
+          if (!isSelf) {
+            log.info(`→ ${vscode.workspace.asRelativePath(pvDef.uri)}:${pvDef.range.start.line + 1} (previewLoc+def, ${ms()})`);
+            await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(pvDef.uri), {
+              selection: pvDef.range, preserveFocus: false
+            });
+            return;
+          }
+        }
+        if (callMs > 3000) {
+          log.info(`  [5] slow (${callMs}ms) → skip (${ms()})`);
+          break;
+        }
+      }
+    } catch (err) {
+      log.warn(`  [5] previewLoc defProvider error: ${err} (${ms()})`);
+    }
+  }
+
+  // ── Step 6: Hover fallback ──
+  log.info(`  [6] hover fallback... (${ms()})`);
   for (let di = 0; di < allDocs.length; di++) {
     const doc = allDocs[di];
     const relPath = vscode.workspace.asRelativePath(doc.uri);
@@ -948,9 +1038,9 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
       const m = regex.exec(text);
       if (!m) { continue; }
       const pos = doc.positionAt(m.index);
-      log.info(`  [4.${di}] ${relPath}:${pos.line + 1} hoverProvider (${ms()})`);
+      log.info(`  [6.${di}] ${relPath}:${pos.line + 1} hoverProvider (${ms()})`);
       const hovers = await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', doc.uri, pos);
-      log.info(`  [4.${di}] returned ${hovers?.length || 0} hover(s) (${ms()})`);
+      log.info(`  [6.${di}] returned ${hovers?.length || 0} hover(s) (${ms()})`);
       if (hovers?.length) {
         log.info(`→ hover at ${relPath}:${pos.line + 1} (${ms()})`);
         await vscode.window.showTextDocument(doc, { selection: new vscode.Range(pos, pos), preserveFocus: false });
