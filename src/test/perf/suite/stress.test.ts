@@ -645,4 +645,15 @@ suite('Performance Stress: 100K files', () => {
 
     assert.ok(stats(scanTimes).p95 < 100, `p95 defLine scan too slow: ${stats(scanTimes).p95}ms`);
   });
+
+  suiteTeardown(function () {
+    if (process.env.PERF_CLEANUP !== 'false' && wsRoot && wsRoot.includes('perf-fixtures')) {
+      try {
+        fs.rmSync(wsRoot, { recursive: true });
+        console.log(`  Cleaned up: ${wsRoot}`);
+      } catch (err) {
+        console.log(`  Cleanup failed (non-critical): ${err}`);
+      }
+    }
+  });
 });
