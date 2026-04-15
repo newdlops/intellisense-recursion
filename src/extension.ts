@@ -419,6 +419,18 @@ function startClickListener(mainWs: any) {
       }
     } catch {}
   });
+
+  mainWs.on('close', () => {
+    log.warn('[listen] CDP WebSocket closed — click listener lost. Will attempt reconnect...');
+    setTimeout(() => {
+      log.info('[listen] Attempting CDP reconnect...');
+      injectRenderer().catch(err => log.error(`[listen] Reconnect failed: ${err}`));
+    }, 2000);
+  });
+
+  mainWs.on('error', (err: any) => {
+    log.warn(`[listen] CDP WebSocket error: ${err}`);
+  });
 }
 
 function httpGet(url: string): Promise<string> {
@@ -568,7 +580,14 @@ async function goToTypeHandler(docUriStr: string, identifier: string) {
     return;
   }
   goToTypeBusy = true;
-  try { await goToTypeHandlerInner(docUriStr, identifier); } finally { goToTypeBusy = false; }
+  // Safety timeout: release busy flag after 15s even if goToTypeHandlerInner hangs
+  const safetyTimer = setTimeout(() => {
+    if (goToTypeBusy) {
+      log.warn(`goToType: "${identifier}" safety timeout (15s) — releasing busy flag`);
+      goToTypeBusy = false;
+    }
+  }, 15000);
+  try { await goToTypeHandlerInner(docUriStr, identifier); } finally { goToTypeBusy = false; clearTimeout(safetyTimer); }
 }
 
 // Normalize defProvider result (Location or LocationLink) to {uri, range}
@@ -819,6 +838,17 @@ async function followImports(identifier: string, docs: vscode.TextDocument[], ms
   return null;
 }
 
+/** showTextDocument with a 5s timeout to prevent permanent hangs */
+async function safeShowTextDocument(docOrUri: vscode.TextDocument | vscode.Uri, options: { selection: vscode.Range; preserveFocus: boolean }): Promise<void> {
+  const doc = docOrUri instanceof vscode.Uri ? await vscode.workspace.openTextDocument(docOrUri) : docOrUri;
+  const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error('showTextDocument timeout (5s)')), 5000));
+  try {
+    await Promise.race([vscode.window.showTextDocument(doc, options), timeout]);
+  } catch (err) {
+    log.warn(`safeShowTextDocument: ${err}`);
+  }
+}
+
 async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
   const regexSource = `\\b${esc(identifier)}\\b`;
   log.info(`goToType: "${identifier}" regex=/${regexSource}/g`);
@@ -888,7 +918,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
       if (pos) {
         const line = doc.lineAt(pos.line).text.trim();
         log.info(`→ ${relPath}:${pos.line + 1} "${line.substring(0, 60)}" (defLine${pass === 1 ? '/ext' : ''}, ${ms()})`);
-        await vscode.window.showTextDocument(doc, {
+        await safeShowTextDocument(doc, {
           selection: new vscode.Range(pos, pos), preserveFocus: false
         });
         return;
@@ -903,7 +933,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
     const importLoc = await followImports(identifier, allDocs, ms);
     if (importLoc) {
       log.info(`→ ${vscode.workspace.asRelativePath(importLoc.uri)}:${importLoc.range.start.line + 1} (import-follow, ${ms()})`);
-      await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(importLoc.uri), {
+      await safeShowTextDocument(importLoc.uri, {
         selection: importLoc.range, preserveFocus: false
       });
       return;
@@ -973,7 +1003,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
           }
 
           log.info(`→ ${defRelPath}:${def.range.start.line + 1} (${ms()})`);
-          await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(def.uri), {
+          await safeShowTextDocument(def.uri, {
             selection: def.range, preserveFocus: false
           });
           return;
@@ -1068,7 +1098,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
           if (pos) {
             const line = srcDoc.lineAt(pos.line).text.trim();
             log.info(`→ ${vscode.workspace.asRelativePath(srcUri)}:${pos.line + 1} "${line.substring(0, 60)}" (importSource, ${ms()})`);
-            await vscode.window.showTextDocument(srcDoc, {
+            await safeShowTextDocument(srcDoc, {
               selection: new vscode.Range(pos, pos), preserveFocus: false
             });
             return;
@@ -1094,7 +1124,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
           if (wsPos) {
             const wsLine = wsDoc.lineAt(wsPos.line).text.trim();
             log.info(`→ ${vscode.workspace.asRelativePath(wsFileUri)}:${wsPos.line + 1} "${wsLine.substring(0, 60)}" (findFiles, ${ms()})`);
-            await vscode.window.showTextDocument(wsDoc, {
+            await safeShowTextDocument(wsDoc, {
               selection: new vscode.Range(wsPos, wsPos), preserveFocus: false
             });
             return;
@@ -1127,7 +1157,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
             && Math.abs(pvDef.range.start.character - pvPos.character) < 3;
           if (!isSelf) {
             log.info(`→ ${vscode.workspace.asRelativePath(pvDef.uri)}:${pvDef.range.start.line + 1} (previewLoc+def, ${ms()})`);
-            await vscode.window.showTextDocument(await vscode.workspace.openTextDocument(pvDef.uri), {
+            await safeShowTextDocument(pvDef.uri, {
               selection: pvDef.range, preserveFocus: false
             });
             return;
@@ -1159,7 +1189,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
       log.info(`  [6.${di}] returned ${hovers?.length || 0} hover(s) (${ms()})`);
       if (hovers?.length) {
         log.info(`→ hover at ${relPath}:${pos.line + 1} (${ms()})`);
-        await vscode.window.showTextDocument(doc, { selection: new vscode.Range(pos, pos), preserveFocus: false });
+        await safeShowTextDocument(doc, { selection: new vscode.Range(pos, pos), preserveFocus: false });
         await vscode.commands.executeCommand('editor.action.showHover');
         return;
       }
