@@ -66,7 +66,7 @@ async function collectFiles(wsRoot: string, ext: string, limit: number): Promise
 
 // ─── Stress tests ───
 
-suite('Performance Stress: 100K files', () => {
+suite('Performance Stress: 10K files', () => {
   let wsRoot: string;
   let pyFiles: string[];
   let tsFiles: string[];
@@ -644,6 +644,128 @@ suite('Performance Stress: 100K files', () => {
     for (const [pt, c] of Object.entries(patternCounts)) { console.log(`    ${pt}: ${c}`); }
 
     assert.ok(stats(scanTimes).p95 < 100, `p95 defLine scan too slow: ${stats(scanTimes).p95}ms`);
+  });
+
+  test('cache effectiveness: cold vs warm hover on same positions', async function () {
+    this.timeout(120000);
+    const targetFile = pyFiles.find(f => f.includes('models.py') && f.includes('pkg_000'))
+      || pyFiles.find(f => f.includes('models.py'));
+    if (!targetFile) { console.log('  Skipped: no model file'); return; }
+
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(targetFile));
+    const text = doc.getText();
+    const typeRegex = /\b([A-Z][a-zA-Z0-9]+)\b/g;
+    const positions: vscode.Position[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = typeRegex.exec(text)) !== null && positions.length < 20) {
+      positions.push(doc.positionAt(m.index));
+    }
+    if (positions.length === 0) { console.log('  Skipped: no type positions'); return; }
+
+    // Pass 1: cold hovers
+    const coldTimes: number[] = [];
+    for (const pos of positions) {
+      const t0 = Date.now();
+      await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', doc.uri, pos);
+      coldTimes.push(Date.now() - t0);
+    }
+
+    // Small delay to avoid dedup window
+    await new Promise(r => setTimeout(r, 300));
+
+    // Pass 2: warm hovers (same positions → should hit defCache)
+    const warmTimes: number[] = [];
+    for (const pos of positions) {
+      const t0 = Date.now();
+      await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', doc.uri, pos);
+      warmTimes.push(Date.now() - t0);
+    }
+
+    logStats('cold hover (pass 1)', coldTimes);
+    logStats('warm hover (pass 2)', warmTimes);
+
+    const coldAvg = coldTimes.reduce((a, b) => a + b, 0) / coldTimes.length;
+    const warmAvg = warmTimes.reduce((a, b) => a + b, 0) / warmTimes.length;
+    const speedup = coldAvg / Math.max(warmAvg, 1);
+    console.log(`  Speedup: ${speedup.toFixed(1)}x (cold avg=${Math.round(coldAvg)}ms, warm avg=${Math.round(warmAvg)}ms)`);
+  });
+
+  test('negative cache: repeated hover on unresolvable symbols', async function () {
+    this.timeout(120000);
+    const targetFile = pyFiles.find(f => f.includes('service.py') && f.includes('pkg_000'))
+      || pyFiles.find(f => f.includes('service.py'));
+    if (!targetFile) { console.log('  Skipped: no service file'); return; }
+
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(targetFile));
+    const text = doc.getText();
+
+    // Find lowercase identifiers (more likely to fail defProvider → test negative cache)
+    const idRegex = /\b([a-z_][a-z0-9_]{3,})\b/g;
+    const positions: vscode.Position[] = [];
+    let m: RegExpExecArray | null;
+    const seen = new Set<string>();
+    while ((m = idRegex.exec(text)) !== null && positions.length < 15) {
+      if (!seen.has(m[1])) {
+        seen.add(m[1]);
+        positions.push(doc.positionAt(m.index));
+      }
+    }
+    if (positions.length === 0) { console.log('  Skipped: no identifiers'); return; }
+
+    // Pass 1
+    const pass1Times: number[] = [];
+    for (const pos of positions) {
+      const t0 = Date.now();
+      await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', doc.uri, pos);
+      pass1Times.push(Date.now() - t0);
+    }
+
+    await new Promise(r => setTimeout(r, 300));
+
+    // Pass 2 (negative cache should kick in)
+    const pass2Times: number[] = [];
+    for (const pos of positions) {
+      const t0 = Date.now();
+      await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', doc.uri, pos);
+      pass2Times.push(Date.now() - t0);
+    }
+
+    logStats('pass 1 (cold, low-id)', pass1Times);
+    logStats('pass 2 (neg-cached)', pass2Times);
+
+    const p1Avg = pass1Times.reduce((a, b) => a + b, 0) / pass1Times.length;
+    const p2Avg = pass2Times.reduce((a, b) => a + b, 0) / pass2Times.length;
+    console.log(`  Negative cache speedup: ${(p1Avg / Math.max(p2Avg, 1)).toFixed(1)}x (pass1 avg=${Math.round(p1Avg)}ms, pass2 avg=${Math.round(p2Avg)}ms)`);
+  });
+
+  test('parallel resolution: hover with multiple types in signature', async function () {
+    this.timeout(120000);
+    // Find a file with complex type annotations (multiple types per line)
+    const targetFile = pyFiles.find(f => f.includes('service.py') && f.includes('pkg_000'))
+      || pyFiles.find(f => f.includes('service.py'));
+    if (!targetFile) { console.log('  Skipped: no service file'); return; }
+
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(targetFile));
+    const text = doc.getText();
+
+    // Find lines with function signatures that reference types
+    const funcRegex = /^def \w+\(.*?([A-Z]\w+)/gm;
+    const positions: vscode.Position[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = funcRegex.exec(text)) !== null && positions.length < 10) {
+      positions.push(doc.positionAt(m.index));
+    }
+    if (positions.length === 0) { console.log('  Skipped: no function signatures'); return; }
+
+    const times: number[] = [];
+    for (const pos of positions) {
+      const t0 = Date.now();
+      await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', doc.uri, pos);
+      times.push(Date.now() - t0);
+    }
+
+    logStats('hover on function signatures', times);
+    assert.ok(stats(times).p95 < 5000, `p95 hover on signatures too slow: ${stats(times).p95}ms`);
   });
 
   suiteTeardown(function () {

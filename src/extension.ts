@@ -15,6 +15,42 @@ let hoverPatchActive = false;
 let lastPreviewKey = '';
 let lastPreviewTime = 0;
 
+// ── Definition cache (LRU-style with TTL) ──
+// Key: "uri:line:character:typeName", Value: cached result or negative marker
+interface DefCacheEntry {
+  timestamp: number;
+  /** null = negative cache (defProvider returned 0 and hover fallback failed) */
+  result: { preview: string; location: vscode.Location; defUri: vscode.Uri; defDoc?: vscode.TextDocument } | null;
+}
+const defCache = new Map<string, DefCacheEntry>();
+const DEF_CACHE_TTL = 60_000;       // positive cache: 60s
+const DEF_CACHE_NEG_TTL = 30_000;   // negative cache: 30s
+const DEF_CACHE_MAX_SIZE = 200;
+
+function defCacheKey(uri: vscode.Uri, pos: vscode.Position, typeName: string): string {
+  return `${uri.fsPath}:${pos.line}:${pos.character}:${typeName}`;
+}
+
+function defCacheGet(key: string): DefCacheEntry | undefined {
+  const entry = defCache.get(key);
+  if (!entry) { return undefined; }
+  const ttl = entry.result ? DEF_CACHE_TTL : DEF_CACHE_NEG_TTL;
+  if (Date.now() - entry.timestamp > ttl) {
+    defCache.delete(key);
+    return undefined;
+  }
+  return entry;
+}
+
+function defCacheSet(key: string, result: DefCacheEntry['result']) {
+  // Simple eviction: drop oldest entries when over limit
+  if (defCache.size >= DEF_CACHE_MAX_SIZE) {
+    const firstKey = defCache.keys().next().value;
+    if (firstKey !== undefined) { defCache.delete(firstKey); }
+  }
+  defCache.set(key, { timestamp: Date.now(), result });
+}
+
 export async function activate(context: vscode.ExtensionContext) {
   log.info('Extension activating...');
 
@@ -23,7 +59,14 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('intellisenseRecursion.getPatchStatus', () => ({
       hoverPatchActive,
       hoverRecursionDepth,
-    }))
+    })),
+    // Invalidate def cache when documents are saved (content may have changed)
+    vscode.workspace.onDidSaveTextDocument(savedDoc => {
+      const prefix = savedDoc.uri.fsPath + ':';
+      for (const key of defCache.keys()) {
+        if (key.startsWith(prefix)) { defCache.delete(key); }
+      }
+    })
   );
 
   // Patch $provideHover on shared ExtHostLanguageFeatures
@@ -142,7 +185,8 @@ function patchSharedService(service: any) {
       const previews: string[] = [];
       const resolvedDefDocs: { uri: vscode.Uri; doc: vscode.TextDocument }[] = [];
 
-      for (const typeName of uniqueTypes.slice(0, 3)) {
+      // Resolve each type: find anchor position, then resolve definition (with cache)
+      async function resolveType(typeName: string): Promise<string | null> {
         const typeT0 = Date.now();
         const regex = new RegExp(`\\b${esc(typeName)}\\b`);
         let match = regex.exec(docText);
@@ -157,16 +201,34 @@ function patchSharedService(service: any) {
           }
           if (!match) {
             log.info(`[hover]   "${typeName}" not found in docs (${hoverMs()})`);
-            continue;
+            return null;
           }
         }
 
         const pos = matchDoc.positionAt(match.index);
+        const cacheKey = defCacheKey(matchUri, pos, typeName);
+
+        // Check cache (positive and negative)
+        const cached = defCacheGet(cacheKey);
+        if (cached) {
+          if (cached.result) {
+            log.info(`[hover]   "${typeName}" → cached def (${Date.now() - typeT0}ms)`);
+            lastPreviewLocations.set(typeName, cached.result.location);
+            if (cached.result.defDoc) {
+              resolvedDefDocs.push({ uri: cached.result.defUri, doc: cached.result.defDoc });
+            }
+            return cached.result.preview;
+          } else {
+            log.info(`[hover]   "${typeName}" → cached negative (${Date.now() - typeT0}ms)`);
+            return null;
+          }
+        }
+
         log.info(`[hover]   "${typeName}" → defProvider ${vscode.workspace.asRelativePath(matchUri)}:${pos.line + 1} (${hoverMs()})`);
         const defs = await vscode.commands.executeCommand<vscode.Location[]>('vscode.executeDefinitionProvider', matchUri, pos);
 
         if (defs?.length && defs[0]?.uri && defs[0]?.range?.start) {
-          // Definition found → show file preview (existing)
+          // Definition found → show file preview
           const def = defs[0];
           const defDoc = await vscode.workspace.openTextDocument(def.uri);
           resolvedDefDocs.push({ uri: def.uri, doc: defDoc });
@@ -178,16 +240,19 @@ function patchSharedService(service: any) {
           const relPath = vscode.workspace.asRelativePath(def.uri);
           const lang = defDoc.languageId || 'python';
 
-          previews.push(`\`${typeName}\` — *${relPath}:${startLine + 1}*\n\`\`\`${lang}\n${previewCode}\n\`\`\``);
+          const preview = `\`${typeName}\` — *${relPath}:${startLine + 1}*\n\`\`\`${lang}\n${previewCode}\n\`\`\``;
           log.info(`[hover]   "${typeName}" → def ${relPath}:${startLine + 1} (${Date.now() - typeT0}ms)`);
 
-          // Store preview location for type names in preview code (not all identifiers)
           const previewLoc = new vscode.Location(def.uri, new vscode.Range(startLine, 0, endLine, 0));
           lastPreviewLocations.set(typeName, previewLoc);
           const previewTypes = findTypeNames(previewCode);
           for (const pt of previewTypes) { lastPreviewLocations.set(pt, previewLoc); }
+
+          // Cache positive result
+          defCacheSet(cacheKey, { preview, location: previewLoc, defUri: def.uri, defDoc });
+          return preview;
         } else {
-          // No definition → hover fallback (recursive: doc preview)
+          // No definition → hover fallback
           log.info(`[hover]   "${typeName}" → defProvider returned 0, trying hover fallback (${hoverMs()})`);
           try {
             const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
@@ -205,14 +270,16 @@ function patchSharedService(service: any) {
                 }
               }
               if (hoverParts.length > 0) {
-                previews.push(`\`${typeName}\` — *doc*\n${hoverParts.join('\n')}`);
+                const preview = `\`${typeName}\` — *doc*\n${hoverParts.join('\n')}`;
                 log.info(`[hover]   "${typeName}" → hover fallback ok (${Date.now() - typeT0}ms)`);
                 const hoverLoc = new vscode.Location(matchUri, new vscode.Range(pos, pos));
                 lastPreviewLocations.set(typeName, hoverLoc);
-                // Store only PascalCase type names from hover content (not all identifiers)
                 const hoverText = hoverParts.join('\n');
                 const hoverTypes = findTypeNames(hoverText);
                 for (const ht of hoverTypes) { lastPreviewLocations.set(ht, hoverLoc); }
+                // Cache positive hover fallback result
+                defCacheSet(cacheKey, { preview, location: hoverLoc, defUri: matchUri });
+                return preview;
               } else {
                 log.info(`[hover]   "${typeName}" → hover fallback empty (${Date.now() - typeT0}ms)`);
               }
@@ -222,8 +289,15 @@ function patchSharedService(service: any) {
           } catch (hoverErr) {
             log.warn(`[hover]   "${typeName}" → hover error: ${hoverErr} (${Date.now() - typeT0}ms)`);
           }
+          // Cache negative result (defProvider=0 and hover fallback failed)
+          defCacheSet(cacheKey, null);
+          return null;
         }
       }
+
+      // Resolve types in parallel (up to 3)
+      const typeResults = await Promise.all(uniqueTypes.slice(0, 3).map(resolveType));
+      for (const r of typeResults) { if (r) { previews.push(r); } }
 
       if (previews.length > 0) {
         lastPreviewKey = posKey;

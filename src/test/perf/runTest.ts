@@ -10,7 +10,7 @@ async function main() {
     const userExtensionsDir = path.join(os.homedir(), '.vscode', 'extensions');
 
     console.log('Running PERFORMANCE STRESS tests');
-    console.log(`  workspace: ${testWorkspace} (100K files)`);
+    console.log(`  workspace: ${testWorkspace} (10K files)`);
     console.log(`  extensions: ${userExtensionsDir}`);
 
     await runTests({

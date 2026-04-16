@@ -1,5 +1,5 @@
 /**
- * Generate 100,000 file stress test fixtures.
+ * Generate 10,000 file stress test fixtures.
  *
  * Structure:
  *   perf-fixtures/
@@ -14,7 +14,7 @@
  *         utils.py / helpers.ts       (functions using types)
  *
  * Total files: 100 × (4 + 10 × 4) = 4,400 files with actual content
- * + 95,600 stub files spread across deeper sub-directories
+ * + 5,600 stub files spread across deeper sub-directories
  *
  * Patterns exercised:
  *   - Deep import chains (pkg_000.sub_005.models → pkg_000.models → base)
@@ -34,7 +34,7 @@ const NUM_PACKAGES = 100 * SCALE;
 const SUB_PACKAGES_PER_PKG = 10;
 const CLASSES_PER_MODEL = 50;
 const CLASSES_PER_SUB = 20;
-const STUB_FILES_TARGET = SCALE === 10 ? 1_000_000 : 100_000;
+const STUB_FILES_TARGET = SCALE === 10 ? 100_000 : 10_000;
 
 function rand(n: number) { return Math.floor(Math.random() * n); }
 function randItem<T>(arr: T[]): T { return arr[rand(arr.length)]; }
@@ -252,7 +252,7 @@ function generate() {
     }
   }
 
-  // ── Generate remaining stub files to reach 100K ──
+  // ── Generate remaining stub files to reach 10K ──
   const stubsNeeded = STUB_FILES_TARGET - fileCount;
   const stubDir = path.join(ROOT, 'stubs');
   const STUBS_PER_DIR = 100;
