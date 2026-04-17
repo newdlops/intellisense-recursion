@@ -51,6 +51,255 @@ function defCacheSet(key: string, result: DefCacheEntry['result']) {
   defCache.set(key, { timestamp: Date.now(), result });
 }
 
+// ── Hover budget + background resolve ──
+// Goal: hover overhead ≤ 10ms. On cache miss, race a resolve against a tight
+// budget; if it doesn't finish in time, return preview-less hover and let the
+// resolve finish in the background to populate cache for the next hover.
+const HOVER_BUDGET_MS = 5;
+const BG_RESOLVE_TIMEOUT_MS = 3_000;
+
+const inflightResolves = new Map<string, Promise<DefCacheEntry['result']>>();
+
+function withTimeout<T>(p: Thenable<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timeout after ${ms}ms`)), ms);
+    Promise.resolve(p).then(
+      v => { clearTimeout(timer); resolve(v); },
+      e => { clearTimeout(timer); reject(e); },
+    );
+  });
+}
+
+function findOpenDoc(uri: vscode.Uri): vscode.TextDocument | undefined {
+  const fs = uri.fsPath;
+  return vscode.workspace.textDocuments.find(d => d.uri.fsPath === fs);
+}
+
+/**
+ * Actual defProvider + hoverProvider resolve. Runs to completion (bounded by
+ * BG_RESOLVE_TIMEOUT_MS) and writes the result to cache. Deduplicated by
+ * cacheKey via `inflightResolves` so concurrent hovers don't spawn duplicate work.
+ */
+function resolveInBackground(
+  typeName: string,
+  matchUri: vscode.Uri,
+  pos: vscode.Position,
+  cacheKey: string,
+): Promise<DefCacheEntry['result']> {
+  const existing = inflightResolves.get(cacheKey);
+  if (existing) { return existing; }
+
+  const p = (async (): Promise<DefCacheEntry['result']> => {
+    const t0 = Date.now();
+    try {
+      const defs = await withTimeout(
+        vscode.commands.executeCommand<vscode.Location[]>('vscode.executeDefinitionProvider', matchUri, pos),
+        BG_RESOLVE_TIMEOUT_MS,
+        'defProvider',
+      );
+
+      if (defs?.length && defs[0]?.uri && defs[0]?.range?.start) {
+        const def = defs[0];
+        const defDoc = findOpenDoc(def.uri) ?? await withTimeout(
+          vscode.workspace.openTextDocument(def.uri),
+          BG_RESOLVE_TIMEOUT_MS,
+          'openDef',
+        );
+        const startLine = def.range.start.line;
+        const endLine = Math.min(startLine + 15, defDoc.lineCount);
+        const lines: string[] = [];
+        for (let i = startLine; i < endLine; i++) { lines.push(defDoc.lineAt(i).text); }
+        const previewCode = lines.join('\n');
+        const relPath = vscode.workspace.asRelativePath(def.uri);
+        const lang = defDoc.languageId || 'python';
+        const preview = `\`${typeName}\` — *${relPath}:${startLine + 1}*\n\`\`\`${lang}\n${previewCode}\n\`\`\``;
+        const previewLoc = new vscode.Location(def.uri, new vscode.Range(startLine, 0, endLine, 0));
+        lastPreviewLocations.set(typeName, previewLoc);
+        for (const pt of findTypeNames(previewCode)) { lastPreviewLocations.set(pt, previewLoc); }
+        const result = { preview, location: previewLoc, defUri: def.uri, defDoc };
+        defCacheSet(cacheKey, result);
+        log.info(`[bg]   "${typeName}" → def ${relPath}:${startLine + 1} (${Date.now() - t0}ms)`);
+        return result;
+      }
+
+      // Hover fallback
+      try {
+        const hovers = await withTimeout(
+          vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', matchUri, pos),
+          BG_RESOLVE_TIMEOUT_MS,
+          'hoverProvider',
+        );
+        if (hovers?.length) {
+          const hoverParts: string[] = [];
+          for (const h of hovers) {
+            for (const c of (h.contents as any[])) {
+              const val = typeof c === 'string' ? c
+                : c instanceof vscode.MarkdownString ? c.value
+                : (c && typeof c.value === 'string') ? c.value
+                : null;
+              if (val) { hoverParts.push(val); }
+            }
+          }
+          if (hoverParts.length > 0) {
+            const preview = `\`${typeName}\` — *doc*\n${hoverParts.join('\n')}`;
+            const hoverLoc = new vscode.Location(matchUri, new vscode.Range(pos, pos));
+            lastPreviewLocations.set(typeName, hoverLoc);
+            for (const ht of findTypeNames(hoverParts.join('\n'))) { lastPreviewLocations.set(ht, hoverLoc); }
+            const result = { preview, location: hoverLoc, defUri: matchUri };
+            defCacheSet(cacheKey, result);
+            log.info(`[bg]   "${typeName}" → hover fallback ok (${Date.now() - t0}ms)`);
+            return result;
+          }
+        }
+      } catch (hoverErr) {
+        log.warn(`[bg]   "${typeName}" hover error: ${hoverErr} (${Date.now() - t0}ms)`);
+      }
+
+      defCacheSet(cacheKey, null);
+      log.info(`[bg]   "${typeName}" → negative (${Date.now() - t0}ms)`);
+      return null;
+    } catch (err) {
+      // Timeout or LS error: don't cache — may succeed later
+      log.warn(`[bg]   "${typeName}" resolve failed: ${err} (${Date.now() - t0}ms)`);
+      return null;
+    } finally {
+      inflightResolves.delete(cacheKey);
+    }
+  })();
+
+  inflightResolves.set(cacheKey, p);
+  return p;
+}
+
+// ── (D) Regex compile cache ──
+// Boundary-anchored regex per typeName. Reused across hovers and prefetch.
+const regexCache = new Map<string, RegExp>();
+function typeRegex(name: string): RegExp {
+  let r = regexCache.get(name);
+  if (!r) {
+    r = new RegExp(`\\b${esc(name)}\\b`);
+    if (regexCache.size > 500) {
+      const k = regexCache.keys().next().value;
+      if (k !== undefined) { regexCache.delete(k); }
+    }
+    regexCache.set(name, r);
+  }
+  return r;
+}
+
+// ── (A) Position-level preview cache ──
+// Key: "uri:line:col". Short TTL — guards against re-computing for the same
+// hover event across handles and for rapid re-hovers at the same point.
+interface PosPreviewEntry {
+  timestamp: number;
+  typesKey: string;  // sorted, comma-joined type names
+  previews: string;  // joined preview blocks, ready to append
+}
+const posPreviewCache = new Map<string, PosPreviewEntry>();
+const POS_PREVIEW_TTL = 30_000;
+const POS_PREVIEW_MAX = 100;
+
+function posPreviewGet(posKey: string, typesKey: string): string | undefined {
+  const e = posPreviewCache.get(posKey);
+  if (!e) { return undefined; }
+  if (Date.now() - e.timestamp > POS_PREVIEW_TTL) { posPreviewCache.delete(posKey); return undefined; }
+  if (e.typesKey !== typesKey) { return undefined; }
+  return e.previews;
+}
+function posPreviewSet(posKey: string, typesKey: string, previews: string) {
+  if (posPreviewCache.size >= POS_PREVIEW_MAX) {
+    const k = posPreviewCache.keys().next().value;
+    if (k !== undefined) { posPreviewCache.delete(k); }
+  }
+  posPreviewCache.set(posKey, { timestamp: Date.now(), typesKey, previews });
+}
+
+// ── (E) In-flight hover preview dedup (per-position) ──
+// When VS Code calls $provideHover for multiple handles at the same position,
+// the first handle computes and later handles await the same promise.
+const inflightHoverPreviews = new Map<string, Promise<{ typesKey: string; previews: string } | null>>();
+
+// ── (B) Document-open prefetch infrastructure ──
+const prefetchedDocs = new Set<string>();  // uri.fsPath → already scheduled
+const prefetchQueue: Array<() => Promise<void>> = [];
+let prefetchWorkers = 0;
+const PREFETCH_MAX_WORKERS = 3;
+const PREFETCH_WORKER_DELAY_MS = 100;
+const PREFETCH_MAX_TOKENS = 30;
+const PREFETCH_MAX_DOC_BYTES = 1_000_000;  // 1 MB
+const PREFETCH_DEBOUNCE_MS = 500;
+let prefetchDebounce: ReturnType<typeof setTimeout> | undefined;
+
+function enqueuePrefetch(task: () => Promise<void>) {
+  prefetchQueue.push(task);
+  while (prefetchWorkers < PREFETCH_MAX_WORKERS && prefetchQueue.length > 0) {
+    prefetchWorkers++;
+    (async () => {
+      while (prefetchQueue.length > 0) {
+        const t = prefetchQueue.shift();
+        if (!t) { break; }
+        try { await t(); } catch { /* swallow */ }
+        await new Promise(r => setTimeout(r, PREFETCH_WORKER_DELAY_MS));
+      }
+      prefetchWorkers--;
+    })();
+  }
+}
+
+// Extract PascalCase tokens (>= 3 chars) ranked by frequency, return top N with their first position.
+function extractPrefetchTokens(doc: vscode.TextDocument): Array<{ name: string; pos: vscode.Position }> {
+  const text = doc.getText();
+  const re = /\b[A-Z][A-Za-z0-9_]{2,}\b/g;
+  const seen = new Map<string, { pos: vscode.Position; count: number }>();
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const name = m[0];
+    if (SKIP_WORDS.has(name)) { continue; }
+    const prev = seen.get(name);
+    if (prev) { prev.count++; } else { seen.set(name, { pos: doc.positionAt(m.index), count: 1 }); }
+  }
+  return [...seen.entries()]
+    .sort((a, b) => b[1].count - a[1].count)
+    .slice(0, PREFETCH_MAX_TOKENS)
+    .map(([name, v]) => ({ name, pos: v.pos }));
+}
+
+function schedulePrefetch(doc: vscode.TextDocument | undefined) {
+  if (!doc) { return; }
+  if (!isCodeDoc(doc)) { return; }
+  if (prefetchedDocs.has(doc.uri.fsPath)) { return; }
+  // Cheap size check without copying full text (approx): lineCount * avg chars.
+  // If actual getText() is too big we still bail inside the debounced task.
+
+  if (prefetchDebounce) { clearTimeout(prefetchDebounce); }
+  prefetchDebounce = setTimeout(() => {
+    try {
+      if (prefetchedDocs.has(doc.uri.fsPath)) { return; }
+      if (!vscode.window.visibleTextEditors.some(e => e.document === doc)) { return; }
+      const textLen = doc.getText().length;
+      if (textLen > PREFETCH_MAX_DOC_BYTES) {
+        log.info(`[prefetch] skip ${vscode.workspace.asRelativePath(doc.uri)} — too large (${textLen}B)`);
+        prefetchedDocs.add(doc.uri.fsPath);
+        return;
+      }
+      prefetchedDocs.add(doc.uri.fsPath);
+      const tokens = extractPrefetchTokens(doc);
+      let queued = 0;
+      for (const t of tokens) {
+        const key = defCacheKey(doc.uri, t.pos, t.name);
+        if (defCacheGet(key)) { continue; }
+        enqueuePrefetch(async () => {
+          await resolveInBackground(t.name, doc.uri, t.pos, key);
+        });
+        queued++;
+      }
+      log.info(`[prefetch] ${vscode.workspace.asRelativePath(doc.uri)}: queued ${queued}/${tokens.length} tokens`);
+    } catch (err) {
+      log.warn(`[prefetch] scheduling error: ${err}`);
+    }
+  }, PREFETCH_DEBOUNCE_MS);
+}
+
 export async function activate(context: vscode.ExtensionContext) {
   log.info('Extension activating...');
 
@@ -60,14 +309,26 @@ export async function activate(context: vscode.ExtensionContext) {
       hoverPatchActive,
       hoverRecursionDepth,
     })),
-    // Invalidate def cache when documents are saved (content may have changed)
+    // Invalidate caches when documents are saved (content may have changed)
     vscode.workspace.onDidSaveTextDocument(savedDoc => {
       const prefix = savedDoc.uri.fsPath + ':';
       for (const key of defCache.keys()) {
         if (key.startsWith(prefix)) { defCache.delete(key); }
       }
-    })
+      for (const key of posPreviewCache.keys()) {
+        if (key.startsWith(prefix)) { posPreviewCache.delete(key); }
+      }
+      // Allow prefetch to run again on next activation of this doc
+      prefetchedDocs.delete(savedDoc.uri.fsPath);
+    }),
+    // (B) Prefetch on active editor change — warms def cache for visible docs
+    vscode.window.onDidChangeActiveTextEditor(editor => {
+      schedulePrefetch(editor?.document);
+    }),
   );
+
+  // Prefetch current active editor on startup
+  schedulePrefetch(vscode.window.activeTextEditor?.document);
 
   // Patch $provideHover on shared ExtHostLanguageFeatures
   const sharedService = findSharedHoverService();
@@ -143,6 +404,18 @@ function findSharedHoverService(): any | null {
 function patchSharedService(service: any) {
   const original = service.$provideHover;
 
+  // Helper: attach previews string to the first stringy content block.
+  function attachPreviews(res: any, previews: string): any {
+    const newContents = [...res.contents];
+    for (let ci = 0; ci < newContents.length; ci++) {
+      if (newContents[ci]?.value && typeof newContents[ci].value === 'string') {
+        newContents[ci] = { ...newContents[ci], value: newContents[ci].value + '\n\n---\n' + previews };
+        break;
+      }
+    }
+    return { ...res, contents: newContents };
+  }
+
   service.$provideHover = async function (handle: number, uri: any, position: any, context: any, token: any) {
     const hoverT0 = Date.now();
     const fileName = (uri?.path || '').split('/').pop() || '?';
@@ -153,14 +426,19 @@ function patchSharedService(service: any) {
     if (!result?.contents?.length) { return result; }
     if (hoverRecursionDepth > 1) { return result; }
 
-    // Dedup: only add previews once per hover position (multiple handles are called for the same hover event)
-    const posKey = `${uri?.path || uri}:${position?.line}:${position?.character}`;
+    // Canonical position key (0-based, stable across internal vs API shapes)
+    const apiLine = position?.lineNumber !== undefined ? position.lineNumber - 1 : (position?.line ?? 0);
+    const apiChar = position?.column !== undefined ? position.column - 1 : (position?.character ?? 0);
+    const posKey = `${uri?.path || uri}:${apiLine}:${apiChar}`;
     const now = Date.now();
+
+    // Legacy 200ms dedup — protects against recursive re-entrancy and recent
+    // successful handles re-emitting previews on the same result object.
     if (posKey === lastPreviewKey && now - lastPreviewTime < 200) {
       return result;
     }
 
-    // Extract PascalCase types from code fences
+    // Extract types from code fences
     const types: string[] = [];
     for (const content of result.contents) {
       if (!content || typeof content.value !== 'string') { continue; }
@@ -171,44 +449,92 @@ function patchSharedService(service: any) {
     if (uniqueTypes.length === 0) { return result; }
 
     const hoverMs = () => `${Date.now() - hoverT0}ms`;
+    const typesKey = uniqueTypes.slice(0, 3).sort().join(',');
+
+    // (A) Position-level preview cache — short-circuits everything below for
+    // repeated hovers at the same point with the same extracted types.
+    const cachedPreviews = posPreviewGet(posKey, typesKey);
+    if (cachedPreviews) {
+      log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} POS-CACHE hit (${hoverMs()})`);
+      lastPreviewKey = posKey;
+      lastPreviewTime = now;
+      return attachPreviews(result, cachedPreviews);
+    }
+
+    // (E) In-flight preview dedup — share work with other handles called
+    // for the same hover event at the same position with the same types.
+    const inflightKey = `${posKey}:${typesKey}`;
+    const existingInflight = inflightHoverPreviews.get(inflightKey);
+    if (existingInflight) {
+      log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} INFLIGHT shared (${hoverMs()})`);
+      try {
+        const shared = await existingInflight;
+        if (shared) { return attachPreviews(result, shared.previews); }
+      } catch { /* fall through to original */ }
+      return result;
+    }
+
     log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} types=[${uniqueTypes.join(',')}] (${hoverMs()})`);
 
     const docUriStr = uri?.scheme ? `${uri.scheme}://${uri.authority || ''}${uri.path}` : String(uri);
     lastHoverDocUri = docUriStr;
 
-    // Resolve definition previews for types (with hover fallback for doc-only symbols)
-    hoverRecursionDepth++;
-    try {
+    // Compute previews and cache. Install promise in inflightHoverPreviews
+    // BEFORE awaiting so concurrent handles can share.
+    const computePromise = (async (): Promise<{ typesKey: string; previews: string } | null> => {
       const docUri = vscode.Uri.parse(docUriStr);
-      const doc = await vscode.workspace.openTextDocument(docUri);
-      const docText = doc.getText();
-      const previews: string[] = [];
+      const doc = findOpenDoc(docUri) ?? await vscode.workspace.openTextDocument(docUri);
+
+      // (C) Smart anchor — if the word under the cursor is itself a PascalCase
+      // identifier, we can skip the full docText regex scan for it.
+      const hoverApiPos = new vscode.Position(apiLine, apiChar);
+      let hoveredWord = '';
+      let hoveredAnchor: vscode.Position | undefined;
+      try {
+        const wr = doc.getWordRangeAtPosition(hoverApiPos);
+        if (wr) {
+          hoveredWord = doc.getText(wr);
+          hoveredAnchor = wr.start;
+        }
+      } catch { /* invalid position — fall back to scan */ }
+
+      // Lazy-load docText only when we actually need to scan (i.e. no smart anchor)
+      let docTextCache: string | undefined;
+      const getDocText = () => (docTextCache ??= doc.getText());
+
+      const previewsOut: string[] = [];
       const resolvedDefDocs: { uri: vscode.Uri; doc: vscode.TextDocument }[] = [];
 
-      // Resolve each type: find anchor position, then resolve definition (with cache)
       async function resolveType(typeName: string): Promise<string | null> {
         const typeT0 = Date.now();
-        const regex = new RegExp(`\\b${esc(typeName)}\\b`);
-        let match = regex.exec(docText);
+        let pos: vscode.Position | undefined;
         let matchUri = docUri;
-        let matchDoc = doc;
 
-        // If not found in hovered doc, search already-resolved definition files
-        if (!match) {
-          for (const rd of resolvedDefDocs) {
-            match = regex.exec(rd.doc.getText());
-            if (match) { matchUri = rd.uri; matchDoc = rd.doc; break; }
-          }
+        // (C) Smart anchor shortcut
+        if (typeName === hoveredWord && hoveredAnchor) {
+          pos = hoveredAnchor;
+        } else {
+          // (D) Cached compiled regex, scan hovered doc first
+          const regex = typeRegex(typeName);
+          regex.lastIndex = 0;
+          let match = regex.exec(getDocText());
+          let matchDoc = doc;
           if (!match) {
-            log.info(`[hover]   "${typeName}" not found in docs (${hoverMs()})`);
-            return null;
+            for (const rd of resolvedDefDocs) {
+              regex.lastIndex = 0;
+              match = regex.exec(rd.doc.getText());
+              if (match) { matchUri = rd.uri; matchDoc = rd.doc; break; }
+            }
+            if (!match) {
+              log.info(`[hover]   "${typeName}" not found in docs (${hoverMs()})`);
+              return null;
+            }
           }
+          pos = matchDoc.positionAt(match.index);
         }
 
-        const pos = matchDoc.positionAt(match.index);
         const cacheKey = defCacheKey(matchUri, pos, typeName);
 
-        // Check cache (positive and negative)
         const cached = defCacheGet(cacheKey);
         if (cached) {
           if (cached.result) {
@@ -218,106 +544,60 @@ function patchSharedService(service: any) {
               resolvedDefDocs.push({ uri: cached.result.defUri, doc: cached.result.defDoc });
             }
             return cached.result.preview;
-          } else {
-            log.info(`[hover]   "${typeName}" → cached negative (${Date.now() - typeT0}ms)`);
-            return null;
           }
-        }
-
-        log.info(`[hover]   "${typeName}" → defProvider ${vscode.workspace.asRelativePath(matchUri)}:${pos.line + 1} (${hoverMs()})`);
-        const defs = await vscode.commands.executeCommand<vscode.Location[]>('vscode.executeDefinitionProvider', matchUri, pos);
-
-        if (defs?.length && defs[0]?.uri && defs[0]?.range?.start) {
-          // Definition found → show file preview
-          const def = defs[0];
-          const defDoc = await vscode.workspace.openTextDocument(def.uri);
-          resolvedDefDocs.push({ uri: def.uri, doc: defDoc });
-          const startLine = def.range.start.line;
-          const endLine = Math.min(startLine + 15, defDoc.lineCount);
-          const lines: string[] = [];
-          for (let i = startLine; i < endLine; i++) { lines.push(defDoc.lineAt(i).text); }
-          const previewCode = lines.join('\n');
-          const relPath = vscode.workspace.asRelativePath(def.uri);
-          const lang = defDoc.languageId || 'python';
-
-          const preview = `\`${typeName}\` — *${relPath}:${startLine + 1}*\n\`\`\`${lang}\n${previewCode}\n\`\`\``;
-          log.info(`[hover]   "${typeName}" → def ${relPath}:${startLine + 1} (${Date.now() - typeT0}ms)`);
-
-          const previewLoc = new vscode.Location(def.uri, new vscode.Range(startLine, 0, endLine, 0));
-          lastPreviewLocations.set(typeName, previewLoc);
-          const previewTypes = findTypeNames(previewCode);
-          for (const pt of previewTypes) { lastPreviewLocations.set(pt, previewLoc); }
-
-          // Cache positive result
-          defCacheSet(cacheKey, { preview, location: previewLoc, defUri: def.uri, defDoc });
-          return preview;
-        } else {
-          // No definition → hover fallback
-          log.info(`[hover]   "${typeName}" → defProvider returned 0, trying hover fallback (${hoverMs()})`);
-          try {
-            const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
-              'vscode.executeHoverProvider', matchUri, pos
-            );
-            if (hovers?.length) {
-              const hoverParts: string[] = [];
-              for (const h of hovers) {
-                for (const c of (h.contents as any[])) {
-                  const val = typeof c === 'string' ? c
-                    : c instanceof vscode.MarkdownString ? c.value
-                    : (c && typeof c.value === 'string') ? c.value
-                    : null;
-                  if (val) { hoverParts.push(val); }
-                }
-              }
-              if (hoverParts.length > 0) {
-                const preview = `\`${typeName}\` — *doc*\n${hoverParts.join('\n')}`;
-                log.info(`[hover]   "${typeName}" → hover fallback ok (${Date.now() - typeT0}ms)`);
-                const hoverLoc = new vscode.Location(matchUri, new vscode.Range(pos, pos));
-                lastPreviewLocations.set(typeName, hoverLoc);
-                const hoverText = hoverParts.join('\n');
-                const hoverTypes = findTypeNames(hoverText);
-                for (const ht of hoverTypes) { lastPreviewLocations.set(ht, hoverLoc); }
-                // Cache positive hover fallback result
-                defCacheSet(cacheKey, { preview, location: hoverLoc, defUri: matchUri });
-                return preview;
-              } else {
-                log.info(`[hover]   "${typeName}" → hover fallback empty (${Date.now() - typeT0}ms)`);
-              }
-            } else {
-              log.info(`[hover]   "${typeName}" → no hover (${Date.now() - typeT0}ms)`);
-            }
-          } catch (hoverErr) {
-            log.warn(`[hover]   "${typeName}" → hover error: ${hoverErr} (${Date.now() - typeT0}ms)`);
-          }
-          // Cache negative result (defProvider=0 and hover fallback failed)
-          defCacheSet(cacheKey, null);
+          log.info(`[hover]   "${typeName}" → cached negative (${Date.now() - typeT0}ms)`);
           return null;
         }
+
+        const bgPromise = resolveInBackground(typeName, matchUri, pos, cacheKey);
+        bgPromise.catch(() => {});
+        const BUDGET = Symbol('budget-exceeded');
+        const raced = await Promise.race<DefCacheEntry['result'] | typeof BUDGET>([
+          bgPromise,
+          new Promise(r => setTimeout(() => r(BUDGET), HOVER_BUDGET_MS)),
+        ]);
+        if (raced === BUDGET) {
+          log.info(`[hover]   "${typeName}" → budget ${HOVER_BUDGET_MS}ms exceeded, bg running (${Date.now() - typeT0}ms)`);
+          return null;
+        }
+        if (raced) {
+          if (raced.defDoc) {
+            resolvedDefDocs.push({ uri: raced.defUri, doc: raced.defDoc });
+          }
+          log.info(`[hover]   "${typeName}" → resolved in budget (${Date.now() - typeT0}ms)`);
+          return raced.preview;
+        }
+        return null;
       }
 
-      // Resolve types in parallel (up to 3)
-      const typeResults = await Promise.all(uniqueTypes.slice(0, 3).map(resolveType));
-      for (const r of typeResults) { if (r) { previews.push(r); } }
+      if (token?.isCancellationRequested) {
+        log.info(`[hover] cancelled before resolve (${hoverMs()})`);
+        return null;
+      }
 
-      if (previews.length > 0) {
+      const typeResults = await Promise.all(uniqueTypes.slice(0, 3).map(resolveType));
+      for (const r of typeResults) { if (r) { previewsOut.push(r); } }
+      if (previewsOut.length === 0) { return null; }
+      return { typesKey, previews: previewsOut.join('\n\n---\n') };
+    })();
+
+    inflightHoverPreviews.set(inflightKey, computePromise);
+    hoverRecursionDepth++;
+    try {
+      const computed = await computePromise;
+      if (computed) {
         lastPreviewKey = posKey;
         lastPreviewTime = now;
-
-        const newContents = [...result.contents];
-        for (let ci = 0; ci < newContents.length; ci++) {
-          if (newContents[ci]?.value && typeof newContents[ci].value === 'string') {
-            newContents[ci] = { ...newContents[ci], value: newContents[ci].value + '\n\n---\n' + previews.join('\n\n---\n') };
-            break;
-          }
-        }
-        log.info(`[hover] done: ${previews.length} preview(s) added (${hoverMs()})`);
-        return { ...result, contents: newContents };
+        posPreviewSet(posKey, computed.typesKey, computed.previews);
+        log.info(`[hover] done: previews cached (${hoverMs()})`);
+        return attachPreviews(result, computed.previews);
       }
       log.info(`[hover] done: no previews (${hoverMs()})`);
     } catch (err) {
       log.error(`[hover] error: ${err} (${hoverMs()})`);
     } finally {
       hoverRecursionDepth--;
+      inflightHoverPreviews.delete(inflightKey);
     }
     return result;
   };
