@@ -10,7 +10,8 @@ let hoverRecursionDepth = 0;
 let reinjectTimer: ReturnType<typeof setInterval> | undefined;
 let lastClickId = '';
 let lastClickTime = 0;
-let goToTypeBusy = false;
+// A new click aborts an in-flight click via this controller.
+let currentClickController: AbortController | null = null;
 let hoverPatchActive = false;
 let lastPreviewKey = '';
 let lastPreviewTime = 0;
@@ -51,12 +52,38 @@ function defCacheSet(key: string, result: DefCacheEntry['result']) {
   defCache.set(key, { timestamp: Date.now(), result });
 }
 
+// ── Click negative cache ──
+// Identifier-level: short-circuits goToTypeHandler when a prior click already
+// walked every fallback (steps 1-6) and came up empty. Avoids re-running the
+// ~3-4s import-source scan for genuinely unresolvable tokens. Cleared on save.
+const clickNegCache = new Map<string, number>();
+const CLICK_NEG_TTL = 60_000;
+const CLICK_NEG_MAX = 200;
+function clickNegGet(identifier: string): boolean {
+  const ts = clickNegCache.get(identifier);
+  if (ts === undefined) { return false; }
+  if (Date.now() - ts > CLICK_NEG_TTL) { clickNegCache.delete(identifier); return false; }
+  return true;
+}
+function clickNegSet(identifier: string) {
+  if (clickNegCache.size >= CLICK_NEG_MAX) {
+    const k = clickNegCache.keys().next().value;
+    if (k !== undefined) { clickNegCache.delete(k); }
+  }
+  clickNegCache.set(identifier, Date.now());
+}
+
 // ── Hover budget + background resolve ──
 // Goal: hover overhead ≤ 10ms. On cache miss, race a resolve against a tight
 // budget; if it doesn't finish in time, return preview-less hover and let the
 // resolve finish in the background to populate cache for the next hover.
 const HOVER_BUDGET_MS = 5;
-const BG_RESOLVE_TIMEOUT_MS = 3_000;
+// defProvider is the hot path — Pylance/Jedi commonly stalls up to several
+// seconds on cold symbols. 1500ms keeps the ceiling low without dropping most
+// successful resolves (observed p95 ~1300ms).
+const BG_RESOLVE_DEF_TIMEOUT_MS = 1_500;
+// Hover fallback can pull docstrings over the wire; allow a bit more headroom.
+const BG_RESOLVE_HOVER_TIMEOUT_MS = 2_000;
 
 const inflightResolves = new Map<string, Promise<DefCacheEntry['result']>>();
 
@@ -77,8 +104,9 @@ function findOpenDoc(uri: vscode.Uri): vscode.TextDocument | undefined {
 
 /**
  * Actual defProvider + hoverProvider resolve. Runs to completion (bounded by
- * BG_RESOLVE_TIMEOUT_MS) and writes the result to cache. Deduplicated by
- * cacheKey via `inflightResolves` so concurrent hovers don't spawn duplicate work.
+ * BG_RESOLVE_DEF_TIMEOUT_MS / BG_RESOLVE_HOVER_TIMEOUT_MS) and writes the
+ * result to cache. Deduplicated by cacheKey via `inflightResolves` so
+ * concurrent hovers don't spawn duplicate work.
  */
 function resolveInBackground(
   typeName: string,
@@ -94,7 +122,7 @@ function resolveInBackground(
     try {
       const defs = await withTimeout(
         vscode.commands.executeCommand<vscode.Location[]>('vscode.executeDefinitionProvider', matchUri, pos),
-        BG_RESOLVE_TIMEOUT_MS,
+        BG_RESOLVE_DEF_TIMEOUT_MS,
         'defProvider',
       );
 
@@ -102,7 +130,7 @@ function resolveInBackground(
         const def = defs[0];
         const defDoc = findOpenDoc(def.uri) ?? await withTimeout(
           vscode.workspace.openTextDocument(def.uri),
-          BG_RESOLVE_TIMEOUT_MS,
+          BG_RESOLVE_DEF_TIMEOUT_MS,
           'openDef',
         );
         const startLine = def.range.start.line;
@@ -126,7 +154,7 @@ function resolveInBackground(
       try {
         const hovers = await withTimeout(
           vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', matchUri, pos),
-          BG_RESOLVE_TIMEOUT_MS,
+          BG_RESOLVE_HOVER_TIMEOUT_MS,
           'hoverProvider',
         );
         if (hovers?.length) {
@@ -318,6 +346,8 @@ export async function activate(context: vscode.ExtensionContext) {
       for (const key of posPreviewCache.keys()) {
         if (key.startsWith(prefix)) { posPreviewCache.delete(key); }
       }
+      // Any new save may have added a definition the prior scan missed.
+      clickNegCache.clear();
       // Allow prefetch to run again on next activation of this doc
       prefetchedDocs.delete(savedDoc.uri.fsPath);
     }),
@@ -927,21 +957,52 @@ function findTypeNames(text: string): string[] {
 
 // ── Go to definition handler ──
 
+class AbortError extends Error {
+  constructor() { super('Aborted'); this.name = 'AbortError'; }
+}
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) { throw new AbortError(); }
+}
+
 async function goToTypeHandler(docUriStr: string, identifier: string) {
-  if (goToTypeBusy) { log.info(`goToType: "${identifier}" skipped (busy)`); return; }
   if (identifier.length <= 2) {
     log.info(`goToType: "${identifier}" skipped (too short)`);
     return;
   }
-  goToTypeBusy = true;
-  // Safety timeout: release busy flag after 15s even if goToTypeHandlerInner hangs
+  if (clickNegGet(identifier)) {
+    log.info(`goToType: "${identifier}" skipped (cached negative)`);
+    return;
+  }
+
+  // Cancel any in-flight click so a new one isn't dropped by a busy flag.
+  if (currentClickController && !currentClickController.signal.aborted) {
+    currentClickController.abort();
+    log.info(`goToType: cancelling previous click for new "${identifier}"`);
+  }
+  const controller = new AbortController();
+  currentClickController = controller;
+  const signal = controller.signal;
+
+  // Safety net: abort if the inner handler hangs beyond 15s.
   const safetyTimer = setTimeout(() => {
-    if (goToTypeBusy) {
-      log.warn(`goToType: "${identifier}" safety timeout (15s) — releasing busy flag`);
-      goToTypeBusy = false;
+    if (!signal.aborted) {
+      log.warn(`goToType: "${identifier}" safety timeout (15s) — aborting`);
+      controller.abort();
     }
   }, 15000);
-  try { await goToTypeHandlerInner(docUriStr, identifier); } finally { goToTypeBusy = false; clearTimeout(safetyTimer); }
+
+  try {
+    await goToTypeHandlerInner(docUriStr, identifier, signal);
+  } catch (err) {
+    if (err instanceof AbortError || signal.aborted) {
+      log.info(`goToType: "${identifier}" aborted`);
+    } else {
+      log.warn(`goToType: "${identifier}" error: ${err}`);
+    }
+  } finally {
+    clearTimeout(safetyTimer);
+    if (currentClickController === controller) { currentClickController = null; }
+  }
 }
 
 // Normalize defProvider result (Location or LocationLink) to {uri, range}
@@ -1007,7 +1068,8 @@ function findDefInText(text: string, identifier: string, doc: vscode.TextDocumen
   return null;
 }
 
-async function followImports(identifier: string, docs: vscode.TextDocument[], ms: () => string): Promise<vscode.Location | null> {
+async function followImports(identifier: string, docs: vscode.TextDocument[], ms: () => string, signal?: AbortSignal): Promise<vscode.Location | null> {
+  const checkAbort = () => { if (signal?.aborted) { throw new AbortError(); } };
   // Python: from module.path import Identifier (single-line)
   const pyImportSingle = new RegExp(`^[ \\t]*from[ \\t]+([\\w.]+)[ \\t]+import[ \\t]+.*\\b${esc(identifier)}\\b`, 'm');
   // Python: from module.path import (\n  ...\n  Identifier,\n) (multi-line)
@@ -1016,6 +1078,7 @@ async function followImports(identifier: string, docs: vscode.TextDocument[], ms
   const tsImportRegex = new RegExp(`import[ \\t]+(?:\\{[^}]*\\b${esc(identifier)}\\b[^}]*\\}|${esc(identifier)})[ \\t]+from[ \\t]+['"]([^'"]+)['"]`, 's');
 
   for (const doc of docs) {
+    checkAbort();
     const text = doc.getText();
     const isPython = doc.languageId === 'python' || doc.uri.fsPath.endsWith('.py') || doc.uri.fsPath.endsWith('.pyi');
     const isTS = doc.languageId === 'typescript' || doc.languageId === 'javascript'
@@ -1203,7 +1266,7 @@ async function safeShowTextDocument(docOrUri: vscode.TextDocument | vscode.Uri, 
   }
 }
 
-async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
+async function goToTypeHandlerInner(docUriStr: string, identifier: string, signal?: AbortSignal) {
   const regexSource = `\\b${esc(identifier)}\\b`;
   log.info(`goToType: "${identifier}" regex=/${regexSource}/g`);
   const t0 = Date.now();
@@ -1260,6 +1323,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
   };
   for (let pass = 0; pass < 2; pass++) {
     for (let di = 0; di < allDocs.length; di++) {
+      throwIfAborted(signal);
       const doc = allDocs[di];
       const external = isExternalDoc(doc);
       if (pass === 0 && external) { continue; }  // pass 0: project only
@@ -1270,6 +1334,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
 
       const pos = findDefInText(text, identifier, doc);
       if (pos) {
+        throwIfAborted(signal);
         const line = doc.lineAt(pos.line).text.trim();
         log.info(`→ ${relPath}:${pos.line + 1} "${line.substring(0, 60)}" (defLine${pass === 1 ? '/ext' : ''}, ${ms()})`);
         await safeShowTextDocument(doc, {
@@ -1282,9 +1347,11 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
   }
 
   // ── Step 2: Import-follow (trace import statements to source file) ──
+  throwIfAborted(signal);
   log.info(`  [2] import-follow... (${ms()})`);
   try {
-    const importLoc = await followImports(identifier, allDocs, ms);
+    const importLoc = await followImports(identifier, allDocs, ms, signal);
+    throwIfAborted(signal);
     if (importLoc) {
       log.info(`→ ${vscode.workspace.asRelativePath(importLoc.uri)}:${importLoc.range.start.line + 1} (import-follow, ${ms()})`);
       await safeShowTextDocument(importLoc.uri, {
@@ -1293,12 +1360,14 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
       return;
     }
   } catch (err) {
+    if (err instanceof AbortError) { throw err; }
     log.warn(`  [2] import-follow error: ${err} (${ms()})`);
   }
 
   // ── Step 3: Definition provider (with per-call timeout, skip if first call is slow) ──
   log.info(`  [3] defProvider scan... (${ms()})`);
   for (let di = 0; di < allDocs.length; di++) {
+    throwIfAborted(signal);
     const doc = allDocs[di];
     const relPath = vscode.workspace.asRelativePath(doc.uri);
     const text = doc.getText();
@@ -1316,6 +1385,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
     try {
       let slowFile = false;
       for (let mi = 0; mi < matchPositions.length; mi++) {
+        throwIfAborted(signal);
         if (slowFile) {
           log.info(`  [3.${di}] skip remaining (slow file) (${ms()})`);
           break;
@@ -1326,6 +1396,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
         const defPromise = vscode.commands.executeCommand<vscode.Location[]>('vscode.executeDefinitionProvider', doc.uri, pos);
         const defTimeout = new Promise<null>(r => setTimeout(() => r(null), 5000));
         const defs = await Promise.race([defPromise, defTimeout]);
+        throwIfAborted(signal);
 
         if (defs === null) {
           log.warn(`  [3.${di}.${mi}] TIMEOUT 5s → skip file (${ms()})`);
@@ -1364,11 +1435,13 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
         }
       }
     } catch (err) {
+      if (err instanceof AbortError) { throw err; }
       log.warn(`  [3.${di}] error: ${err} (${ms()})`);
     }
   }
 
   // ── Step 4: Scan import sources of the hover-origin file (max 3s) ──
+  throwIfAborted(signal);
   const step4Deadline = Date.now() + 3000;
   log.info(`  [4] import-source scan... (${ms()})`);
   try {
@@ -1442,6 +1515,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
 
       log.info(`  [4] scanning ${importSources.length} import source(s) (${ms()})`);
       for (const srcUri of importSources) {
+        throwIfAborted(signal);
         if (Date.now() > step4Deadline) {
           log.info(`  [4] timeout after 3s (${ms()})`);
           break;
@@ -1450,6 +1524,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
           const srcDoc = await vscode.workspace.openTextDocument(srcUri);
           const pos = findDefInText(srcDoc.getText(), identifier, srcDoc);
           if (pos) {
+            throwIfAborted(signal);
             const line = srcDoc.lineAt(pos.line).text.trim();
             log.info(`→ ${vscode.workspace.asRelativePath(srcUri)}:${pos.line + 1} "${line.substring(0, 60)}" (importSource, ${ms()})`);
             await safeShowTextDocument(srcDoc, {
@@ -1457,7 +1532,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
             });
             return;
           }
-        } catch {}
+        } catch (err) { if (err instanceof AbortError) { throw err; } }
       }
     }
 
@@ -1468,14 +1543,17 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
     const wsPatterns = [`**/${identifier}.py`, `**/${identifier}.ts`, `**/${identifier}.d.ts`,
       `**/${identifier}.tsx`, `**/${identifier.toLowerCase()}.py`, `**/${identifier.toLowerCase()}.ts`];
     for (const wsPat of wsPatterns) {
+      throwIfAborted(signal);
       if (Date.now() > step4Deadline) { break; }
       const wsFiles = await vscode.workspace.findFiles(wsPat, '**/node_modules/**', 3);
       for (const wsFileUri of wsFiles) {
+        throwIfAborted(signal);
         if (seen.has(wsFileUri.toString())) { continue; }
         try {
           const wsDoc = await vscode.workspace.openTextDocument(wsFileUri);
           const wsPos = findDefInText(wsDoc.getText(), identifier, wsDoc);
           if (wsPos) {
+            throwIfAborted(signal);
             const wsLine = wsDoc.lineAt(wsPos.line).text.trim();
             log.info(`→ ${vscode.workspace.asRelativePath(wsFileUri)}:${wsPos.line + 1} "${wsLine.substring(0, 60)}" (findFiles, ${ms()})`);
             await safeShowTextDocument(wsDoc, {
@@ -1483,15 +1561,17 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
             });
             return;
           }
-        } catch {}
+        } catch (err) { if (err instanceof AbortError) { throw err; } }
       }
     }
     } // end if deadline check
   } catch (err) {
+    if (err instanceof AbortError) { throw err; }
     log.warn(`  [4] error: ${err} (${ms()})`);
   }
 
   // ── Step 5: Direct defProvider on previewLoc (for types the LS knows about) ──
+  throwIfAborted(signal);
   if (previewLoc?.uri) {
     log.info(`  [5] previewLoc defProvider... (${ms()})`);
     try {
@@ -1500,9 +1580,11 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
       regex.lastIndex = 0;
       let pvMatch: RegExpExecArray | null;
       while ((pvMatch = regex.exec(pvText)) !== null) {
+        throwIfAborted(signal);
         const pvPos = pvDoc.positionAt(pvMatch.index);
         const callT0 = Date.now();
         const pvDefs = await vscode.commands.executeCommand<any[]>('vscode.executeDefinitionProvider', pvDoc.uri, pvPos);
+        throwIfAborted(signal);
         const callMs = Date.now() - callT0;
         const pvDef = pvDefs?.length ? normalizeDef(pvDefs[0]) : null;
         if (pvDef) {
@@ -1523,13 +1605,16 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
         }
       }
     } catch (err) {
+      if (err instanceof AbortError) { throw err; }
       log.warn(`  [5] previewLoc defProvider error: ${err} (${ms()})`);
     }
   }
 
   // ── Step 6: Hover fallback ──
+  throwIfAborted(signal);
   log.info(`  [6] hover fallback... (${ms()})`);
   for (let di = 0; di < allDocs.length; di++) {
+    throwIfAborted(signal);
     const doc = allDocs[di];
     const relPath = vscode.workspace.asRelativePath(doc.uri);
     try {
@@ -1540,6 +1625,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
       const pos = doc.positionAt(m.index);
       log.info(`  [6.${di}] ${relPath}:${pos.line + 1} hoverProvider (${ms()})`);
       const hovers = await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', doc.uri, pos);
+      throwIfAborted(signal);
       log.info(`  [6.${di}] returned ${hovers?.length || 0} hover(s) (${ms()})`);
       if (hovers?.length) {
         log.info(`→ hover at ${relPath}:${pos.line + 1} (${ms()})`);
@@ -1547,9 +1633,12 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string) {
         await vscode.commands.executeCommand('editor.action.showHover');
         return;
       }
-    } catch {}
+    } catch (err) {
+      if (err instanceof AbortError) { throw err; }
+    }
   }
 
+  clickNegSet(identifier);
   log.warn(`"${identifier}" not found (${ms()})`);
 }
 
