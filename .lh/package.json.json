@@ -3,11 +3,15 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 0,
+            "activePatchIndex": 1,
             "patches": [
                 {
                     "date": 1776576981553,
                     "content": "Index: \n===================================================================\n--- \n+++ \n"
+                },
+                {
+                    "date": 1776595173659,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellisense-recursion\",\n   \"displayName\": \"IntelliSense Recursion\",\n   \"description\": \"Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA\",\n-  \"version\": \"0.2.2\",\n+  \"version\": \"0.2.3\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n@@ -59,8 +59,11 @@\n   \"scripts\": {\n     \"vscode:prepublish\": \"npm run bundle\",\n     \"compile\": \"tsc -p ./\",\n     \"bundle\": \"tsc -p ./ && node esbuild.js\",\n+    \"bin:build\": \"cd indexer && cargo build --release\",\n+    \"bin:all\": \"bash scripts/build-all.sh\",\n+    \"bin:copy\": \"node scripts/prepackage.js\",\n     \"watch\": \"tsc -watch -p ./\",\n     \"pretest\": \"npm run compile\",\n     \"test\": \"node ./out/test/runTest.js\",\n     \"test:python\": \"TEST_FIXTURE=python node ./out/test/runTest.js\",\n"
                 }
             ],
             "date": 1776576981553,

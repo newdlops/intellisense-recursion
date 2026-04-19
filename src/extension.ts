@@ -85,6 +85,35 @@ async function sidecarDefinitivelyMissing(
   return hits.length === 0;
 }
 
+/** Shared directory-component depth between two absolute paths. */
+function sharedDirDepth(a: string, b: string): number {
+  const aParts = path.dirname(a).split(path.sep);
+  const bParts = path.dirname(b).split(path.sep);
+  const max = Math.min(aParts.length, bParts.length);
+  let i = 0;
+  while (i < max && aParts[i] === bParts[i]) { i++; }
+  return i;
+}
+
+/**
+ * Pick the hit whose path shares the deepest directory prefix with `origin`.
+ * Returns null when two or more hits tie for the deepest prefix (ambiguous).
+ */
+function pickByProximity<T extends { path: string }>(
+  candidates: T[],
+  origin: string,
+): T | null {
+  let best: T | null = null;
+  let bestDepth = -1;
+  let tie = false;
+  for (const c of candidates) {
+    const d = sharedDirDepth(c.path, origin);
+    if (d > bestDepth) { best = c; bestDepth = d; tie = false; }
+    else if (d === bestDepth) { tie = true; }
+  }
+  return tie || bestDepth < 0 ? null : best;
+}
+
 async function fastResolveTypeName(
   typeName: string,
   originFsPath: string,
@@ -99,12 +128,20 @@ async function fastResolveTypeName(
   const nonAlias = hits.filter((h) => h.kind !== 'alias');
   if (nonAlias.length === 0) { return null; }
 
-  // If the workspace itself defines the symbol, only fast-path when there's
-  // exactly one project-side definition (otherwise LSP disambiguates via type
-  // inference, e.g. many `class Meta` inside Django models).
+  // If the workspace itself defines the symbol, prefer project-side hits.
   const projectNonAlias = nonAlias.filter((h) => h.source === 'project');
   if (projectNonAlias.length === 1) { return projectNonAlias[0]; }
-  if (projectNonAlias.length > 1) { return null; }
+  if (projectNonAlias.length > 1) {
+    // Multiple project definitions (e.g. `class Meta` across Django models,
+    // `DIRECTOR` across several enum classes). LSP can disambiguate via type
+    // inference, but it usually times out on large workspaces. Try proximity
+    // first: whichever hit shares the deepest directory prefix with the
+    // origin is almost certainly the intended one. Only fall back to LSP
+    // when proximity ties — otherwise showing a reasonable candidate beats
+    // a 1.5 s stall with no preview.
+    if (!TYPE_SHAPED_NAME.test(typeName)) { return null; }
+    return pickByProximity(projectNonAlias, originFsPath);
+  }
 
   // All non-alias hits are in external roots. Gate on identifier shape:
   // lowercase names (`modal`, `common`, `form`, `predicate`) are almost
@@ -254,9 +291,15 @@ function resolveInBackground(
   matchUri: vscode.Uri,
   pos: vscode.Position,
   cacheKey: string,
+  mode: 'hover' | 'prefetch' = 'hover',
 ): Promise<DefCacheEntry['result']> {
-  const existing = inflightResolves.get(cacheKey);
-  if (existing) { return existing; }
+  // Only hover participates in in-flight dedup. Prefetch runs independently
+  // so a concurrent hover can still take the full LSP path instead of
+  // inheriting prefetch's null (sidecar-skip) result.
+  if (mode === 'hover') {
+    const existing = inflightResolves.get(cacheKey);
+    if (existing) { return existing; }
+  }
 
   const p = (async (): Promise<DefCacheEntry['result']> => {
     const t0 = Date.now();
@@ -285,6 +328,15 @@ function resolveInBackground(
           log.warn(`[bg]   "${typeName}" fast-path error: ${err}`);
           // fall through to LSP
         }
+      }
+
+      // Prefetch is speculative warmup — skip LSP entirely. Don't cache so
+      // a real hover can retry via LSP if the user actually lands on this
+      // token. Prevents 30-token prefetch batches from stacking 1.5 s LSP
+      // timeouts during Pylance backpressure.
+      if (mode === 'prefetch') {
+        log.info(`[bg]   "${typeName}" → prefetch skip LSP (${Date.now() - t0}ms)`);
+        return null;
       }
 
       const defs = await withTimeout(
@@ -358,11 +410,11 @@ function resolveInBackground(
       log.warn(`[bg]   "${typeName}" resolve failed: ${err} (${Date.now() - t0}ms)`);
       return null;
     } finally {
-      inflightResolves.delete(cacheKey);
+      if (mode === 'hover') { inflightResolves.delete(cacheKey); }
     }
   })();
 
-  inflightResolves.set(cacheKey, p);
+  if (mode === 'hover') { inflightResolves.set(cacheKey, p); }
   return p;
 }
 
@@ -418,7 +470,10 @@ const inflightHoverPreviews = new Map<string, Promise<{ typesKey: string; previe
 const prefetchedDocs = new Set<string>();  // uri.fsPath → already scheduled
 const prefetchQueue: Array<() => Promise<void>> = [];
 let prefetchWorkers = 0;
-const PREFETCH_MAX_WORKERS = 3;
+// Single worker. Prefetch is sidecar-only (µs per lookup), so serial issue is
+// not a throughput concern, and this eliminates the concurrent timer pile-up
+// we saw when 3 workers each stalled on LSP backpressure.
+const PREFETCH_MAX_WORKERS = 1;
 const PREFETCH_WORKER_DELAY_MS = 100;
 const PREFETCH_MAX_TOKENS = 30;
 const PREFETCH_MAX_DOC_BYTES = 1_000_000;  // 1 MB
@@ -484,7 +539,7 @@ function schedulePrefetch(doc: vscode.TextDocument | undefined) {
         const key = defCacheKey(doc.uri, t.pos, t.name);
         if (defCacheGet(key)) { continue; }
         enqueuePrefetch(async () => {
-          await resolveInBackground(t.name, doc.uri, t.pos, key);
+          await resolveInBackground(t.name, doc.uri, t.pos, key, 'prefetch');
         });
         queued++;
       }
