@@ -1,8 +1,149 @@
 import * as vscode from 'vscode';
 import * as inspector from 'node:inspector';
+import * as path from 'node:path';
 import WebSocket from 'ws';
+import { IndexManager } from './indexManager';
+import type { SidecarHit, SidecarLanguage } from './sidecar';
 
 const log = vscode.window.createOutputChannel('IntelliSense Recursion', { log: true });
+
+// ── Rust sidecar fast-path manager (Phase 3) ──
+// Null when no workspace or binary missing; all callers guard on this.
+let indexManager: IndexManager | null = null;
+
+function workspaceRootFsPath(): string | null {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders?.length || folders[0].uri.scheme !== 'file') { return null; }
+  return folders[0].uri.fsPath;
+}
+
+function isPythonFsPath(fsPath: string): boolean {
+  return fsPath.endsWith('.py') || fsPath.endsWith('.pyi');
+}
+
+function isSupportedFsPath(fsPath: string): boolean {
+  return (
+    isPythonFsPath(fsPath)
+    || fsPath.endsWith('.ts')
+    || fsPath.endsWith('.tsx')
+    || fsPath.endsWith('.d.ts')
+  );
+}
+
+/**
+ * Derive the sidecar language tag from the file that triggered a lookup.
+ * Returns undefined for files we don't index (means: don't apply a language
+ * filter on the sidecar query — but we also wouldn't reach here since the
+ * fast-path is gated by isSupportedFsPath).
+ */
+function languageOf(fsPath: string): SidecarLanguage | undefined {
+  if (isPythonFsPath(fsPath)) { return 'python'; }
+  if (fsPath.endsWith('.ts') || fsPath.endsWith('.tsx') || fsPath.endsWith('.d.ts')) {
+    return 'typescript';
+  }
+  return undefined;
+}
+
+/**
+ * Ask the sidecar for the best definition of `typeName` and return it only
+ * when the answer is unambiguous.
+ *
+ * Heuristic: exactly one non-alias hit across all kinds. If two or more
+ * non-aliases exist (e.g. `Meta` defined in many Django models, `created_at`
+ * on many models) we return null and let the LSP path disambiguate via type
+ * inference.
+ */
+// PascalCase / SCREAMING_SNAKE only — names shaped like parameter/method
+// (snake_case, starts lowercase) stay on the LSP path because the sidecar
+// doesn't index parameters or local variables.
+const TYPE_SHAPED_NAME = /^[A-Z_][A-Za-z0-9_]*$/;
+
+/**
+ * True when the sidecar has full-library coverage AND returns zero hits for
+ * `typeName`. In that case LSP won't find it either (we already index
+ * .venv/stdlib/typeshed) so we save the 1.5 s timeout.
+ */
+/**
+ * Short-circuit the LSP path only when we're confident the symbol doesn't
+ * exist anywhere the sidecar would find it. Python has full library coverage
+ * (venv + stdlib + typeshed), so a miss is authoritative. TypeScript coverage
+ * is partial (node_modules has .d.ts but also parameters/generics we skip) —
+ * we don't short-circuit there.
+ */
+async function sidecarDefinitivelyMissing(
+  typeName: string,
+  originFsPath: string,
+): Promise<boolean> {
+  if (!indexManager?.hasFullCoverage()) { return false; }
+  if (!TYPE_SHAPED_NAME.test(typeName)) { return false; }
+  const language = languageOf(originFsPath);
+  if (!language) { return false; }
+  // Applies to Python (.venv + stdlib + typeshed covered) and TypeScript
+  // (node_modules covered). If the sidecar finds nothing in the appropriate
+  // language pool, LSP will almost always time out too — skip it.
+  const hits = await indexManager.lookup(typeName, 1, language);
+  return hits.length === 0;
+}
+
+async function fastResolveTypeName(
+  typeName: string,
+  originFsPath: string,
+): Promise<SidecarHit | null> {
+  if (!indexManager) { return null; }
+  // Ask the sidecar for same-language hits only. Cross-language jumps
+  // (e.g. `.tsx` → Python stub file) are always wrong for our users.
+  const language = languageOf(originFsPath);
+  const hits = await indexManager.lookup(typeName, 10, language);
+  if (hits.length === 0) { return null; }
+
+  const nonAlias = hits.filter((h) => h.kind !== 'alias');
+  if (nonAlias.length === 0) { return null; }
+
+  // If the workspace itself defines the symbol, only fast-path when there's
+  // exactly one project-side definition (otherwise LSP disambiguates via type
+  // inference, e.g. many `class Meta` inside Django models).
+  const projectNonAlias = nonAlias.filter((h) => h.source === 'project');
+  if (projectNonAlias.length === 1) { return projectNonAlias[0]; }
+  if (projectNonAlias.length > 1) { return null; }
+
+  // All non-alias hits are in external roots. Gate on identifier shape:
+  // lowercase names (`modal`, `common`, `form`, `predicate`) are almost
+  // always local params / properties — jumping to a random library's
+  // `const modal = ...` is worse than falling through to LSP. PascalCase /
+  // SCREAMING_SNAKE only.
+  if (!TYPE_SHAPED_NAME.test(typeName)) { return null; }
+  // Duplicate stubs across venv/typeshed point at the same logical symbol,
+  // so picking the top one is safe (and dramatically better than a 1.5 s
+  // LSP timeout).
+  return nonAlias[0];
+}
+
+/**
+ * Build the same DefCacheEntry payload as resolveInBackground's LSP success
+ * path, but from a sidecar hit. Opens the target doc, extracts a 15-line
+ * preview, populates lastPreviewLocations, and returns the entry.
+ */
+async function buildResultFromFastHit(
+  typeName: string,
+  hit: SidecarHit,
+): Promise<DefCacheEntry['result']> {
+  // hit.path is always absolute (v2 format reconstructs root + relative).
+  const defUri = vscode.Uri.file(hit.path);
+  const defDoc = findOpenDoc(defUri)
+    ?? await withTimeout(vscode.workspace.openTextDocument(defUri), 1_000, 'openDef (fast)');
+  const startLine = Math.max(0, hit.line - 1);
+  const endLine = Math.min(startLine + 15, defDoc.lineCount);
+  const lines: string[] = [];
+  for (let i = startLine; i < endLine; i++) { lines.push(defDoc.lineAt(i).text); }
+  const previewCode = lines.join('\n');
+  const relPath = vscode.workspace.asRelativePath(defUri);
+  const lang = defDoc.languageId || 'python';
+  const preview = `\`${typeName}\` — *${relPath}:${startLine + 1}*\n\`\`\`${lang}\n${previewCode}\n\`\`\``;
+  const previewLoc = new vscode.Location(defUri, new vscode.Range(startLine, 0, endLine, 0));
+  lastPreviewLocations.set(typeName, previewLoc);
+  for (const pt of findTypeNames(previewCode)) { lastPreviewLocations.set(pt, previewLoc); }
+  return { preview, location: previewLoc, defUri, defDoc };
+}
 
 const lastPreviewLocations = new Map<string, vscode.Location>();
 let lastHoverDocUri = '';
@@ -120,6 +261,32 @@ function resolveInBackground(
   const p = (async (): Promise<DefCacheEntry['result']> => {
     const t0 = Date.now();
     try {
+      // Fast path via the Rust sidecar. Applies to any language the indexer
+      // understands (.py, .pyi, .ts, .tsx, .d.ts).
+      if (indexManager && isSupportedFsPath(matchUri.fsPath)) {
+        try {
+          const fastHit = await fastResolveTypeName(typeName, matchUri.fsPath);
+          if (fastHit) {
+            const entry = await buildResultFromFastHit(typeName, fastHit);
+            if (entry) {
+              defCacheSet(cacheKey, entry);
+              log.info(`[bg]   "${typeName}" → fast def ${fastHit.path}:${fastHit.line} (${Date.now() - t0}ms)`);
+              return entry;
+            }
+          } else if (await sidecarDefinitivelyMissing(typeName, matchUri.fsPath)) {
+            // Full Python library coverage + zero hits + type-shaped name →
+            // LSP won't find anything either. Cache negative and skip the
+            // 1.5 s timeout.
+            defCacheSet(cacheKey, null);
+            log.info(`[bg]   "${typeName}" → sidecar miss (full coverage), skipping LSP (${Date.now() - t0}ms)`);
+            return null;
+          }
+        } catch (err) {
+          log.warn(`[bg]   "${typeName}" fast-path error: ${err}`);
+          // fall through to LSP
+        }
+      }
+
       const defs = await withTimeout(
         vscode.commands.executeCommand<vscode.Location[]>('vscode.executeDefinitionProvider', matchUri, pos),
         BG_RESOLVE_DEF_TIMEOUT_MS,
@@ -331,12 +498,31 @@ function schedulePrefetch(doc: vscode.TextDocument | undefined) {
 export async function activate(context: vscode.ExtensionContext) {
   log.info('Extension activating...');
 
+  // Rust sidecar: non-blocking; if it fails we continue with LSP-only path.
+  indexManager = new IndexManager(context.extensionPath, context.globalStorageUri.fsPath, {
+    info: (m) => log.info(m),
+    warn: (m) => log.warn(m),
+  });
+  if (indexManager.isAvailable()) {
+    indexManager.registerWatchers(context);
+    indexManager.start().catch((err) => log.warn(`[ir] start error: ${err}`));
+  } else {
+    log.info('[ir] sidecar unavailable; running in LSP-only mode');
+  }
+  context.subscriptions.push({ dispose: () => indexManager?.dispose() });
+
   context.subscriptions.push(
     vscode.commands.registerCommand('intellisenseRecursion.goToType', goToTypeHandler),
     vscode.commands.registerCommand('intellisenseRecursion.getPatchStatus', () => ({
       hoverPatchActive,
       hoverRecursionDepth,
     })),
+    vscode.commands.registerCommand('intellisenseRecursion.rebuildIndex', async () => {
+      if (!indexManager) { vscode.window.showWarningMessage('IR: sidecar not available'); return; }
+      vscode.window.showInformationMessage('IR: rebuilding symbol index...');
+      await indexManager.rebuildNow();
+      vscode.window.showInformationMessage('IR: rebuild complete');
+    }),
     // Invalidate caches when documents are saved (content may have changed)
     vscode.workspace.onDidSaveTextDocument(savedDoc => {
       const prefix = savedDoc.uri.fsPath + ':';
@@ -943,6 +1129,22 @@ const SKIP_WORDS = new Set([
   'all', 'each', 'every', 'some', 'any', 'Returns', 'Raises', 'Args',
   'Parameters', 'Note', 'Example', 'param', 'throws', 'since', 'see',
   'deprecated', 'alias', 'overload', 'module', 'variable',
+  // Modal verbs / common doc prose capitalized at sentence start
+  'Cannot', 'Could', 'Would', 'Should',
+  // Pronouns / demonstratives
+  'This', 'That', 'These', 'Those', 'Here', 'There',
+  // Temporal / hedging adverbs
+  'Now', 'Then', 'Usually', 'Sometimes', 'Always', 'Never',
+  'Often', 'Rarely', 'Initially', 'Finally',
+  // Docstring headers we missed the first time
+  'Warning', 'Warnings', 'See', 'Also', 'More', 'Given',
+  'Available', 'Required', 'Reference', 'Examples',
+  // Review / logging words
+  'Copy', 'Wrap', 'Multiple', 'Make', 'Please', 'Raise',
+  'Private', 'Subclasses', 'Implementation', 'Root',
+  'Filesystem', 'Human', 'Last',
+  // Linter codes that show up in comments
+  'F401',
 ]);
 
 function findTypeNames(text: string): string[] {
@@ -1312,6 +1514,51 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string, signa
   });
   log.info(`  docs: [${allDocs.map(d => vscode.workspace.asRelativePath(d.uri)).join(', ')}] (${ms()})`);
 
+  // ── Step 0: Sidecar fast path ──
+  // Gate on the *origin* doc type so unsupported-language clicks aren't
+  // funnelled through the index. Fast-path applies to any supported language;
+  // the short-circuit (definitively-missing) is restricted to Python because
+  // we only have full library coverage there.
+  const originFsPath = (() => {
+    try {
+      if (docUriStr) { return vscode.Uri.parse(docUriStr).fsPath; }
+    } catch {}
+    const active = vscode.window.activeTextEditor;
+    return active?.document.uri.fsPath ?? '';
+  })();
+  const clickSupported = isSupportedFsPath(originFsPath);
+
+  if (indexManager && clickSupported) {
+    try {
+      const fastHit = await fastResolveTypeName(identifier, originFsPath);
+      throwIfAborted(signal);
+      if (fastHit) {
+        try {
+          const defUri = vscode.Uri.file(fastHit.path);
+          const defDoc = findOpenDoc(defUri) ?? await vscode.workspace.openTextDocument(defUri);
+          const pos = new vscode.Position(
+            Math.max(0, fastHit.line - 1),
+            Math.max(0, fastHit.col - 1),
+          );
+          log.info(`→ ${vscode.workspace.asRelativePath(defUri)}:${fastHit.line} (fast/${fastHit.kind}/${fastHit.source}, ${ms()})`);
+          await safeShowTextDocument(defDoc, {
+            selection: new vscode.Range(pos, pos), preserveFocus: false,
+          });
+          return;
+        } catch (err) {
+          log.warn(`  [0] fast path open error: ${err} (${ms()})`);
+        }
+      } else if (await sidecarDefinitivelyMissing(identifier, originFsPath)) {
+        log.info(`  [0] sidecar miss (full coverage) → skip LSP, "${identifier}" not navigable (${ms()})`);
+        clickNegSet(identifier);
+        return;
+      }
+    } catch (err) {
+      if (err instanceof AbortError) { throw err; }
+      log.warn(`  [0] fast path error: ${err} (${ms()})`);
+    }
+  }
+
   // ── Step 1: Fast definition-line scan (no language server, pure regex) ──
   // Two-pass: project files first, then stdlib/.venv/node_modules
   log.info(`  [1] defLine scan... (${ms()})`);
@@ -1646,6 +1893,8 @@ function esc(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 export function deactivate() {
   if (reinjectTimer) { clearInterval(reinjectTimer); }
+  indexManager?.dispose();
+  indexManager = null;
   log.info('Extension deactivated');
   log.dispose();
 }

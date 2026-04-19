@@ -6,6 +6,12 @@ node_modules/
 # Performance test generated fixtures (100K files)
 perf-fixtures/
 
+# Rust indexer build artifacts
+indexer/target/
+
+# Optional local/CI sidecar binaries
+bin/
+
 # Test fixture build artifacts
 src/test/fixtures/rust/target/
 src/test/fixtures/dart/.dart_tool/

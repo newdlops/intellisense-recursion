@@ -5,6 +5,96 @@ All notable changes to the IntelliSense Recursion extension.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.2] - 2026-04-19
+
+Rust sidecar: a compact symbol index that replaces most LSP fallback work.
+Target: go-to-definition in µs for project and library symbols, no more
+1.5 s `defProvider` timeouts on cold lookups.
+
+### Added
+- **`ir-indexer` sidecar binary** (new `indexer/` Rust crate) — tree-sitter
+  based symbol extractor for Python and TypeScript. Produces a compact
+  mmap-friendly binary index (header + FST + varint postings + roots table).
+  Parses class / function / method / type alias / enum / module-level
+  assignments / `self.X = …` in `__init__` / import aliases.
+- **Multi-root indexing with source tags** (v2 format) — project, `venv`,
+  `stdlib`, `typeshed`, `other`. `IndexManager` auto-detects:
+  `.venv/lib/pythonX.Y/site-packages`, Python stdlib via `sysconfig`,
+  the latest Pylance `typeshed-fallback`, and `node_modules/`.
+- **Stdio JSON-RPC protocol** between extension and sidecar
+  (`ping`, `stats`, `lookup`, `lookup_many`). Hits are returned with
+  `path`, `line`, `col`, `kind`, `source`, `language`.
+- **Fast-path in `resolveInBackground` and `goToTypeHandler`** — sidecar
+  lookup runs before LSP. On an unambiguous hit, jump / preview directly.
+- **Definitively-missing short-circuit** — when the sidecar has full
+  library coverage for the origin language and returns zero hits for a
+  type-shaped identifier (PascalCase / SCREAMING_SNAKE), skip the 1.5 s
+  LSP cascade entirely.
+- **Rebuild Symbol Index command** — force a rebuild from the command
+  palette.
+- **On-save re-index** — `.py` / `.pyi` / `.ts` / `.tsx` saves schedule a
+  debounced (10 s) background rebuild, followed by an atomic sidecar
+  restart.
+- Expanded `SKIP_WORDS` with ~30 documentation / prose words
+  (`Cannot`, `Could`, `This`, `That`, `Initially`, `Filesystem`, `F401`,
+  …) to cut LSP calls on obvious non-symbols.
+
+### Changed
+- Ranking across sidecar hits now sorts by
+  `(kind, source, path)` with two semantic overrides:
+  - **Canonical type modules** (`node_modules/typescript/lib/lib.*`,
+    `typing.py` / `typing.pyi`) have their `Variable` kind promoted to
+    `Class`-level rank and their source promoted to project-level. The TS
+    built-in `type Omit = …` and Python stdlib `Union = _SpecialForm(…)`
+    now beat a library's `static Omit()` method or a vendored copy.
+  - **Path sub-rank** within a source prefers `typescript/lib/` →
+    `@types/node/` → `@types/react/` → `@types/*/` → other packages, and
+    demotes `test-data/`, `tests/`, `jedi/third_party/`, `mypy/typeshed/`.
+- `fastResolveTypeName` accepts a sidecar hit only when there is exactly
+  one project-side non-alias candidate, or (for external-only hits) the
+  identifier passes a shape gate — prevents spurious jumps from
+  lowercase params (`modal`, `common`, `form`) landing in random
+  dependencies.
+- Language filter on every lookup: `.py` / `.pyi` queries return only
+  Python hits, `.ts` / `.tsx` / `.d.ts` queries only TypeScript. No more
+  cross-language jumps from `.tsx` into `.pyi` stubs.
+- Click handler gates Step 0 on `docUriStr`'s language so TS clicks
+  aren't funnelled through a Python-only index.
+- Walker no longer excludes `dist/` / `build/` inside extra roots —
+  npm packages (styled-components, @apollo, MUI) ship their `.d.ts` in
+  `dist/`, which was previously skipped, leading to missing
+  `IStyledComponentBase` / `FastOmit` and similar.
+- Walker no longer inherits the project's `.gitignore` into extra roots
+  (`parents(false)`), so `node_modules/` entries in the workspace's
+  `.gitignore` don't invalidate the explicitly-requested root.
+
+### Performance (captain monorepo, 73 k files indexed)
+- Index size: 21.06 MiB total
+  (project 20 937 / venv 24 829 / stdlib 2 590 / typeshed 4 672 /
+  node_modules 20 352).
+- Cold build: ~11 s. Rebuild on save: debounced 10 s + ~11 s.
+- Sidecar cold lookup (Rust query): p50 0.25 µs, p99 &lt;150 µs for
+  1000-hit symbols.
+- End-to-end lookup from Node (stdio JSON): p50 20 µs, p99 134 µs.
+- Observed real-world impact:
+  - `IStyledComponentBase` click: 3550 ms timeout → 18 ms.
+  - `_RWrapped` (stdlib `functools.pyi`): timeout → 11 µs.
+  - `TYPE_CHECKING` / `Self` / `Any`: 1.5–2.2 s LSP timeout →
+    `typing.pyi` fast-path.
+  - Type-shaped names that nowhere match (e.g. `FIXME`, `LLC`, generic
+    type parameters in jQuery stubs): 1.5 s timeout → µs short-circuit.
+
+### Packaging
+- Dev builds locate the binary at `indexer/target/release/ir-indexer`.
+  Packaged builds download the current-OS sidecar from the matching GitHub
+  Release into VS Code global storage on first activation, verify it against
+  `SHA256SUMS`, then use it. If the download is unavailable, they compile
+  the bundled Rust source via `cargo build --locked --release`. If both
+  paths fail, the extension logs a warning and runs in LSP-only mode.
+- Per-workspace index cached at
+  `~/.cache/intellisense-recursion/<sha1-16>.bin`. The cache key is the
+  workspace root path. Cleared on uninstall.
+
 ## [0.2.0] - 2026-04-17
 
 Major hover performance overhaul. Target: ≤10 ms overhead on every hover, no
@@ -76,6 +166,7 @@ UI freeze on language-server stalls.
   protocol-level `$provideHover` patch.
 - Initial release: hover type previews inside tooltips across 14+ languages.
 
+[0.2.2]: https://github.com/newdlops/intellisense-recursion/releases/tag/v0.2.2
 [0.2.0]: https://github.com/newdlops/intellisense-recursion/releases/tag/v0.2.0
 [0.1.8]: https://github.com/newdlops/intellisense-recursion/releases/tag/v0.1.8
 [0.1.7]: https://github.com/newdlops/intellisense-recursion/releases/tag/v0.1.7

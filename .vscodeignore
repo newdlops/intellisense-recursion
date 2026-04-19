@@ -1,11 +1,46 @@
+# ── dev-only config ──
 .vscode/**
 .vscode-test/**
-src/**
-.gitignore
 .claude/**
-memory/**
+.lh/**
+.github/**
+.gitignore
+
+# ── TypeScript source (bundled into out/extension.js by esbuild) ──
+src/**
 tsconfig.json
 esbuild.js
-package-lock.json
-**/*.map
+
+# ── docs / design notes kept out of the vsix ──
+memory/**
+spec.md
+
+# ── Rust sidecar build output ──
+# The source is packaged as an offline fallback; clients first try to
+# download the current-OS release binary, then compile from source if cargo
+# is available. Cargo target directories stay out of the vsix.
+indexer/target*/**
+
+# ── build scripts ──
+scripts/**
+
+# ── node / build artifacts ──
 node_modules/**
+package-lock.json
+
+# ── sourcemaps and compiled tests ──
+**/*.map
+out/test/**
+out/**/*.test.js
+
+# ── orphan tsc outputs (esbuild inlines these into out/extension.js) ──
+out/indexManager.js
+out/sidecar.js
+
+# ── optional local/CI prebuilt binaries ──
+# Shipped extensions download release binaries on demand instead of carrying
+# platform-specific binaries in every vsix.
+bin/**
+
+# ── previously-packaged vsix files ──
+*.vsix

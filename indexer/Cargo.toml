@@ -1,0 +1,28 @@
+[package]
+name = "ir-indexer"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.75"
+publish = false
+
+[[bin]]
+name = "ir-indexer"
+path = "src/main.rs"
+
+[dependencies]
+tree-sitter = "0.22"
+tree-sitter-python = "0.21"
+tree-sitter-typescript = "0.21"
+fst = "0.4"
+memmap2 = "0.9"
+rayon = "1.10"
+ignore = "0.4"
+clap = { version = "4.5", features = ["derive"] }
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

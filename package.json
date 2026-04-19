@@ -2,7 +2,7 @@
   "name": "intellisense-recursion",
   "displayName": "IntelliSense Recursion",
   "description": "Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA",
-  "version": "0.2.1",
+  "version": "0.2.2",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
@@ -49,6 +49,10 @@
       {
         "command": "intellisenseRecursion.goToType",
         "title": "Go to Definition (from hover)"
+      },
+      {
+        "command": "intellisenseRecursion.rebuildIndex",
+        "title": "IR: Rebuild Symbol Index"
       }
     ]
   },
@@ -56,6 +60,9 @@
     "vscode:prepublish": "npm run bundle",
     "compile": "tsc -p ./",
     "bundle": "tsc -p ./ && node esbuild.js",
+    "bin:build": "cd indexer && cargo build --release",
+    "bin:all": "bash scripts/build-all.sh",
+    "bin:copy": "node scripts/prepackage.js",
     "watch": "tsc -watch -p ./",
     "pretest": "npm run compile",
     "test": "node ./out/test/runTest.js",
@@ -77,7 +84,7 @@
     "perf:1m": "npm run compile && npm run perf:generate:1m && npm run perf:run",
     "perf:keep": "PERF_CLEANUP=false npm run perf",
     "package": "npx @vscode/vsce package",
-    "deploy:local": "npm run package && code --install-extension intellisense-recursion-0.1.3.vsix --force && echo 'Installed! Restart VS Code to activate.'"
+    "deploy:local": "npm run package && code --install-extension intellisense-recursion-$npm_package_version.vsix --force && echo 'Installed! Restart VS Code to activate.'"
   },
   "devDependencies": {
     "@types/glob": "^8.1.0",

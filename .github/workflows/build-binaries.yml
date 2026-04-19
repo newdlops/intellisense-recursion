@@ -1,0 +1,134 @@
+name: Build sidecar binaries
+
+# Multi-platform build for the ir-indexer Rust sidecar. Each OS runs on its
+# own native runner — no cross-compilation, no Docker required. Artifacts
+# are named with VS Code's `<platform>-<arch>` convention so
+# `scripts/prepackage.js` can pick them up verbatim.
+#
+# Trigger manually from the Actions tab or on pushing a `v*` tag.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: darwin-arm64
+            runner: macos-14            # Apple Silicon
+            target: aarch64-apple-darwin
+            artifact: ir-indexer-darwin-arm64
+          - name: darwin-x64
+            runner: macos-13            # Intel
+            target: x86_64-apple-darwin
+            artifact: ir-indexer-darwin-x64
+          - name: linux-x64
+            runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact: ir-indexer-linux-x64
+          - name: linux-arm64
+            runner: ubuntu-latest-arm64  # GitHub's ARM64 Linux runner
+            target: aarch64-unknown-linux-gnu
+            artifact: ir-indexer-linux-arm64
+          - name: win32-x64
+            runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: ir-indexer-win32-x64.exe
+          - name: win32-arm64
+            runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact: ir-indexer-win32-arm64.exe
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: indexer
+
+      - name: Build
+        working-directory: indexer
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Stage binary
+        shell: bash
+        run: |
+          mkdir -p bin
+          if [[ "${{ matrix.runner }}" == windows-* ]]; then
+            cp "indexer/target/${{ matrix.target }}/release/ir-indexer.exe" "bin/${{ matrix.artifact }}"
+          else
+            cp "indexer/target/${{ matrix.target }}/release/ir-indexer" "bin/${{ matrix.artifact }}"
+            chmod +x "bin/${{ matrix.artifact }}"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: bin/${{ matrix.artifact }}
+          if-no-files-found: error
+
+  package:
+    # Collect every platform binary, run `vsce package`, attach the .vsix.
+    name: package vsix
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      - name: Install deps
+        run: npm ci
+
+      - name: Download all sidecar binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: bin-artifacts
+
+      - name: Assemble bin/
+        shell: bash
+        run: |
+          mkdir -p bin
+          find bin-artifacts -type f -name 'ir-indexer-*' -exec cp {} bin/ \;
+          chmod +x bin/ir-indexer-* 2>/dev/null || true
+          ls -lh bin/
+
+      - name: Bundle + package
+        run: |
+          npm run bundle
+          npx @vscode/vsce package --no-dependencies
+
+      - name: Generate checksums
+        shell: bash
+        run: shasum -a 256 bin/ir-indexer-* *.vsix > SHA256SUMS
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vsix
+          path: |
+            *.vsix
+            SHA256SUMS
+          if-no-files-found: error
+
+      - name: Publish release assets
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            bin/ir-indexer-*
+            *.vsix
+            SHA256SUMS
