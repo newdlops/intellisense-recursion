@@ -193,6 +193,12 @@ let currentClickController: AbortController | null = null;
 let hoverPatchActive = false;
 let lastPreviewKey = '';
 let lastPreviewTime = 0;
+// Persistent main-process CDP WebSocket — set by startClickListener after
+// injection succeeds. previewTypeHandler reuses it via sendToRenderer to
+// push Runtime.evaluate calls back into the renderer (in-place hover
+// content swap on plain click).
+let mainWsRef: WebSocket | null = null;
+let cdpMsgIdCounter = 100_000;
 
 // ── Definition cache (LRU-style with TTL) ──
 // Key: "uri:line:character:typeName", Value: cached result or negative marker
@@ -613,7 +619,39 @@ export async function activate(context: vscode.ExtensionContext) {
   await injectRenderer();
   reinjectTimer = setInterval(() => { reinjectRenderer().catch(() => {}); }, 10000);
 
+  // Trigger Monaco service captures by briefly side-opening an editor.
+  // The renderer's prototype hooks (defined by the patch script but
+  // dormant by default) are activated by __irStartCapture and torn
+  // down by __irStopCapture immediately after — total active window
+  // ~1s, no impact on click handlers or hover underline.
+  setTimeout(() => { triggerMonacoCapture().catch(() => {}); }, 2000);
+
   log.info('Extension activated');
+}
+
+async function triggerMonacoCapture() {
+  try {
+    const active = vscode.window.activeTextEditor;
+    if (!active) {
+      log.info('[capture] no active editor — skipping');
+      return;
+    }
+    sendToRenderer("(window.__irStartCapture && window.__irStartCapture('side-open'))");
+    log.info(`[capture] side-opening ${vscode.workspace.asRelativePath(active.document.uri)}`);
+    try {
+      await vscode.window.showTextDocument(active.document, {
+        viewColumn: vscode.ViewColumn.Beside,
+        preserveFocus: true,
+        preview: true,
+      });
+    } catch (e) { log.warn(`[capture] showTextDocument err: ${e}`); }
+    await new Promise(r => setTimeout(r, 700));
+    try { await vscode.commands.executeCommand('workbench.action.closeEditorsInGroup'); } catch {}
+    await new Promise(r => setTimeout(r, 300));
+    sendToRenderer("(window.__irStopCapture && window.__irStopCapture())");
+  } catch (e) {
+    log.warn(`[capture] trigger error: ${e}`);
+  }
 }
 
 // ── V8 Inspector: extract shared ExtHostLanguageFeatures ──
@@ -1024,13 +1062,37 @@ async function reinjectRenderer() {
 
 function startClickListener(mainWs: any) {
   log.info('[listen] Click event listener started (binding-driven)');
+  mainWsRef = mainWs;
 
   mainWs.on('message', (data: string) => {
     try {
       const resp = JSON.parse(data);
+      // sendToRenderer responses use ids >= 100000 — surface exceptions
+      // and result values so silent failures aren't invisible.
+      if (typeof resp.id === 'number' && resp.id >= 100_000) {
+        if (resp.error) {
+          log.warn(`[send-resp] id=${resp.id} error=${JSON.stringify(resp.error)}`);
+        } else if (resp.result?.exceptionDetails) {
+          const ex = resp.result.exceptionDetails;
+          const msg = ex.exception?.description || ex.exception?.value || ex.text || '?';
+          log.warn(`[send-resp] id=${resp.id} exception=${msg}`);
+        } else if (resp.result?.result) {
+          const r = resp.result.result;
+          const v = r.value !== undefined ? JSON.stringify(r.value) : `(type=${r.type})`;
+          log.info(`[send-resp] id=${resp.id} value=${v}`);
+        }
+        return;
+      }
       if (resp.method === 'Runtime.bindingCalled' && resp.params?.name === 'irClickNotify') {
         const val = String(resp.params.payload);
-        if (val.startsWith('LOG:')) { return; }
+        if (val.startsWith('LOG:')) {
+          log.info(`[renderer] ${val.substring(4)}`);
+          return;
+        }
+        if (val.startsWith('SEND:')) {
+          log.info(`[send] ${val.substring(5)}`);
+          return;
+        }
 
         // Debounce: ignore duplicate clicks for same identifier within 300ms
         const now = Date.now();
@@ -1040,13 +1102,21 @@ function startClickListener(mainWs: any) {
 
         log.info(`Click: "${val}"`);
         const editor = vscode.window.activeTextEditor;
-        if (editor) { goToTypeHandler(editor.document.uri.toString(), val); }
+        const docUri = editor?.document.uri.toString() || '';
+
+        if (val.startsWith('PREVIEW:')) {
+          const typeName = val.substring('PREVIEW:'.length);
+          previewTypeHandler(docUri, typeName).catch(err => log.warn(`preview: error: ${err}`));
+        } else if (editor) {
+          goToTypeHandler(editor.document.uri.toString(), val);
+        }
       }
     } catch {}
   });
 
   mainWs.on('close', () => {
     log.warn('[listen] CDP WebSocket closed — click listener lost. Will attempt reconnect...');
+    if (mainWsRef === mainWs) { mainWsRef = null; }
     setTimeout(() => {
       log.info('[listen] Attempting CDP reconnect...');
       injectRenderer().catch(err => log.error(`[listen] Reconnect failed: ${err}`));
@@ -1056,6 +1126,170 @@ function startClickListener(mainWs: any) {
   mainWs.on('error', (err: any) => {
     log.warn(`[listen] CDP WebSocket error: ${err}`);
   });
+}
+
+/**
+ * Push a Runtime.evaluate via the persistent main-process CDP WebSocket so
+ * the given JS runs inside the focused renderer window (where our hover
+ * popup lives). Used to update visible hover content in place after a
+ * plain click on a type link, and to start/stop monaco capture hooks.
+ */
+function sendToRenderer(rendererJs: string): void {
+  const ws = mainWsRef;
+  if (!ws || ws.readyState !== 1 /* OPEN */) {
+    log.warn(`sendToRenderer: no active main-process WebSocket`);
+    return;
+  }
+  const b64 = Buffer.from(rendererJs).toString('base64');
+  const expr = `(async function() {
+    var BW = require('electron').BrowserWindow;
+    var w = BW.getFocusedWindow();
+    if (!w) {
+      if (typeof global.irClickNotify === 'function') { global.irClickNotify('SEND:no-focused-window'); }
+      return 'no-focused-window';
+    }
+    var wid = w.id;
+    var summary;
+    try {
+      var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: "eval(atob('" + ${JSON.stringify(b64)} + "'))" });
+      if (r && r.exceptionDetails) {
+        var et = r.exceptionDetails.exception ? (r.exceptionDetails.exception.description || r.exceptionDetails.exception.value) : r.exceptionDetails.text;
+        summary = 'wid=' + wid + ' exc=' + (et || '?');
+      } else {
+        summary = 'wid=' + wid + ' ok';
+      }
+    } catch (e) {
+      summary = 'wid=' + wid + ' snd=' + (e && e.message ? e.message : String(e));
+    }
+    if (typeof global.irClickNotify === 'function') { global.irClickNotify('SEND:' + summary); }
+    return summary;
+  })()`;
+  const id = ++cdpMsgIdCounter;
+  try {
+    ws.send(JSON.stringify({
+      id,
+      method: 'Runtime.evaluate',
+      params: { expression: expr, awaitPromise: true, returnByValue: true, includeCommandLineAPI: true },
+    }));
+  } catch (err) {
+    log.warn(`sendToRenderer error: ${err}`);
+  }
+}
+
+// ASCII-escape every non-ASCII char to \\uXXXX. The payload is base64-
+// encoded for transport and the renderer uses atob() which returns a
+// binary (latin-1) string; without the escape, UTF-8 multibyte chars
+// (e.g. Korean) come out as mojibake when the string is eval'd.
+function jsonStringifyAscii(value: unknown): string {
+  return JSON.stringify(value).replace(/[-￿]/g, c =>
+    '\\u' + ('0000' + c.charCodeAt(0).toString(16)).slice(-4));
+}
+
+async function previewTypeHandler(docUriStr: string, identifier: string): Promise<void> {
+  if (identifier.length <= 2) { return; }
+  const t0 = Date.now();
+  const ms = () => `${Date.now() - t0}ms`;
+  log.info(`preview: "${identifier}" start`);
+
+  // Sidecar FIRST — lastPreviewLocations caches every nested type against
+  // the OUTER hover's location, which would make a click on a nested
+  // name re-show the parent. Sidecar resolves by name → index, so it
+  // never confuses parent and child.
+  let loc: vscode.Location | null = null;
+  let originFs = '';
+  try { if (docUriStr) { originFs = vscode.Uri.parse(docUriStr).fsPath; } } catch {}
+  if (!originFs) { originFs = vscode.window.activeTextEditor?.document.uri.fsPath ?? ''; }
+  if (originFs && indexManager) {
+    try {
+      const fastHit = await fastResolveTypeName(identifier, originFs);
+      if (fastHit) {
+        loc = new vscode.Location(
+          vscode.Uri.file(fastHit.path),
+          new vscode.Position(Math.max(0, fastHit.line - 1), Math.max(0, fastHit.col - 1)),
+        );
+        log.info(`preview:   loc from sidecar: ${vscode.workspace.asRelativePath(loc.uri)}:${fastHit.line}`);
+      }
+    } catch (err) { log.warn(`preview: sidecar error: ${err}`); }
+  }
+  // Fallback: hover-side cache. The cache stores the OUTER symbol's
+  // location for nested type names. Locate the actual identifier text
+  // around the cached line and use THAT position so the LSP returns
+  // the right symbol's hover.
+  if (!loc) {
+    const cached = lastPreviewLocations.get(identifier);
+    if (cached) {
+      try {
+        const cacheDoc = findOpenDoc(cached.uri) ?? await vscode.workspace.openTextDocument(cached.uri);
+        const cl = cached.range.start.line;
+        const startLine = Math.max(0, cl - 5);
+        const endLine = Math.min(cacheDoc.lineCount, cl + 30);
+        const re = new RegExp(`\\b${esc(identifier)}\\b`);
+        let foundPos: vscode.Position | null = null;
+        for (let li = startLine; li < endLine; li++) {
+          const m = re.exec(cacheDoc.lineAt(li).text);
+          if (m) { foundPos = new vscode.Position(li, m.index); break; }
+        }
+        if (foundPos) {
+          loc = new vscode.Location(cached.uri, foundPos);
+          log.info(`preview:   loc from cache+find: ${vscode.workspace.asRelativePath(cached.uri)}:${foundPos.line + 1}:${foundPos.character + 1}`);
+        } else {
+          loc = cached;
+          log.info(`preview:   loc from cache raw: ${vscode.workspace.asRelativePath(cached.uri)}:${cl + 1}`);
+        }
+      } catch (err) {
+        log.warn(`preview: cache lookup error: ${err}`);
+        loc = cached;
+      }
+    }
+  }
+  if (!loc) {
+    log.info(`preview: "${identifier}" no location (${ms()})`);
+    return;
+  }
+
+  let doc: vscode.TextDocument;
+  try { doc = await vscode.workspace.openTextDocument(loc.uri); }
+  catch (err) { log.warn(`preview: openDoc error: ${err} (${ms()})`); return; }
+
+  let markdown = '';
+  try {
+    const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+      'vscode.executeHoverProvider', loc.uri, loc.range.start,
+    );
+    if (hovers?.length) {
+      const parts: string[] = [];
+      for (const h of hovers) {
+        for (const c of (h.contents as any[])) {
+          const val = typeof c === 'string' ? c
+            : c instanceof vscode.MarkdownString ? c.value
+            : (c && typeof c.value === 'string') ? c.value
+            : null;
+          if (val) { parts.push(val); }
+        }
+      }
+      markdown = parts.join('\n\n---\n\n');
+    }
+  } catch (err) {
+    log.warn(`preview: hoverProvider error: ${err} (${ms()})`);
+  }
+
+  // Synthesize a code-fenced preview from the def location if no hover.
+  if (!markdown) {
+    const startLine = loc.range.start.line;
+    const endLine = Math.min(startLine + 15, doc.lineCount);
+    const lines: string[] = [];
+    for (let i = startLine; i < endLine; i++) { lines.push(doc.lineAt(i).text); }
+    const previewCode = lines.join('\n');
+    const relPath = vscode.workspace.asRelativePath(loc.uri);
+    const lang = doc.languageId || '';
+    markdown = `\`${identifier}\` — *${relPath}:${startLine + 1}*\n\`\`\`${lang}\n${previewCode}\n\`\`\``;
+  }
+
+  const safeId = jsonStringifyAscii(identifier);
+  const safeMd = jsonStringifyAscii(markdown);
+  const rendererJs = `if(typeof window.irApplyPreview==='function')window.irApplyPreview(${safeId},${safeMd})`;
+  sendToRenderer(rendererJs);
+  log.info(`preview: "${identifier}" sent (${markdown.length}md, ${ms()})`);
 }
 
 function httpGet(url: string): Promise<string> {
@@ -1075,38 +1309,215 @@ function httpGet(url: string): Promise<string> {
 
 function getHoverPatchScript(): string {
   return `(function(){
-if(window.__irHoverPatched)return 'already patched';
-window.__irHoverPatched=true;
+var IR_PATCH_VERSION = 20;
+if(window.__irPatchVersion === IR_PATCH_VERSION) return 'already patched';
+
+// Tear down any prior version's listeners and style so the new patch
+// has a clean slate. Each version stores its registered listeners on
+// window.__irListeners so the next install can remove them precisely.
+try {
+  if (window.__irListeners) {
+    for (var n = 0; n < window.__irListeners.length; n++) {
+      var L = window.__irListeners[n];
+      try { L.target.removeEventListener(L.type, L.fn, L.capture); } catch(_) {}
+    }
+  }
+  if (window.__irStyleEl && window.__irStyleEl.parentNode) {
+    window.__irStyleEl.parentNode.removeChild(window.__irStyleEl);
+  }
+  if (window.__irScanInterval) { clearInterval(window.__irScanInterval); }
+  if (window.__irStopCapture) { try { window.__irStopCapture(); } catch(_) {} }
+} catch(_) {}
+window.__irListeners = [];
+window.__irPatchVersion = IR_PATCH_VERSION;
+window.__irHoverPatched = true;  // legacy compat
 
 function irLog(msg){if(typeof window.irGoToType==='function')window.irGoToType('LOG:'+msg)}
-irLog('renderer: patch installing');
+irLog('renderer: patch v'+IR_PATCH_VERSION+' installing');
+
+function track(target, type, fn, capture){
+  target.addEventListener(type, fn, capture);
+  window.__irListeners.push({target:target,type:type,fn:fn,capture:capture});
+}
 
 var style=document.createElement('style');
-style.textContent='.ir-type-link{cursor:default}body.ir-cmd-held .ir-type-link:hover{text-decoration:underline !important;cursor:pointer !important;color:var(--vscode-textLink-foreground) !important}';
+style.textContent=[
+  // Always-on underline + pointer on hover. cmd/ctrl is no longer
+  // required to see the hint that a symbol is clickable.
+  '.ir-type-link,.ir-type-link *{cursor:pointer !important}',
+  '.ir-type-link:hover,.ir-type-link:hover *{text-decoration:underline !important;color:var(--vscode-textLink-foreground) !important}',
+].join('');
 document.head.appendChild(style);
+window.__irStyleEl = style;
 irLog('renderer: CSS injected');
 
-document.addEventListener('keydown',function(e){if(e.metaKey||e.ctrlKey)document.body.classList.add('ir-cmd-held')});
-document.addEventListener('keyup',function(e){if(!e.metaKey&&!e.ctrlKey)document.body.classList.remove('ir-cmd-held')});
-irLog('renderer: key listeners added');
+// Eat mousedown on type-links so VS Code's selection / focus-change
+// logic can't fire before our click handler — some hover widgets
+// dismiss on mousedown outside the editor.
+track(document,'mousedown',function(e){
+  var t=e.target;
+  if(!t||!t.classList||!t.classList.contains('ir-type-link'))return;
+  e.preventDefault();e.stopPropagation();
+},true);
 
-document.addEventListener('click',function(e){
-  if(!(e.metaKey||e.ctrlKey))return;
+track(document,'click',function(e){
   var t=e.target;
   if(!t||!t.classList||!t.classList.contains('ir-type-link'))return;
   var typeName=t.getAttribute('data-type');
   if(!typeName)return;
   e.preventDefault();e.stopPropagation();
-  irLog('renderer: click on "'+typeName+'"');
-  if(typeof window.irGoToType==='function'){window.irGoToType(typeName)}
-  else{irLog('renderer: irGoToType binding not available!')}
+  if(e.metaKey||e.ctrlKey){
+    irLog('renderer: cmd-click on "'+typeName+'"');
+    if(typeof window.irGoToType==='function'){window.irGoToType(typeName)}
+  }else{
+    var anc=t.closest('.rendered-markdown');
+    window.__irLastPreviewTarget=anc;
+    irLog('renderer: plain-click on "'+typeName+'"');
+    if(typeof window.irGoToType==='function'){window.irGoToType('PREVIEW:'+typeName)}
+  }
 },true);
+
+// ── Markdown → DOM (TrustedHTML-safe) ─────────────────────────────────
+// We never set innerHTML or use DOMParser.parseFromString — both are
+// blocked by VS Code's CSP. Build everything via createElement and
+// createTextNode. Handles fenced code, inline \`code\`, paragraphs,
+// headings, hr, line breaks. Other markdown is rendered as plain text.
+function irBuildInline(text, parent){
+  var re=/\\\`([^\\\`]+)\\\`/g; var last=0; var m;
+  while((m=re.exec(text))!==null){
+    if(m.index>last) parent.appendChild(document.createTextNode(text.substring(last,m.index)));
+    var c=document.createElement('code'); c.textContent=m[1]; parent.appendChild(c);
+    last=m.index+m[0].length;
+  }
+  if(last<text.length){
+    var rest=text.substring(last);
+    if(rest.indexOf('\\n')<0){ parent.appendChild(document.createTextNode(rest)); return; }
+    var parts=rest.split('\\n');
+    for(var i=0;i<parts.length;i++){
+      if(parts[i]) parent.appendChild(document.createTextNode(parts[i]));
+      if(i<parts.length-1) parent.appendChild(document.createElement('br'));
+    }
+  }
+}
+function irBuildParagraphs(text,parent){
+  var paras=text.split(/\\n\\s*\\n/);
+  for(var p=0;p<paras.length;p++){
+    var t=paras[p].trim(); if(!t) continue;
+    if(/^---+$/.test(t)){ parent.appendChild(document.createElement('hr')); continue; }
+    var h=/^(#{1,6})\\s+(.+)$/.exec(t);
+    if(h){
+      var hEl=document.createElement('h'+h[1].length);
+      irBuildInline(h[2],hEl); parent.appendChild(hEl); continue;
+    }
+    var pEl=document.createElement('p');
+    irBuildInline(t,pEl); parent.appendChild(pEl);
+  }
+}
+function irBuildMdDom(md,parent){
+  var i=0; var len=md.length;
+  while(i<len){
+    var fenceAt=-1;
+    if(md.substr(i,3)==='\\\`\\\`\\\`') fenceAt=i;
+    else { var nl=md.indexOf('\\n\\\`\\\`\\\`',i); if(nl>=0) fenceAt=nl+1; }
+    if(fenceAt<0){ irBuildParagraphs(md.substring(i),parent); break; }
+    if(fenceAt>i) irBuildParagraphs(md.substring(i,fenceAt),parent);
+    var langStart=fenceAt+3;
+    var nlAfter=md.indexOf('\\n',langStart);
+    if(nlAfter<0) break;
+    var lang=md.substring(langStart,nlAfter).trim();
+    var endFence=md.indexOf('\\\`\\\`\\\`',nlAfter+1);
+    if(endFence<0) break;
+    var code=md.substring(nlAfter+1,endFence);
+    if(code.charAt(code.length-1)==='\\n') code=code.substring(0,code.length-1);
+    var pre=document.createElement('pre');
+    if(lang) pre.setAttribute('data-lang',lang);
+    var c=document.createElement('code');
+    if(lang) c.className='language-'+lang;
+    // Try Monaco-themed tokenization (Phase 2). Returns a fragment of
+    // cloned .mtkN spans. Wrap in .monaco-editor so the .mtkN CSS rules
+    // (scoped under .monaco-editor in VS Code's stylesheet) resolve.
+    var tokenized=null;
+    if(typeof window.__irTokenizeCode==='function'){
+      try { tokenized=window.__irTokenizeCode(code,lang); } catch(_) {}
+    }
+    if(tokenized){
+      var monaWrap=document.createElement('span');
+      monaWrap.className='monaco-editor';
+      monaWrap.appendChild(tokenized);
+      c.appendChild(monaWrap);
+    } else {
+      c.textContent=code;
+    }
+    pre.appendChild(c);
+    parent.appendChild(pre);
+    i=endFence+3; if(md.charAt(i)==='\\n') i++;
+  }
+}
+
+// Decode HTML entities + unescape markdown backslash escapes that some
+// LSPs leave in their hover content (e.g. \`<class 'int'>\` arrives as
+// \`&lt;class &#39;int&#39;&gt;\` and \`\\<\` stays raw).
+function irDecodeContent(s){
+  var out=s;
+  out=out.replace(/&lt;/g,'<').replace(/&gt;/g,'>').replace(/&quot;/g,'"').replace(/&#39;/g,"'").replace(/&apos;/g,"'").replace(/&nbsp;/g,' ').replace(/&amp;/g,'&');
+  var lines=out.split('\\n');
+  var inFence=false;
+  for(var li=0;li<lines.length;li++){
+    if(lines[li].indexOf('\\\`\\\`\\\`')===0) { inFence=!inFence; continue; }
+    if(inFence) continue;
+    lines[li]=lines[li].replace(/\\\\([\\\\\\\`*_{}\\[\\]()#+\\-.!<>|~])/g, '$1');
+  }
+  return lines.join('\\n');
+}
+
+window.irApplyPreview=function(typeName,md){
+  irLog('renderer: irApplyPreview "'+typeName+'" md='+md.length+'B');
+  var target=window.__irLastPreviewTarget;
+  var src='stored';
+  if(!target||!document.body.contains(target)){
+    src='fallback';
+    var nodes=document.querySelectorAll('.monaco-hover .rendered-markdown, .monaco-editor-hover .rendered-markdown');
+    target=null;
+    for(var i=nodes.length-1;i>=0;i--){
+      if(nodes[i].offsetParent!==null){target=nodes[i];break}
+    }
+  }
+  if(!target){ irLog('renderer: irApplyPreview no target for "'+typeName+'"'); return; }
+  try {
+    var decoded=irDecodeContent(md);
+    while(target.firstChild) target.removeChild(target.firstChild);
+    target.classList.add('ir-applied');
+    irBuildMdDom(decoded,target);
+  } catch(eAP){
+    irLog('renderer: irApplyPreview build err: '+(eAP&&eAP.message?eAP.message:String(eAP)));
+    return;
+  }
+  // Let the popup grow to fit new content. Scoped to the hover subtree
+  // so we never touch workbench layout (walking up to body broke the
+  // entire UI in earlier versions). Reset scroll so the user lands at
+  // the top of the new content.
+  try {
+    var hoverEl=target.closest('.monaco-hover, .monaco-editor-hover');
+    if(hoverEl){
+      hoverEl.style.height=''; hoverEl.style.maxHeight=''; hoverEl.style.bottom='';
+      var inners=hoverEl.querySelectorAll('.monaco-scrollable-element, .hover-row, .hover-contents, .markdown-hover, .rendered-markdown');
+      for(var i2=0;i2<inners.length;i2++){
+        inners[i2].style.height=''; inners[i2].style.maxHeight='';
+      }
+      if(hoverEl.scrollTop) hoverEl.scrollTop=0;
+      var scrolls=hoverEl.querySelectorAll('*');
+      for(var s=0;s<scrolls.length;s++){ if(scrolls[s].scrollTop) scrolls[s].scrollTop=0; }
+    } else if(target.scrollTop){ target.scrollTop=0; }
+  } catch(_) {}
+  window.__irLastPreviewTarget=null;
+  irLog('renderer: applied "'+typeName+'" via '+src);
+};
 
 var irScanCount=0;
 var irWrapCount=0;
 var irLastContainerCount=0;
 
-setInterval(function(){
+window.__irScanInterval = setInterval(function(){
   var containers=document.querySelectorAll('.rendered-markdown');
   if(containers.length!==irLastContainerCount){
     irLog('renderer: scan containers='+containers.length+' (was '+irLastContainerCount+')');
@@ -1159,6 +1570,187 @@ setInterval(function(){
 },100);
 
 irLog('renderer: setInterval started');
+
+// ── Monaco capture (host-driven, brief activation) ────────────────────
+// Modern VS Code hides the monaco namespace and AMD loader. To get
+// theme-matched syntax highlighting we capture VS Code's internal
+// IInstantiationService + CodeEditorWidget constructor + IModelService
+// by hooking native Map/WeakMap/Set/Array prototypes during widget
+// creation. Hooks are EXPENSIVE (every push/set in the renderer flows
+// through us), so they only activate during the brief window between
+// __irStartCapture() and __irStopCapture() — both driven by the host.
+// Default: no hooks, no impact on normal editor operation.
+window.__irStartCapture = function(reason){
+  if (window.__irCaptureActive) return 'already-active';
+  var caps = { widgets: [], services: [], widgetCtors: [] };
+  window.__irMonacoCaps = caps;
+  window.__irCaptureActive = true;
+  var capturing = true;
+  function sniff(v){
+    if(!capturing || !v || typeof v !== 'object') return;
+    try {
+      if (typeof v.layout==='function' && typeof v.getModel==='function' && typeof v.getDomNode==='function') {
+        if (caps.widgets.length < 50) caps.widgets.push(v);
+        var ctor = v.constructor;
+        if (ctor && caps.widgetCtors.indexOf(ctor) < 0 && caps.widgetCtors.length < 10) caps.widgetCtors.push(ctor);
+        return;
+      }
+    } catch(_) {}
+    try {
+      if (typeof v.createInstance==='function' && typeof v.invokeFunction==='function') {
+        if (caps.services.length < 40) caps.services.push({v:v, kind:'IInstantiationService'});
+        return;
+      }
+    } catch(_) {}
+    try {
+      if (typeof v.createModel==='function' && typeof v.getModel==='function' && typeof v.getModels==='function') {
+        if (caps.services.length < 40) caps.services.push({v:v, kind:'IModelService'});
+        return;
+      }
+    } catch(_) {}
+  }
+  var oM=Map.prototype.set, oW=WeakMap.prototype.set, oS=Set.prototype.add, oA=Array.prototype.push, oR=Reflect.construct;
+  Map.prototype.set = function(k,v){ try { sniff(v); } catch(_) {} return oM.call(this,k,v); };
+  WeakMap.prototype.set = function(k,v){ try { sniff(v); } catch(_) {} return oW.call(this,k,v); };
+  Set.prototype.add = function(v){ try { sniff(v); } catch(_) {} return oS.call(this,v); };
+  Array.prototype.push = function(){ try { for(var i=0;i<arguments.length;i++) sniff(arguments[i]); } catch(_) {} return oA.apply(this,arguments); };
+  Reflect.construct = function(target){
+    try {
+      if (capturing && target && target.prototype) {
+        var p = target.prototype;
+        if (typeof p.layout==='function' && typeof p.getModel==='function' && typeof p.getDomNode==='function') {
+          if (caps.widgetCtors.indexOf(target) < 0 && caps.widgetCtors.length < 20) caps.widgetCtors.push(target);
+        }
+      }
+    } catch(_) {}
+    return oR.apply(Reflect, arguments);
+  };
+  window.__irStopCapture = function(){
+    if (!capturing) return 'already-stopped';
+    capturing = false;
+    try { Map.prototype.set = oM; } catch(_) {}
+    try { WeakMap.prototype.set = oW; } catch(_) {}
+    try { Set.prototype.add = oS; } catch(_) {}
+    try { Array.prototype.push = oA; } catch(_) {}
+    try { Reflect.construct = oR; } catch(_) {}
+    window.__irCaptureActive = false;
+    var kinds = {};
+    for (var i = 0; i < caps.services.length; i++) { kinds[caps.services[i].kind] = (kinds[caps.services[i].kind]||0)+1; }
+    irLog('capture stopped: widgets='+caps.widgets.length+' ctors='+caps.widgetCtors.length+' svcs='+JSON.stringify(kinds));
+    try {
+      var mz = window.__irMaterializeMonaco ? window.__irMaterializeMonaco() : 'no-fn';
+      irLog('materialize: '+mz);
+    } catch(eMz) { irLog('materialize threw: '+(eMz&&eMz.message)); }
+    return 'stopped';
+  };
+  setTimeout(function(){ try { if (window.__irCaptureActive) window.__irStopCapture(); } catch(_) {} }, 3000);
+  irLog('capture started ('+reason+', max 3s)');
+  return 'started';
+};
+
+// Materialize a hidden, off-screen Monaco CodeEditorWidget using the
+// captured services. Try every (inst × ctor) pair — DI stubs throw,
+// real combos succeed.
+window.__irMaterializeMonaco = function(){
+  if (window.__irMonaco) return 'already';
+  var caps = window.__irMonacoCaps;
+  if (!caps) return 'no-caps';
+  var insts = [], modelSvc = null;
+  for (var i = 0; i < caps.services.length; i++) {
+    var s = caps.services[i];
+    if (s.kind === 'IInstantiationService' && insts.indexOf(s.v) < 0) insts.push(s.v);
+    if (s.kind === 'IModelService' && !modelSvc) modelSvc = s.v;
+  }
+  if (!insts.length || !modelSvc || !caps.widgetCtors.length) {
+    return 'missing: inst='+insts.length+' modelSvc='+(!!modelSvc)+' ctors='+caps.widgetCtors.length;
+  }
+  var host = document.createElement('div');
+  host.className = 'ir-monaco-tokenizer-host';
+  host.style.cssText = 'position:fixed;top:-99999px;left:-99999px;width:800px;height:200px;visibility:hidden;pointer-events:none;';
+  document.body.appendChild(host);
+  var options = {
+    automaticLayout: false, readOnly: true, lineNumbers: 'off',
+    glyphMargin: false, folding: false, contextmenu: false,
+    minimap: { enabled: false }, scrollBeyondLastLine: false,
+    wordWrap: 'off', renderLineHighlight: 'none',
+    overviewRulerLanes: 0, overviewRulerBorder: false,
+    hideCursorInOverviewRuler: true,
+    scrollbar: { vertical: 'hidden', horizontal: 'hidden', handleMouseWheel: false },
+    fontSize: 12,
+  };
+  var widgetOpts = { isSimpleWidget: true, contributions: [] };
+  for (var ii = 0; ii < insts.length; ii++) {
+    for (var ci = 0; ci < caps.widgetCtors.length; ci++) {
+      var ctor = caps.widgetCtors[ci];
+      try {
+        var ed = insts[ii].createInstance(ctor, host, options, widgetOpts);
+        if (ed && typeof ed === 'object' && typeof ed.setModel === 'function' && typeof ed.layout === 'function') {
+          window.__irMonaco = { editor: ed, host: host, modelSvc: modelSvc, inst: insts[ii], ctor: ctor };
+          return 'ok inst#'+ii+' ctor#'+ci;
+        }
+      } catch(_) { /* try next */ }
+    }
+  }
+  try { document.body.removeChild(host); } catch(_) {}
+  return 'all-combos-failed';
+};
+
+// Tokenize a single code block via the materialized widget. Returns a
+// DocumentFragment of cloned .mtk* spans + line breaks, or null on
+// failure. Caller wraps in .monaco-editor so .mtkN CSS resolves.
+window.__irTokenizeCode = function(text, lang){
+  var m = window.__irMonaco;
+  if (!m || !text || typeof text !== 'string') return null;
+  try {
+    var langId = (lang || 'plaintext').toLowerCase();
+    var aliases = { ts:'typescript', js:'javascript', py:'python', tsx:'typescriptreact', jsx:'javascriptreact', sh:'shellscript', md:'markdown', yml:'yaml' };
+    if (aliases[langId]) langId = aliases[langId];
+    var lineCount = (text.match(/\\n/g) || []).length + 1;
+    var height = Math.max(40, Math.min(20000, lineCount * 18 + 20));
+    m.host.style.height = height + 'px';
+    var prev = m.editor.getModel && m.editor.getModel();
+    var model;
+    try { model = m.modelSvc.createModel(text, langId); }
+    catch(_) {
+      try { model = m.modelSvc.createModel(text, 'plaintext'); }
+      catch(eM) { irLog('createModel failed: '+(eM&&eM.message)); return null; }
+    }
+    m.editor.setModel(model);
+    m.editor.layout({ width: 800, height: height });
+    if (prev && prev !== model) { try { prev.dispose && prev.dispose(); } catch(_) {} }
+    try {
+      var tk = model.tokenization;
+      if (tk && typeof tk.forceTokenization === 'function') {
+        var lc = model.getLineCount();
+        for (var li = 1; li <= lc; li++) tk.forceTokenization(li);
+      }
+    } catch(_) {}
+    var dom = m.editor.getDomNode && m.editor.getDomNode();
+    if (!dom) return null;
+    var viewLines = dom.querySelector('.view-lines');
+    if (!viewLines || !viewLines.children.length) return null;
+    var entries = [];
+    for (var i = 0; i < viewLines.children.length; i++) {
+      var ln = viewLines.children[i];
+      entries.push({ top: parseInt(ln.style.top, 10) || 0, el: ln });
+    }
+    entries.sort(function(a,b){ return a.top - b.top; });
+    var frag = document.createDocumentFragment();
+    for (var j = 0; j < entries.length; j++) {
+      var lnEl = entries[j].el;
+      for (var k = 0; k < lnEl.children.length; k++) {
+        var sp = lnEl.children[k];
+        if (sp.nodeName === 'SPAN') frag.appendChild(sp.cloneNode(true));
+      }
+      if (j < entries.length - 1) frag.appendChild(document.createTextNode('\\n'));
+    }
+    return frag;
+  } catch(e) {
+    irLog('tokenize threw: '+(e&&e.message?e.message:String(e)));
+    return null;
+  }
+};
+
 return 'hover patch installed';
 })()`;
 }
