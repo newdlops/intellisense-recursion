@@ -1373,7 +1373,7 @@ function httpGet(url: string): Promise<string> {
 
 function getHoverPatchScript(): string {
   return `(function(){
-var IR_PATCH_VERSION = 70;
+var IR_PATCH_VERSION = 71;
 if(window.__irPatchVersion === IR_PATCH_VERSION) return 'already patched';
 
 // Tear down any prior version's listeners and style so the new patch
@@ -1463,29 +1463,33 @@ track(document,'mousedown',function(e){
   e.preventDefault();e.stopPropagation();
 },true);
 
-// Drill-down content can grow beyond the original (0-depth) hover\\'s
-// bounding box. VS Code\\'s ContentHoverController has a global
-// capture-phase mousemove handler that uses a cached bbox to decide
-// "mouse left hover → dismiss". Stop the event in capture phase BEFORE
-// that handler runs whenever the mouse is over our drill-down area.
-// This keeps the hover open while the user reads the expanded content.
-track(document,'mousemove',function(e){
+// Drill-down dismissal control with two layers:
+//  1) Mouse INSIDE the drill-down hover → block VS Code\\'s capture-phase
+//     dismiss handler (it uses a cached 0-depth bbox so it would fire
+//     when the cursor moves into our expanded area).
+//  2) Mouse OUTSIDE the drill-down hover but the hover is "sticky"
+//     (drill-down was just applied / depth just changed; user has not
+//     yet moved their cursor INTO the hover) → block dismiss until
+//     they enter. Once they enter, sticky is cleared. The next depth
+//     change re-arms sticky — important when the new content shrinks
+//     under the cursor and triggers a phantom "leave".
+function irHoverGuard(e){
   var t=e.target;
   if(!t||!t.closest)return;
-  // Inside drill-down content: block VS Code\\'s mouseleave inference.
-  if(t.closest('.ir-applied')){ e.stopImmediatePropagation(); return; }
-  // Also block when target is anywhere in a hover with our drill-down
-  // (covers padding / scrollbar / margin areas around .ir-applied).
-  var hv=t.closest('.monaco-hover, .monaco-editor-hover');
-  if(hv && hv.querySelector('.ir-applied')){ e.stopImmediatePropagation(); }
-},true);
-track(document,'mouseout',function(e){
-  var t=e.target;
-  if(!t||!t.closest)return;
-  if(t.closest('.ir-applied')){ e.stopImmediatePropagation(); return; }
-  var hv=t.closest('.monaco-hover, .monaco-editor-hover');
-  if(hv && hv.querySelector('.ir-applied')){ e.stopImmediatePropagation(); }
-},true);
+  var insideHv=t.closest('.monaco-hover, .monaco-editor-hover');
+  if(insideHv && insideHv.querySelector('.ir-applied')){
+    insideHv.classList.remove('ir-sticky');
+    e.stopImmediatePropagation();
+    return;
+  }
+  var sticky=document.querySelector('.monaco-hover.ir-sticky, .monaco-editor-hover.ir-sticky');
+  if(sticky && sticky.querySelector('.ir-applied')){
+    e.stopImmediatePropagation();
+  }
+}
+track(document,'mousemove',irHoverGuard,true);
+track(document,'mouseout',irHoverGuard,true);
+track(document,'mouseleave',irHoverGuard,true);
 
 track(document,'click',function(e){
   var t=e.target;
@@ -1905,6 +1909,27 @@ window.irApplyPreview=function(typeName,md){
   try {
     var hoverEl=target.closest('.monaco-hover, .monaco-editor-hover');
     if(hoverEl){
+      // Capture current visible dimensions BEFORE clearing — every depth
+      // change pins min-height/min-width to MAX of (previously pinned,
+      // currently visible). Going from BIG drill-down to SMALL one
+      // doesn\\'t shrink the hover; the cursor stays inside the panel.
+      // Per-hover state via window.__irHoverPinnedFor identity check.
+      var prevH=hoverEl.offsetHeight;
+      var prevW=hoverEl.offsetWidth;
+      if(window.__irHoverPinnedFor!==hoverEl){
+        window.__irHoverPinnedFor=hoverEl;
+        window.__irHoverPinH=prevH;
+        window.__irHoverPinW=prevW;
+      } else {
+        window.__irHoverPinH=Math.max(window.__irHoverPinH||0, prevH);
+        window.__irHoverPinW=Math.max(window.__irHoverPinW||0, prevW);
+      }
+      // RE-ARM sticky on EVERY depth change. Even if the user already
+      // entered the hover at a previous depth, the new (potentially
+      // smaller) content might shrink under the cursor, triggering a
+      // phantom mouseleave. Sticky requires them to enter again before
+      // dismiss is allowed.
+      hoverEl.classList.add('ir-sticky');
       // Outer hover container: clear ALL dimensions.
       var clearProps=['height','maxHeight','minHeight','width','maxWidth','minWidth','top','bottom','left','right'];
       for(var cp=0;cp<clearProps.length;cp++) hoverEl.style[clearProps[cp]]='';
@@ -1951,6 +1976,12 @@ window.irApplyPreview=function(typeName,md){
         try { var _=hoverEl.scrollHeight; var __=hoverEl.offsetHeight; } catch(_) {}
       } catch(_) {}
       try { window.dispatchEvent(new Event('resize')); } catch(_) {}
+      // Apply the pinned mins so smaller subsequent content can\\'t
+      // shrink the hover under the cursor.
+      try {
+        if(window.__irHoverPinH) hoverEl.style.minHeight=window.__irHoverPinH+'px';
+        if(window.__irHoverPinW) hoverEl.style.minWidth=window.__irHoverPinW+'px';
+      } catch(_) {}
     } else if(target.scrollTop){ target.scrollTop=0; }
   } catch(_) {}
   window.__irLastPreviewTarget=null;
