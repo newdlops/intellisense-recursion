@@ -1373,7 +1373,7 @@ function httpGet(url: string): Promise<string> {
 
 function getHoverPatchScript(): string {
   return `(function(){
-var IR_PATCH_VERSION = 66;
+var IR_PATCH_VERSION = 67;
 if(window.__irPatchVersion === IR_PATCH_VERSION) return 'already patched';
 
 // Tear down any prior version's listeners and style so the new patch
@@ -1870,21 +1870,42 @@ window.irApplyPreview=function(typeName,md){
     irLog('renderer: irApplyPreview build err: '+(eAP&&eAP.message?eAP.message:String(eAP)));
     return;
   }
-  // Let the popup grow to fit new content. Scoped to the hover subtree
-  // so we never touch workbench layout (walking up to body broke the
-  // entire UI in earlier versions). Reset scroll so the user lands at
-  // the top of the new content.
+  // Let the popup grow to fit drill-down content. The 0-depth hover
+  // sizes itself once on first render; without clearing those inline
+  // dims the new (potentially larger) content is clipped to that
+  // original box. Clear EVERY dimension we can find — height/width/
+  // top/bottom/left/right/maxHeight/maxWidth/minWidth — on hoverEl AND
+  // every inner sizing wrapper. Then nudge the scrollable-element\\'s
+  // internal dimensions by reading scrollHeight (forces a reflow that
+  // VS Code\\'s SmoothScrollableElement picks up).
   try {
     var hoverEl=target.closest('.monaco-hover, .monaco-editor-hover');
     if(hoverEl){
-      hoverEl.style.height=''; hoverEl.style.maxHeight=''; hoverEl.style.bottom='';
-      var inners=hoverEl.querySelectorAll('.monaco-scrollable-element, .hover-row, .hover-contents, .markdown-hover, .rendered-markdown');
+      // Outer hover container: clear ALL dimensions.
+      var clearProps=['height','maxHeight','minHeight','width','maxWidth','minWidth','top','bottom','left','right'];
+      for(var cp=0;cp<clearProps.length;cp++) hoverEl.style[clearProps[cp]]='';
+      // Inner sizing wrappers (these get height/maxHeight pinned by
+      // VS Code\\'s ContentHoverWidget on first layout).
+      var inners=hoverEl.querySelectorAll('.monaco-scrollable-element, .monaco-hover-content, .hover-row, .hover-row-contents, .hover-contents, .markdown-hover, .rendered-markdown');
       for(var i2=0;i2<inners.length;i2++){
-        inners[i2].style.height=''; inners[i2].style.maxHeight='';
+        for(var cp2=0;cp2<clearProps.length;cp2++) inners[i2].style[clearProps[cp2]]='';
       }
+      // Reset scrolltops so user starts at top of new content.
       if(hoverEl.scrollTop) hoverEl.scrollTop=0;
       var scrolls=hoverEl.querySelectorAll('*');
       for(var s=0;s<scrolls.length;s++){ if(scrolls[s].scrollTop) scrolls[s].scrollTop=0; }
+      // Nudge .monaco-scrollable-element to recompute scroll dimensions
+      // by reading scrollHeight (forces reflow). Then dispatch a synthetic
+      // resize event so any internal listeners reposition mouseleave
+      // boundaries to the new (larger) bbox. Without this the hover\\'s
+      // dismiss-on-mouseleave fires the moment the mouse moves into the
+      // newly-revealed area outside the original (smaller) box.
+      try {
+        var sc=hoverEl.querySelector('.monaco-scrollable-element');
+        if(sc){ var _=sc.scrollHeight; var __=sc.offsetHeight; }
+        var _2=hoverEl.scrollHeight; var _3=hoverEl.offsetHeight;
+      } catch(_) {}
+      try { window.dispatchEvent(new Event('resize')); } catch(_) {}
     } else if(target.scrollTop){ target.scrollTop=0; }
   } catch(_) {}
   window.__irLastPreviewTarget=null;
