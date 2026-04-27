@@ -212,6 +212,13 @@ interface PendingPreviewHover {
   expiresAt: number;
 }
 let pendingPreviewHover: PendingPreviewHover | null = null;
+// After the override is delivered to the first handle, suppress all
+// further handle responses for a short window so VS Code's hover
+// aggregator doesn't repeat the drill-down panel once per registered
+// provider. Parallel handles in the same showHover fanout fire within
+// a few ms; 500ms is a generous bound. Unrelated hovers after the
+// window go through the normal LSP path.
+let previewHoverSuppressUntil = 0;
 
 // Last position where VS Code's native hover was successfully fetched.
 // Captured by the patched $provideHover so previewTypeHandler can move
@@ -745,18 +752,18 @@ function patchSharedService(service: any) {
     } catch {}
 
     // Page transition: if a drill-down click is pending, redirect this
-    // hover request to return the clicked symbol's content. We only
-    // honor it on the FIRST handle within the window so multiple
-    // providers don't all duplicate the same content. VS Code renders
-    // this via its native MarkdownRenderer, so theme + TextMate tokens
-    // come for free — no DOM manipulation on the renderer side.
+    // hover request to return the clicked symbol's content. VS Code
+    // renders via its native MarkdownRenderer (theme + TextMate tokens
+    // for free) — no DOM manipulation on the renderer side.
     if (pendingPreviewHover && Date.now() < pendingPreviewHover.expiresAt) {
       const preview = pendingPreviewHover;
-      // DON'T clear: keep persistent until expiresAt so every handle
-      // (29 = main editor hover, 220 = others) returns the same redirected
-      // content. The visible hover widget needs handle=29 to re-fire to
-      // refresh; clearing on first hit means later handles miss the
-      // redirect and we lose the page transition.
+      // Consume on first hit: clear pendingPreviewHover and open a short
+      // suppression window. The other handles in this showHover fanout
+      // (typically a few ms apart) hit the suppression branch below and
+      // return empty contents, so the hover aggregator shows the panel
+      // exactly once.
+      pendingPreviewHover = null;
+      previewHoverSuppressUntil = Date.now() + 500;
       log.info(`[hover] page-transition handle=${handle} → "${preview.identifier}"`);
       const ln = position?.lineNumber !== undefined ? position.lineNumber : (position?.line !== undefined ? position.line + 1 : 1);
       const col = position?.column !== undefined ? position.column : (position?.character !== undefined ? position.character + 1 : 1);
@@ -764,6 +771,12 @@ function patchSharedService(service: any) {
         contents: preview.contents,
         range: { startLineNumber: ln, startColumn: col, endLineNumber: ln, endColumn: col },
       };
+    }
+    // Suppression branch: parallel handles in the same showHover fanout
+    // return empty so the override isn't duplicated across providers.
+    if (Date.now() < previewHoverSuppressUntil) {
+      log.info(`[hover] page-transition handle=${handle} suppressed (in window)`);
+      return { contents: [] };
     }
 
     const result = await original.call(this, handle, uri, position, context, token);
@@ -1333,6 +1346,9 @@ async function previewTypeHandler(docUriStr: string, identifier: string): Promis
     contents: [{ value: markdown, isTrusted: true, supportThemeIcons: true }],
     expiresAt: Date.now() + 3000,
   };
+  // Reset suppression window — a new drill-down should not be silently
+  // dropped just because a previous one's window is still open.
+  previewHoverSuppressUntil = 0;
 
   try {
     // showHover triggers at the *cursor* (not the mouse). Move the cursor
