@@ -20,5 +20,5 @@ src/test/fixtures/csharp/obj/
 src/test/fixtures/java/*.class
 
 .zoek-ru
-.vscode/**
+.vscode*
 .lh

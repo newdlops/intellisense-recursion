@@ -44,3 +44,6 @@ bin/**
 
 # ── previously-packaged vsix files ──
 *.vsix
+.zoek-rs
+.lh
+.vscode*
