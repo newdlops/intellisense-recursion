@@ -1373,7 +1373,7 @@ function httpGet(url: string): Promise<string> {
 
 function getHoverPatchScript(): string {
   return `(function(){
-var IR_PATCH_VERSION = 67;
+var IR_PATCH_VERSION = 68;
 if(window.__irPatchVersion === IR_PATCH_VERSION) return 'already patched';
 
 // Tear down any prior version's listeners and style so the new patch
@@ -1461,6 +1461,30 @@ track(document,'mousedown',function(e){
   var t=e.target;
   if(!t||!t.classList||!t.classList.contains('ir-type-link'))return;
   e.preventDefault();e.stopPropagation();
+},true);
+
+// Drill-down content can grow beyond the original (0-depth) hover\\'s
+// bounding box. VS Code\\'s ContentHoverController has a global
+// capture-phase mousemove handler that uses a cached bbox to decide
+// "mouse left hover → dismiss". Stop the event in capture phase BEFORE
+// that handler runs whenever the mouse is over our drill-down area.
+// This keeps the hover open while the user reads the expanded content.
+track(document,'mousemove',function(e){
+  var t=e.target;
+  if(!t||!t.closest)return;
+  // Inside drill-down content: block VS Code\\'s mouseleave inference.
+  if(t.closest('.ir-applied')){ e.stopImmediatePropagation(); return; }
+  // Also block when target is anywhere in a hover with our drill-down
+  // (covers padding / scrollbar / margin areas around .ir-applied).
+  var hv=t.closest('.monaco-hover, .monaco-editor-hover');
+  if(hv && hv.querySelector('.ir-applied')){ e.stopImmediatePropagation(); }
+},true);
+track(document,'mouseout',function(e){
+  var t=e.target;
+  if(!t||!t.closest)return;
+  if(t.closest('.ir-applied')){ e.stopImmediatePropagation(); return; }
+  var hv=t.closest('.monaco-hover, .monaco-editor-hover');
+  if(hv && hv.querySelector('.ir-applied')){ e.stopImmediatePropagation(); }
 },true);
 
 track(document,'click',function(e){
