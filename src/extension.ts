@@ -639,11 +639,11 @@ export async function activate(context: vscode.ExtensionContext) {
   await injectRenderer();
   reinjectTimer = setInterval(() => { reinjectRenderer().catch(() => {}); }, 10000);
 
-  // Trigger Monaco service captures by briefly side-opening an editor.
-  // The renderer's prototype hooks (defined by the patch script but
-  // dormant by default) are activated by __irStartCapture and torn
-  // down by __irStopCapture immediately after — total active window
-  // ~1s, no impact on click handlers or hover underline.
+  // Arm Monaco capture hooks passively. The renderer's prototype hooks
+  // self-disarm 2s after the first real CodeEditorWidget passes through
+  // (or after a 5min fallback). No forced side-open — we rely on the
+  // user naturally opening a file to flow a fresh widget through the
+  // hooks. See vscode_monacoeditor_monkeypatch.md for the technique.
   setTimeout(() => { triggerMonacoCapture().catch(() => {}); }, 2000);
 
   log.info('Extension activated');
@@ -651,88 +651,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
 async function triggerMonacoCapture() {
   try {
-    sendToRenderer("(window.__irStartCapture && window.__irStartCapture('side-open'))");
-
-    // Pick any workspace file to side-open. We deliberately avoid
-    // `activeTextEditor.document`: if the user already has it side-open,
-    // `Beside` would just reveal that existing tab (no fresh Monaco widget
-    // to capture, and we'd risk closing the user's pre-existing tab below).
-    let fileUri: vscode.Uri | undefined;
-    try {
-      const candidates = await vscode.workspace.findFiles(
-        '**/*.{json,md,txt,ts,tsx,js,py}',
-        '{**/node_modules/**,**/.git/**}',
-        1,
-      );
-      fileUri = candidates[0];
-    } catch (e) { log.warn(`[capture] findFiles err: ${e}`); }
-
-    if (!fileUri) {
-      log.info('[capture] no workspace file — skipping side-open');
-      sendToRenderer("(window.__irStopCapture && window.__irStopCapture())");
-      return;
-    }
-
-    // Snapshot existing tab URIs *before* opening so we can close ONLY the
-    // tab we just created. The previous version called
-    // `workbench.action.closeEditorsInGroup`, which targets whichever group
-    // is focused — and `preserveFocus: true` kept focus in the user's
-    // original group, so that command wiped every document they had open.
-    const fileUriStr = fileUri.toString();
-    const preExisting = new Set<string>();
-    let userAlreadyHadThisTab = false;
-    for (const g of vscode.window.tabGroups.all) {
-      for (const t of g.tabs) {
-        if (t.input instanceof vscode.TabInputText) {
-          const u = t.input.uri.toString();
-          preExisting.add(u);
-          if (u === fileUriStr) { userAlreadyHadThisTab = true; }
-        }
-      }
-    }
-
-    log.info(
-      `[capture] side-opening ${vscode.workspace.asRelativePath(fileUri)}`
-      + (userAlreadyHadThisTab ? ' (already open — will NOT close afterwards)' : ''),
-    );
-
-    try {
-      await vscode.window.showTextDocument(fileUri, {
-        viewColumn: vscode.ViewColumn.Beside,
-        preserveFocus: true,
-        preview: true,
-      });
-    } catch (e) { log.warn(`[capture] showTextDocument err: ${e}`); }
-    await new Promise(r => setTimeout(r, 700));
-
-    if (!userAlreadyHadThisTab) {
-      try {
-        const toClose: vscode.Tab[] = [];
-        for (const g of vscode.window.tabGroups.all) {
-          for (const t of g.tabs) {
-            if (!(t.input instanceof vscode.TabInputText)) continue;
-            const u = t.input.uri.toString();
-            if (u === fileUriStr && !preExisting.has(u)) {
-              toClose.push(t);
-            }
-          }
-        }
-        if (toClose.length) {
-          await vscode.window.tabGroups.close(toClose, true);
-        } else {
-          log.info('[capture] no new tab found to close');
-        }
-      } catch (e) { log.warn(`[capture] close err: ${e}`); }
-    }
-
-    await new Promise(r => setTimeout(r, 300));
-    sendToRenderer("(window.__irStopCapture && window.__irStopCapture())");
-    await new Promise(r => setTimeout(r, 500));
-    // DIAG: ask renderer which .mtkN color rules actually exist in the
-    // document. The renderer prints via irLog so it lands in our log.
-    sendToRenderer("if(window.__irProbeMtk){var p=window.__irProbeMtk(); window.irGoToType('LOG:probe-mtk: '+p);}");
-    await new Promise(r => setTimeout(r, 200));
-    sendToRenderer("if(window.__irProbeMdRenderer){var p=window.__irProbeMdRenderer(); window.irGoToType('LOG:probe-mdr: '+p);}");
+    sendToRenderer("(window.__irStartCapture && window.__irStartCapture('passive'))");
   } catch (e) {
     log.warn(`[capture] trigger error: ${e}`);
   }
@@ -2416,6 +2335,25 @@ window.__irStartCapture = function(reason){
   window.__irMonacoCaps = caps;
   window.__irCaptureActive = true;
   var capturing = true;
+  var graceScheduled = false;
+  // After the first real CodeEditorWidget (one with a model whose URI
+  // is set) flows through our hooks, schedule auto-stop after a short
+  // grace period. The grace lets related services (IInstantiationService,
+  // IModelService) get registered around widget construction. DI-stub
+  // widgets (no model, getModel() returns null) do NOT trigger this —
+  // they appear during workbench boot and aren't useful for materializing
+  // real Monaco editors.
+  function scheduleGraceStop(){
+    if (graceScheduled) return;
+    graceScheduled = true;
+    setTimeout(function(){
+      try {
+        if (window.__irCaptureActive && window.__irCaptureSessionId === mySessionId) {
+          window.__irStopCapture();
+        }
+      } catch(_) {}
+    }, 2000);
+  }
   function sniff(v){
     if(!capturing || !v || typeof v !== 'object') return;
     try {
@@ -2423,6 +2361,12 @@ window.__irStartCapture = function(reason){
         if (caps.widgets.length < 50) caps.widgets.push(v);
         var ctor = v.constructor;
         if (ctor && caps.widgetCtors.indexOf(ctor) < 0 && caps.widgetCtors.length < 10) caps.widgetCtors.push(ctor);
+        if (!graceScheduled) {
+          try {
+            var m = v.getModel();
+            if (m && m.uri) scheduleGraceStop();
+          } catch(_) {}
+        }
         return;
       }
     } catch(_) {}
@@ -2775,8 +2719,8 @@ window.__irStartCapture = function(reason){
         window.__irStopCapture();
       }
     } catch(_) {}
-  }, 3000);
-  irLog('capture started ('+reason+', max 3s)');
+  }, 300000);
+  irLog('capture started ('+reason+', fallback 5min, auto-stops 2s after first real widget)');
   return 'started';
 };
 
