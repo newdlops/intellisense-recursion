@@ -1373,7 +1373,7 @@ function httpGet(url: string): Promise<string> {
 
 function getHoverPatchScript(): string {
   return `(function(){
-var IR_PATCH_VERSION = 71;
+var IR_PATCH_VERSION = 75;
 if(window.__irPatchVersion === IR_PATCH_VERSION) return 'already patched';
 
 // Tear down any prior version's listeners and style so the new patch
@@ -1818,8 +1818,8 @@ function irDecodeContent(s){
   return lines.join('\\n');
 }
 
-window.irApplyPreview=function(typeName,md){
-  irLog('renderer: irApplyPreview "'+typeName+'" md='+md.length+'B');
+window.irApplyPreview=function(typeName,md,fromBack){
+  irLog('renderer: irApplyPreview "'+typeName+'" md='+md.length+'B'+(fromBack?' [back]':''));
   var target=window.__irLastPreviewTarget;
   var src='stored';
   if(!target||!document.body.contains(target)){
@@ -1831,10 +1831,56 @@ window.irApplyPreview=function(typeName,md){
     }
   }
   if(!target){ irLog('renderer: irApplyPreview no target for "'+typeName+'"'); return; }
+  // Drill-down history: each forward navigation pushes the CURRENT
+  // state to history (so we can pop back). Back navigation skips push.
+  // Fresh hover (different hoverEl from last time) resets history.
+  var hoverElForHistory=target.closest('.monaco-hover, .monaco-editor-hover');
+  if(window.__irHistoryFor!==hoverElForHistory){
+    window.__irHistoryFor=hoverElForHistory;
+    window.__irHistory=[];
+    window.__irHistoryCurrent=null;
+  }
+  if(!fromBack){
+    if(window.__irHistoryCurrent){
+      window.__irHistory=window.__irHistory||[];
+      window.__irHistory.push(window.__irHistoryCurrent);
+    }
+  }
+  window.__irHistoryCurrent={ typeName:typeName, md:md };
   try {
     var decoded=irDecodeContent(md);
     while(target.firstChild) target.removeChild(target.firstChild);
     target.classList.add('ir-applied');
+    // Find the OUTER hover (non-scrolling) and remove any existing back
+    // button there — so the new one sticks to the panel\\'s top-right
+    // and doesn\\'t scroll with content.
+    var outerHover=target.closest('.monaco-hover, .monaco-editor-hover');
+    if(outerHover){
+      var prevBtn=outerHover.querySelector(':scope > .ir-back-btn');
+      if(prevBtn) prevBtn.parentElement.removeChild(prevBtn);
+    }
+    // Back button — appears when history is non-empty. Anchored on the
+    // OUTER .monaco-hover (which doesn\\'t scroll) so it stays pinned
+    // top-right even as the user scrolls through long drill-down content.
+    if(window.__irHistory && window.__irHistory.length && outerHover){
+      var backBtn=document.createElement('button');
+      backBtn.className='ir-back-btn';
+      backBtn.setAttribute('aria-label','Back');
+      backBtn.textContent='\\u2190';
+      backBtn.style.cssText='position:absolute;top:4px;right:4px;z-index:10;cursor:pointer;background:var(--vscode-button-secondaryBackground,rgba(128,128,128,0.2));border:1px solid var(--vscode-textSeparator-foreground,rgba(128,128,128,0.3));color:var(--vscode-foreground,inherit);padding:0 6px;border-radius:3px;font-size:13px;line-height:18px;height:20px;';
+      backBtn.onclick=function(e){
+        e.preventDefault(); e.stopPropagation();
+        var hist=window.__irHistory;
+        if(!hist||!hist.length)return;
+        var prev=hist.pop();
+        window.__irHistoryCurrent=prev;
+        irLog('renderer: back to "'+prev.typeName+'" stack='+hist.length);
+        window.irApplyPreview(prev.typeName, prev.md, true);
+      };
+      var ocs=window.getComputedStyle(outerHover);
+      if(ocs.position==='static') outerHover.style.position='relative';
+      outerHover.appendChild(backBtn);
+    }
     // DIAG: confirm class added + check if hover ancestor exists for
     // the .monaco-hover scoped CSS rules to match.
     var hasHoverAnc = !!target.closest('.monaco-hover, .monaco-editor-hover');
@@ -1953,11 +1999,17 @@ window.irApplyPreview=function(typeName,md){
       // against actual current content height. Hide the overlay
       // scrollbar widgets since native scrollbar will appear instead.
       try {
+        // Cap hoverEl at viewport-relative size — content beyond
+        // overflows into the inner scrollable element. Without this,
+        // a very long drill-down would push hover off-screen.
+        hoverEl.style.maxHeight='80vh';
+        hoverEl.style.maxWidth='80vw';
         var sc=hoverEl.querySelector('.monaco-scrollable-element');
         if(sc){
           sc.style.overflowY='auto';
           sc.style.overflowX='auto';
-          sc.style.maxHeight='70vh';
+          sc.style.maxHeight='80vh';
+          sc.style.maxWidth='80vw';
           sc.style.position='relative';
         }
         var hContent=hoverEl.querySelector('.monaco-hover-content');
@@ -1976,11 +2028,13 @@ window.irApplyPreview=function(typeName,md){
         try { var _=hoverEl.scrollHeight; var __=hoverEl.offsetHeight; } catch(_) {}
       } catch(_) {}
       try { window.dispatchEvent(new Event('resize')); } catch(_) {}
-      // Apply the pinned mins so smaller subsequent content can\\'t
-      // shrink the hover under the cursor.
+      // Apply the pinned mins, but cap at viewport limit so very tall
+      // earlier content doesn\\'t lock the hover bigger than the screen.
       try {
-        if(window.__irHoverPinH) hoverEl.style.minHeight=window.__irHoverPinH+'px';
-        if(window.__irHoverPinW) hoverEl.style.minWidth=window.__irHoverPinW+'px';
+        var maxPinH=Math.floor(window.innerHeight*0.8);
+        var maxPinW=Math.floor(window.innerWidth*0.8);
+        if(window.__irHoverPinH) hoverEl.style.minHeight=Math.min(window.__irHoverPinH, maxPinH)+'px';
+        if(window.__irHoverPinW) hoverEl.style.minWidth=Math.min(window.__irHoverPinW, maxPinW)+'px';
       } catch(_) {}
     } else if(target.scrollTop){ target.scrollTop=0; }
   } catch(_) {}
