@@ -1247,6 +1247,16 @@ async function previewTypeHandler(docUriStr: string, identifier: string): Promis
   if (identifier.length <= 2) { return; }
   const t0 = Date.now();
   const ms = () => `${Date.now() - t0}ms`;
+  // Snapshot the on-screen anchor position the new hover should fire
+  // at. We use this for the cursor move below instead of reading
+  // lastHoverFetchPosition again — the executeHoverProvider call we
+  // make to fetch the target symbol's docs runs through our patched
+  // $provideHover, which overwrites lastHoverFetchPosition with the
+  // target's location. That target is often off-screen (e.g. drilling
+  // into a definition far down the file), so without this snapshot
+  // showHover ends up firing the popup outside the viewport and the
+  // user perceives it as "hover disappeared".
+  const anchorPos = lastHoverFetchPosition;
   log.info(`preview: "${identifier}" start`);
 
   // Resolve location: sidecar first (resolves nested types correctly),
@@ -1352,15 +1362,15 @@ async function previewTypeHandler(docUriStr: string, identifier: string): Promis
 
   try {
     // showHover triggers at the *cursor* (not the mouse). Move the cursor
-    // to the position where the original hover fired so the new hover
-    // appears in the same anchor — otherwise VS Code shows it at whatever
-    // arbitrary position the cursor happens to be at, or no-ops because
-    // there's no hoverable token there.
-    if (lastHoverFetchPosition) {
+    // to the snapshotted anchor position so the new hover appears in the
+    // same place the original hover did — never to the target symbol's
+    // (possibly off-screen) location, which would scroll the editor and
+    // pop the hover outside the viewport.
+    if (anchorPos) {
       const editor = vscode.window.activeTextEditor;
-      const targetUriStr = lastHoverFetchPosition.uri.toString();
+      const targetUriStr = anchorPos.uri.toString();
       if (editor && editor.document.uri.toString() === targetUriStr) {
-        const newPos = new vscode.Position(lastHoverFetchPosition.line, lastHoverFetchPosition.character);
+        const newPos = new vscode.Position(anchorPos.line, anchorPos.character);
         editor.selection = new vscode.Selection(newPos, newPos);
       }
     }
