@@ -2013,40 +2013,41 @@ window.irApplyPreview=function(typeName,md,fromBack){
   try {
     var hoverEl=target.closest('.monaco-hover, .monaco-editor-hover');
     if(hoverEl){
-      // Capture current visible dimensions BEFORE clearing — every depth
-      // change pins min-height/min-width to MAX of (previously pinned,
-      // currently visible). Going from BIG drill-down to SMALL one
-      // doesn\\'t shrink the hover; the cursor stays inside the panel.
-      // Per-hover state via window.__irHoverPinnedFor identity check.
-      var prevH=hoverEl.offsetHeight;
-      var prevW=hoverEl.offsetWidth;
-      if(window.__irHoverPinnedFor!==hoverEl){
-        window.__irHoverPinnedFor=hoverEl;
-        window.__irHoverPinH=prevH;
-        window.__irHoverPinW=prevW;
-      } else {
-        window.__irHoverPinH=Math.max(window.__irHoverPinH||0, prevH);
-        window.__irHoverPinW=Math.max(window.__irHoverPinW||0, prevW);
-      }
+      // No size pinning across depth changes: each new content sizes the
+      // hover naturally. Pinning min-height/min-width to the previous
+      // depth\\'s rendered box meant a small drill-down kept the big
+      // outer box of an earlier large one.
       // RE-ARM sticky on EVERY depth change. Even if the user already
       // entered the hover at a previous depth, the new (potentially
       // smaller) content might shrink under the cursor, triggering a
       // phantom mouseleave. Sticky requires them to enter again before
       // dismiss is allowed.
       hoverEl.classList.add('ir-sticky');
-      // Outer hover container: clear ALL dimensions.
       var clearProps=['height','maxHeight','minHeight','width','maxWidth','minWidth','top','bottom','left','right'];
+      // Panel-level wrappers (one per hover, shared across all rows).
+      // Clearing these lets the panel reflow when our preview content
+      // grows or shrinks. Other rows are siblings of ours inside these,
+      // so their own sizing stays untouched.
       for(var cp=0;cp<clearProps.length;cp++) hoverEl.style[clearProps[cp]]='';
-      // Inner sizing wrappers (these get height/maxHeight pinned by
-      // VS Code\\'s ContentHoverWidget on first layout).
-      var inners=hoverEl.querySelectorAll('.monaco-scrollable-element, .monaco-hover-content, .hover-row, .hover-row-contents, .hover-contents, .markdown-hover, .rendered-markdown');
-      for(var i2=0;i2<inners.length;i2++){
-        for(var cp2=0;cp2<clearProps.length;cp2++) inners[i2].style[clearProps[cp2]]='';
+      var scTop=hoverEl.querySelector('.monaco-scrollable-element');
+      if(scTop) for(var cpS=0;cpS<clearProps.length;cpS++) scTop.style[clearProps[cpS]]='';
+      var hContentTop=hoverEl.querySelector('.monaco-hover-content');
+      if(hContentTop) for(var cpC=0;cpC<clearProps.length;cpC++) hContentTop.style[clearProps[cpC]]='';
+      // Per-row wrappers — scope to OUR row only. Other extensions\\' hover
+      // rows (e.g. Pylance docstrings) live as sibling .hover-row nodes in
+      // the same panel; we must not touch their dimensions or scroll.
+      var ourRow=target.closest('.hover-row')||target.closest('.markdown-hover')||target;
+      for(var cpR=0;cpR<clearProps.length;cpR++) ourRow.style[clearProps[cpR]]='';
+      var rowInners=ourRow.querySelectorAll('.hover-row-contents, .hover-contents, .markdown-hover, .rendered-markdown');
+      for(var i2=0;i2<rowInners.length;i2++){
+        for(var cp2=0;cp2<clearProps.length;cp2++) rowInners[i2].style[clearProps[cp2]]='';
       }
-      // Reset scrolltops so user starts at top of new content.
+      // Reset scrolltops: panel-level + our row only.
       if(hoverEl.scrollTop) hoverEl.scrollTop=0;
-      var scrolls=hoverEl.querySelectorAll('*');
-      for(var s=0;s<scrolls.length;s++){ if(scrolls[s].scrollTop) scrolls[s].scrollTop=0; }
+      if(scTop&&scTop.scrollTop) scTop.scrollTop=0;
+      if(ourRow.scrollTop) ourRow.scrollTop=0;
+      var rowScrolls=ourRow.querySelectorAll('*');
+      for(var s=0;s<rowScrolls.length;s++){ if(rowScrolls[s].scrollTop) rowScrolls[s].scrollTop=0; }
       // VS Code\\'s SmoothScrollableElement caches scroll dimensions
       // internally and the cache doesn\\'t refresh on DOM mutation.
       // scanDomNode() calls didn\\'t take effect reliably, so instead
@@ -2086,14 +2087,6 @@ window.irApplyPreview=function(typeName,md,fromBack){
         try { var _=hoverEl.scrollHeight; var __=hoverEl.offsetHeight; } catch(_) {}
       } catch(_) {}
       try { window.dispatchEvent(new Event('resize')); } catch(_) {}
-      // Apply the pinned mins, but cap at viewport limit so very tall
-      // earlier content doesn\\'t lock the hover bigger than the screen.
-      try {
-        var maxPinH=Math.floor(window.innerHeight*0.8);
-        var maxPinW=Math.floor(window.innerWidth*0.8);
-        if(window.__irHoverPinH) hoverEl.style.minHeight=Math.min(window.__irHoverPinH, maxPinH)+'px';
-        if(window.__irHoverPinW) hoverEl.style.minWidth=Math.min(window.__irHoverPinW, maxPinW)+'px';
-      } catch(_) {}
     } else if(target.scrollTop){ target.scrollTop=0; }
   } catch(_) {}
   window.__irLastPreviewTarget=null;
