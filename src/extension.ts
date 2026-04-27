@@ -1203,8 +1203,18 @@ function sendToRenderer(rendererJs: string): void {
     var BW = require('electron').BrowserWindow;
     var w = BW.getFocusedWindow();
     if (!w) {
-      if (typeof global.irClickNotify === 'function') { global.irClickNotify('SEND:no-focused-window'); }
-      return 'no-focused-window';
+      // Fallback: VSCode in background / no focus → use first window.
+      // Prefer one with debugger already attached so we don't have to
+      // re-attach mid-flight.
+      var all = BW.getAllWindows();
+      for (var i = 0; i < all.length; i++) {
+        try { if (all[i].webContents && all[i].webContents.debugger && all[i].webContents.debugger.isAttached && all[i].webContents.debugger.isAttached()) { w = all[i]; break; } } catch(_) {}
+      }
+      if (!w) w = all[0];
+      if (!w) {
+        if (typeof global.irClickNotify === 'function') { global.irClickNotify('SEND:no-window-at-all'); }
+        return 'no-window-at-all';
+      }
     }
     var wid = w.id;
     var summary;
@@ -1363,7 +1373,7 @@ function httpGet(url: string): Promise<string> {
 
 function getHoverPatchScript(): string {
   return `(function(){
-var IR_PATCH_VERSION = 41;
+var IR_PATCH_VERSION = 66;
 if(window.__irPatchVersion === IR_PATCH_VERSION) return 'already patched';
 
 // Tear down any prior version's listeners and style so the new patch
@@ -1398,30 +1408,47 @@ var style=document.createElement('style');
 style.textContent=[
   // Always-on underline + pointer on hover. cmd/ctrl is no longer
   // required to see the hint that a symbol is clickable.
-  '.ir-type-link,.ir-type-link *{cursor:pointer !important}',
-  '.ir-type-link:hover,.ir-type-link:hover *{text-decoration:underline !important;color:var(--vscode-textLink-foreground) !important}',
-  // ── Drill-down content styling using VS Code theme variables ──
-  // VS Code's hover CSS uses 2-3 class selectors which beat single-
-  // class .ir-applied rules. We mirror their specificity by scoping
-  // under .monaco-hover/.monaco-editor-hover and adding !important
-  // on color/font properties so theme variables actually take effect.
-  '.monaco-hover .ir-applied,.monaco-editor-hover .ir-applied{color:var(--vscode-editor-foreground,var(--vscode-foreground)) !important;font-family:var(--vscode-font-family) !important;font-size:var(--vscode-font-size,13px) !important;line-height:1.5 !important}',
-  '.monaco-hover .ir-applied p,.monaco-editor-hover .ir-applied p{margin:6px 0 !important;color:var(--vscode-editor-foreground) !important}',
-  '.monaco-hover .ir-applied h1,.monaco-hover .ir-applied h2,.monaco-hover .ir-applied h3,.monaco-hover .ir-applied h4,.monaco-hover .ir-applied h5,.monaco-hover .ir-applied h6,.monaco-editor-hover .ir-applied h1,.monaco-editor-hover .ir-applied h2,.monaco-editor-hover .ir-applied h3{margin:8px 0 4px !important;font-weight:600 !important;color:var(--vscode-editor-foreground) !important}',
+  // Hover-only underline + link color. Doubled selectors push
+  // specificity (0,2,0) above .mtkN single-class rules so our hover
+  // styling always wins, even though our link is wrapped inside the
+  // tokenizer's .mtkN span. pointer-events:auto guards against the
+  // parent mtk span swallowing clicks.
+  '.ir-type-link,.ir-type-link *{cursor:pointer !important;pointer-events:auto !important}',
+  '.ir-type-link.ir-type-link:hover,.ir-type-link:hover,.ir-type-link:hover *{text-decoration:underline !important;color:var(--vscode-textLink-foreground) !important}',
+  // ── Drill-down content styling ──
+  // We DON'T set color/font/etc on .ir-applied. The parent
+  // .code-hover-contents / .markdown-hover already inherits the right
+  // theme from VS Code. Forcing var(--vscode-font-family) on .ir-applied
+  // (as earlier versions did) was overriding the editor monospace font
+  // that .monaco-tokenized-source's inline style sets, plus pushing
+  // line-height to 1.5 which broke 18px line spacing inside code blocks.
+  // Letting native CSS handle everything = drill-down looks identical
+  // to native hover. The only thing we keep is some prose tweaks for
+  // markdown rendering (h*, hr, a, strong, em) since our irBuildMdDom
+  // emits raw tags without inline styles.
+  '.monaco-hover .ir-applied p,.monaco-editor-hover .ir-applied p{margin:6px 0 !important}',
+  '.monaco-hover .ir-applied h1,.monaco-hover .ir-applied h2,.monaco-hover .ir-applied h3,.monaco-hover .ir-applied h4,.monaco-hover .ir-applied h5,.monaco-hover .ir-applied h6,.monaco-editor-hover .ir-applied h1,.monaco-editor-hover .ir-applied h2,.monaco-editor-hover .ir-applied h3{margin:8px 0 4px !important;font-weight:600 !important}',
   '.monaco-hover .ir-applied hr,.monaco-editor-hover .ir-applied hr{border:none !important;border-top:1px solid var(--vscode-textSeparator-foreground,rgba(128,128,128,0.35)) !important;margin:8px 0 !important}',
   '.monaco-hover .ir-applied a,.monaco-editor-hover .ir-applied a{color:var(--vscode-textLink-foreground) !important;text-decoration:none !important}',
   '.monaco-hover .ir-applied a:hover,.monaco-editor-hover .ir-applied a:hover{text-decoration:underline !important}',
-  '.monaco-hover .ir-applied strong,.monaco-editor-hover .ir-applied strong{font-weight:600 !important;color:var(--vscode-editor-foreground) !important}',
+  '.monaco-hover .ir-applied strong,.monaco-editor-hover .ir-applied strong{font-weight:600 !important}',
   '.monaco-hover .ir-applied em,.monaco-editor-hover .ir-applied em{font-style:italic !important}',
-  // Inline code (not the code-block code) — uses textPreformat tokens.
-  '.monaco-hover .ir-applied code:not(.ir-md-code),.monaco-editor-hover .ir-applied code:not(.ir-md-code){color:var(--vscode-textPreformat-foreground) !important;background:var(--vscode-textPreformat-background,var(--vscode-textCodeBlock-background,rgba(128,128,128,0.1))) !important;padding:1px 4px !important;border-radius:3px !important;font-family:var(--vscode-editor-font-family,monospace) !important;font-size:0.95em !important}',
-  // Code blocks — theme-aware chrome with single-color tokens.
-  '.monaco-hover .ir-applied pre.ir-md-pre,.monaco-editor-hover .ir-applied pre.ir-md-pre{background:var(--vscode-textCodeBlock-background,rgba(128,128,128,0.1)) !important;color:var(--vscode-editor-foreground) !important;font-family:var(--vscode-editor-font-family,monospace) !important;font-size:var(--vscode-editor-font-size,12px) !important;padding:8px 10px !important;margin:6px 0 !important;border-radius:4px !important;overflow-x:auto !important;white-space:pre !important;border:1px solid var(--vscode-textSeparator-foreground,rgba(128,128,128,0.2)) !important}',
-  '.monaco-hover .ir-applied pre.ir-md-pre code.ir-md-code,.monaco-editor-hover .ir-applied pre.ir-md-pre code.ir-md-code{background:transparent !important;color:inherit !important;font-family:inherit !important;font-size:inherit !important;padding:0 !important;border:0 !important}',
-  // Token color comes directly from VS Code's theme via .mtkN classes
-  // we sample at runtime. Just keep italic for comments — the color
-  // is whatever user theme assigns to .mtkN for the comment token.
-  '.monaco-hover .ir-applied .ir-tk-cm,.monaco-editor-hover .ir-applied .ir-tk-cm{font-style:italic !important}',
+  // Inline code (within prose, NOT inside .monaco-tokenized-source).
+  '.monaco-hover .ir-applied :not(.monaco-tokenized-source) > code,.monaco-editor-hover .ir-applied :not(.monaco-tokenized-source) > code{color:var(--vscode-textPreformat-foreground) !important;background:var(--vscode-textPreformat-background,var(--vscode-textCodeBlock-background,rgba(128,128,128,0.1))) !important;padding:1px 4px !important;border-radius:3px !important;font-family:var(--vscode-editor-font-family,monospace) !important;font-size:0.95em !important}',
+  // Force monospace + 12px / 18px on our .monaco-tokenized-source AND
+  // its descendants. Native VS Code CSS rules on .rendered-markdown
+  // ancestors apply system font with enough specificity to override
+  // our inline style on the box, so the spans end up rendered in
+  // proportional system font instead of monospace. !important on a
+  // CSS rule defeats inline styles, so this forces monospace through.
+  // Also: spans inside our drill-down are wrapped one level deeper
+  // than native (.rendered-markdown.ir-applied between code-hover-contents
+  // and .monaco-tokenized-source), which breaks native\\'s scoped
+  // .code-hover-contents > .monaco-tokenized-source selectors. Re-add
+  // the chrome ourselves so the drill-down code block has the same
+  // background / padding as native.
+  '.monaco-hover .ir-applied .monaco-tokenized-source,.monaco-editor-hover .ir-applied .monaco-tokenized-source{display:block !important;font-family:Menlo,Monaco,"Courier New",monospace !important;font-size:12px !important;line-height:18px !important;letter-spacing:0 !important}',
+  '.monaco-hover .ir-applied .monaco-tokenized-source *,.monaco-editor-hover .ir-applied .monaco-tokenized-source *{font-family:inherit !important;font-size:inherit !important;line-height:inherit !important}',
 ].join('');
 document.head.appendChild(style);
 window.__irStyleEl = style;
@@ -1517,30 +1544,59 @@ var IR_PRIM = {
 var IR_MTK_MAP = null;
 function irSampleMtk(){
   if (IR_MTK_MAP) return IR_MTK_MAP;
-  var map = { kw:'', str:'', num:'', cls:'', fn:'', cm:'', prim:'', def:'mtk1' };
-  var KW = /^(function|const|let|var|class|interface|type|enum|if|else|for|while|do|return|import|export|from|as|new|delete|typeof|instanceof|in|of|async|await|yield|throw|try|catch|finally|switch|case|break|continue|default|extends|implements|public|private|protected|static|abstract|readonly|override|namespace|declare|keyof|infer|never|any|unknown|null|undefined|true|false|this|super|self|cls|def|lambda|pass|global|nonlocal|raise|and|or|not|None|True|False|module|with)$/;
-  var PRIM = /^(string|number|boolean|object|symbol|bigint|void|any|never|unknown|int|str|float|bool|list|dict|tuple|set|bytes)$/;
+  var map = {
+    kw:'',     // keywords (function, class, if, return, etc.)
+    str:'',    // strings ('foo', "bar", \`baz\`)
+    num:'',    // numbers (123, 3.14, 0xff)
+    cls:'',    // class/type names (PascalCase)
+    fn:'',     // function calls (followed by '(')
+    cm:'',     // comments (//, /* */, #)
+    prim:'',   // primitive types (string, number, boolean, ...)
+    op:'',     // operators (=, +, -, *, /, <, >, etc.)
+    pn:'',     // punctuation (commas, colons, semicolons)
+    bk:'',     // brackets (parens, braces — used as bracket-highlighting base)
+    prop:'',   // property names (after .)
+    var:'',    // variable names / parameter names (lowercase identifiers)
+    deco:'',   // decorators / annotations (@foo)
+    def:'mtk1' // default
+  };
+  var KW = /^(function|const|let|var|class|interface|type|enum|if|else|elif|for|while|do|return|import|export|from|as|new|delete|typeof|instanceof|in|of|async|await|yield|throw|try|catch|finally|switch|case|break|continue|default|extends|implements|public|private|protected|static|abstract|readonly|override|namespace|declare|keyof|infer|this|super|self|def|lambda|pass|global|nonlocal|raise|and|or|not|with|module)$/;
+  var KW_LITERAL = /^(true|false|null|undefined|None|True|False|never|any|unknown)$/;
+  var PRIM = /^(string|number|boolean|object|symbol|bigint|void|int|str|float|bool|list|dict|tuple|set|bytes)$/;
   try {
     var spans = document.querySelectorAll('.monaco-editor .view-line span > span');
-    for (var i = 0; i < spans.length && i < 1500; i++) {
+    var collected = 0;
+    for (var i = 0; i < spans.length && collected < 12 && i < 4000; i++) {
       var sp = spans[i];
-      var text = (sp.textContent || '').replace(/\\u00a0/g, ' ').trim();
+      var text = (sp.textContent || '').replace(/\\u00a0/g, ' ');
+      var trimmed = text.trim();
+      if (!trimmed) continue;
       var cls = sp.className || '';
       var m = /(?:^|\\s)(mtk\\d+)/.exec(cls);
       if (!m) continue;
       var mtk = m[1];
-      if (!map.kw && KW.test(text)) map.kw = mtk;
-      else if (!map.prim && PRIM.test(text)) map.prim = mtk;
-      else if (!map.str && (text.charAt(0) === '"' || text.charAt(0) === "'" || text.charAt(0) === '\`')) map.str = mtk;
-      else if (!map.num && /^[0-9]/.test(text)) map.num = mtk;
-      else if (!map.cls && /^[A-Z][A-Za-z0-9_]+$/.test(text) && text.length > 1) map.cls = mtk;
-      else if (!map.cm && (text.indexOf('//') === 0 || text.indexOf('/*') === 0 || text.indexOf('#') === 0)) map.cm = mtk;
+      // Detect kind from a single-token-looking text
+      if (!map.kw && KW.test(trimmed)) { map.kw = mtk; collected++; continue; }
+      if (!map.kw && KW_LITERAL.test(trimmed)) { map.kw = mtk; collected++; continue; }
+      if (!map.prim && PRIM.test(trimmed)) { map.prim = mtk; collected++; continue; }
+      if (!map.str && (trimmed.charAt(0) === '"' || trimmed.charAt(0) === "'" || trimmed.charAt(0) === '\`')) { map.str = mtk; collected++; continue; }
+      if (!map.num && /^[0-9]/.test(trimmed)) { map.num = mtk; collected++; continue; }
+      if (!map.cls && /^[A-Z][A-Za-z0-9_]+$/.test(trimmed) && trimmed.length > 1 && !KW_LITERAL.test(trimmed)) { map.cls = mtk; collected++; continue; }
+      if (!map.cm && (trimmed.indexOf('//') === 0 || trimmed.indexOf('/*') === 0 || trimmed.indexOf('#') === 0)) { map.cm = mtk; collected++; continue; }
+      if (!map.deco && trimmed.charAt(0) === '@' && trimmed.length > 1) { map.deco = mtk; collected++; continue; }
+      // Operator-ish (single-char symbol token)
+      if (!map.op && trimmed.length === 1 && '=+-*/<>!&|^%~?:'.indexOf(trimmed) >= 0) { map.op = mtk; collected++; continue; }
+      // Bracket / punctuation (single-char open/close bracket)
+      if (!map.bk && trimmed.length === 1 && '()[]{}'.indexOf(trimmed) >= 0) { map.bk = mtk; collected++; continue; }
+      if (!map.pn && trimmed.length === 1 && ',;.'.indexOf(trimmed) >= 0) { map.pn = mtk; collected++; continue; }
+      // Lowercase identifier — variable / parameter
+      if (!map.var && /^[a-z_][a-zA-Z0-9_]*$/.test(trimmed) && !KW.test(trimmed) && !PRIM.test(trimmed)) { map.var = mtk; collected++; continue; }
     }
   } catch(_) {}
   // Fall back to default for any unfound type.
   for (var k in map) if (!map[k]) map[k] = 'mtk1';
   IR_MTK_MAP = map;
-  irLog('mtk-map: kw='+map.kw+' prim='+map.prim+' str='+map.str+' num='+map.num+' cls='+map.cls+' cm='+map.cm);
+  irLog('mtk-map: kw='+map.kw+' prim='+map.prim+' str='+map.str+' num='+map.num+' cls='+map.cls+' fn='+map.fn+' cm='+map.cm+' op='+map.op+' bk='+map.bk+' pn='+map.pn+' prop='+map.prop+' var='+map.var+' deco='+map.deco);
   return map;
 }
 
@@ -1550,24 +1606,22 @@ function irTokenizeCode(code, lang, target){
   var lineComment = isPy ? '#' : '//';
   var i = 0; var len = code.length;
   var mtk = irSampleMtk();
-  // Map token kind → sampled .mtkN class (theme-defined color).
+  var bracketDepth = 0; // for bracket-highlighting-N classes
   function clsFor(kind){
-    return kind === 'kw' ? mtk.kw
-      : kind === 'prim' ? mtk.prim
-      : kind === 'str' ? mtk.str
-      : kind === 'num' ? mtk.num
-      : kind === 'cls' ? mtk.cls
-      : kind === 'fn' ? (mtk.fn || mtk.def)
-      : kind === 'cm' ? mtk.cm
-      : mtk.def;
+    var k = mtk[kind];
+    return k && k !== mtk.def ? k : mtk.def;
   }
-  function emit(kind, text){
+  function emit(kind, text, extraCls){
     if (!text) return;
-    if (kind === 'id') { target.appendChild(document.createTextNode(text)); return; }
     var sp = document.createElement('span');
-    sp.className = clsFor(kind) + ' ir-tk-' + kind; // both sampled .mtkN AND our marker
+    var cls = clsFor(kind) + ' ir-tk-' + kind;
+    if (extraCls) cls += ' ' + extraCls;
+    sp.className = cls;
     sp.textContent = text;
     target.appendChild(sp);
+  }
+  function emitText(text){
+    if (text) target.appendChild(document.createTextNode(text));
   }
   while (i < len) {
     var ch = code.charAt(i);
@@ -1609,26 +1663,64 @@ function irTokenizeCode(code, lang, target){
       emit('num', code.substring(i, j));
       i = j; continue;
     }
-    // Identifiers / keywords
+    // Decorators / annotations (@foo)
+    if (ch === '@' && i+1 < len && /[A-Za-z_]/.test(code.charAt(i+1))) {
+      var j = i + 1;
+      while (j < len && /[A-Za-z0-9_$]/.test(code.charAt(j))) j++;
+      emit('deco', code.substring(i, j));
+      i = j; continue;
+    }
+    // Identifiers / keywords / property access
     if (/[A-Za-z_$]/.test(ch)) {
       var j = i;
       while (j < len && /[A-Za-z0-9_$]/.test(code.charAt(j))) j++;
       var word = code.substring(i, j);
+      // Property access: previous non-space char is '.'
+      var prevIdx = i - 1;
+      while (prevIdx >= 0 && (code.charAt(prevIdx) === ' ' || code.charAt(prevIdx) === '\\t')) prevIdx--;
+      var afterDot = prevIdx >= 0 && code.charAt(prevIdx) === '.';
       if (IR_KW[word]) emit('kw', word);
       else if (IR_PRIM[word]) emit('prim', word);
-      // Capitalized → likely a class/type
+      else if (afterDot && j < len && code.charAt(j) === '(') emit('fn', word);
+      else if (afterDot) emit('prop', word);
       else if (word.charAt(0) >= 'A' && word.charAt(0) <= 'Z') emit('cls', word);
-      // Followed by '(' → function call
       else if (j < len && code.charAt(j) === '(') emit('fn', word);
-      else emit('id', word);
+      else emit('var', word);
       i = j; continue;
     }
-    // Punctuation / operators — leave as plain text
+    // Brackets — apply bracket-highlighting-N like Monaco does.
+    if (ch === '(' || ch === '[' || ch === '{') {
+      emit('bk', ch, 'bracket-highlighting-' + (bracketDepth % 3));
+      bracketDepth++;
+      i++; continue;
+    }
+    if (ch === ')' || ch === ']' || ch === '}') {
+      bracketDepth = Math.max(0, bracketDepth - 1);
+      emit('bk', ch, 'bracket-highlighting-' + (bracketDepth % 3));
+      i++; continue;
+    }
+    // Operators
+    if ('=+-*/<>!&|^%~?'.indexOf(ch) >= 0) {
+      var j = i + 1;
+      while (j < len && '=+-*/<>!&|^%~?'.indexOf(code.charAt(j)) >= 0) j++;
+      emit('op', code.substring(i, j));
+      i = j; continue;
+    }
+    // Punctuation
+    if (ch === ',' || ch === ';' || ch === ':' || ch === '.') {
+      emit('pn', ch);
+      i++; continue;
+    }
+    // Anything else — plain text
     target.appendChild(document.createTextNode(ch));
     i++;
   }
 }
 
+// Inline styles used by VS Code's native .monaco-tokenized-source. From
+// snapshot of native hover. Re-applying here keeps font / line-height /
+// letter-spacing identical even before we get real tokenization wired.
+var IR_MTS_STYLE = 'font-family: Menlo, Monaco, "Courier New", monospace; font-weight: normal; font-size: 12px; font-feature-settings: "liga" 0, "calt" 0; font-variation-settings: normal; line-height: 18px; letter-spacing: 0px; white-space: pre;';
 function irBuildMdDom(md,parent){
   var i=0; var len=md.length;
   while(i<len){
@@ -1645,15 +1737,39 @@ function irBuildMdDom(md,parent){
     if(endFence<0) break;
     var code=md.substring(nlAfter+1,endFence);
     if(code.charAt(code.length-1)==='\\n') code=code.substring(0,code.length-1);
-    var pre=document.createElement('pre');
-    pre.className='ir-md-pre';
-    if(lang) pre.setAttribute('data-lang',lang);
-    var c=document.createElement('code');
-    c.className='ir-md-code';
-    if(lang) c.classList.add('language-'+lang);
-    irTokenizeCode(code, lang, c);
-    pre.appendChild(c);
-    parent.appendChild(pre);
+    // Tokenize via VS Code's actual tokenizationSupport (extracted from
+    // a captured open-editor model). Returns mtkN-classed spans —
+    // matches native hover output exactly. Falls back to the hidden-
+    // widget approach (which collapses to mtk1) if no grammar-loaded
+    // support is found for the language.
+    var frag=null;
+    try {
+      if(typeof window.__irTokenizeToFragment==='function' && lang){
+        frag=window.__irTokenizeToFragment(code,lang);
+      }
+    } catch(eT){ irLog('renderer: tokFrag err: '+(eT&&eT.message)); }
+    if(!frag){
+      try {
+        if(typeof window.__irTokenizeCode==='function' && lang){
+          frag=window.__irTokenizeCode(code,lang);
+        }
+      } catch(eT2){ irLog('renderer: tokenize err: '+(eT2&&eT2.message)); }
+    }
+    var box=document.createElement('div');
+    box.className='monaco-tokenized-source';
+    box.setAttribute('style', IR_MTS_STYLE);
+    if(lang) box.setAttribute('data-lang',lang);
+    if(frag){
+      box.appendChild(frag);
+    } else {
+      // No tokenizer — at least match the native structure so font /
+      // line-height / letter-spacing are right. mtk1 = default fg.
+      var sp=document.createElement('span');
+      sp.className='mtk1';
+      sp.textContent=code;
+      box.appendChild(sp);
+    }
+    parent.appendChild(box);
     i=endFence+3; if(md.charAt(i)==='\\n') i++;
   }
 }
@@ -1706,7 +1822,22 @@ window.irApplyPreview=function(typeName,md){
       }
       irLog('renderer: ancestors: '+chain.join(' < '));
     } catch(_) {}
-    irBuildMdDom(decoded,target);
+    // Prefer VS Code's captured MarkdownRenderer if we found one — it
+    // produces native-quality output (TextMate + semantic tokens, plus
+    // exact chrome). Falls through to our own DOM builder if not found
+    // or rendering fails.
+    var nativeOk = false;
+    if (window.__irMdRenderer && typeof window.__irMdRenderer.render === 'function') {
+      try {
+        var nr = window.__irMdRenderer.render({ value: decoded, isTrusted: true, supportThemeIcons: true });
+        if (nr && nr.element instanceof HTMLElement) {
+          target.appendChild(nr.element);
+          nativeOk = true;
+          irLog('renderer: native MdRenderer used (children='+nr.element.children.length+')');
+        }
+      } catch(eMR){ irLog('renderer: native MdRenderer threw: '+(eMR&&eMR.message)); }
+    }
+    if (!nativeOk) irBuildMdDom(decoded,target);
     // DIAG: walk the rendered children, report tag/class/computed style
     // for the first few. Tells us whether our CSS rules actually match.
     try {
@@ -1818,6 +1949,252 @@ window.__irScanInterval = setInterval(function(){
 
 irLog('renderer: setInterval started');
 
+// ── Native hover anatomy probe ─────────────────────────────────────
+// Auto-snapshot any newly-appeared .monaco-hover so we can see the
+// exact DOM/class structure VS Code uses. Helps us understand what
+// to replicate. Fires once per hover (deduped via Set).
+function irDumpNode(el, depth, max){
+  if (!el || depth > max) return [];
+  var lines = [];
+  var indent = '  '.repeat(depth);
+  var cls = (el.className || '').toString();
+  var attrs = [];
+  if (el.id) attrs.push('id='+el.id);
+  for (var ai = 0; ai < (el.attributes||{}).length; ai++) {
+    var a = el.attributes[ai];
+    if (a.name === 'class' || a.name === 'id') continue;
+    if (a.name.startsWith('data-') || a.name === 'role' || a.name === 'style') {
+      attrs.push(a.name+'='+(a.value||'').slice(0,40));
+    }
+  }
+  var txt = '';
+  if (el.children.length === 0) {
+    txt = (el.textContent || '').slice(0,40).replace(/\\n/g,'\\\\n');
+    if (txt) txt = ' "'+txt+'"';
+  }
+  lines.push(indent + el.tagName + (cls?'.'+cls.split(/\\s+/).join('.'):'') + (attrs.length?' ['+attrs.join(' ')+']':'') + txt);
+  for (var i = 0; i < el.children.length && i < 30; i++) {
+    var sub = irDumpNode(el.children[i], depth + 1, max);
+    for (var s = 0; s < sub.length; s++) lines.push(sub[s]);
+  }
+  if (el.children.length > 30) lines.push(indent + '  ... +' + (el.children.length - 30) + ' more children');
+  return lines;
+}
+
+window.__irSnapshotHover = function(hoverEl){
+  if (!hoverEl) {
+    // Find first visible .monaco-hover
+    var all = document.querySelectorAll('.monaco-hover, .monaco-editor-hover');
+    for (var i = 0; i < all.length; i++) {
+      if (all[i].offsetParent !== null) { hoverEl = all[i]; break; }
+    }
+  }
+  if (!hoverEl) return 'no-hover';
+
+  var lines = ['── hover anatomy ──'];
+
+  // Full DOM tree (4 levels deep)
+  lines.push('DOM:');
+  var tree = irDumpNode(hoverEl, 0, 6);
+  for (var t = 0; t < tree.length && t < 60; t++) lines.push(tree[t]);
+
+  // Find code blocks specifically and dump their inner HTML
+  var codeBlocks = hoverEl.querySelectorAll('pre, .monaco-tokenized-source');
+  lines.push('CODE BLOCKS: '+codeBlocks.length);
+  for (var c = 0; c < Math.min(codeBlocks.length, 3); c++) {
+    var cb = codeBlocks[c];
+    var html = (cb.outerHTML || '').slice(0, 600);
+    lines.push('  ['+c+'] '+html);
+  }
+
+  // Collect all distinct mtk classes inside hover
+  var mtkSet = {};
+  var mtkSpans = hoverEl.querySelectorAll('[class*="mtk"]');
+  for (var m = 0; m < mtkSpans.length; m++) {
+    var c2 = mtkSpans[m].className.toString();
+    var matches = c2.match(/mtk\\d+/g);
+    if (matches) for (var mm = 0; mm < matches.length; mm++) mtkSet[matches[mm]] = true;
+  }
+  lines.push('mtk classes used: '+Object.keys(mtkSet).join(','));
+
+  // For each unique mtk, look up its CSS color
+  var colorInfo = [];
+  for (var mc in mtkSet) {
+    var probe = document.createElement('span');
+    probe.className = mc;
+    probe.style.position = 'fixed';
+    probe.style.top = '-9999px';
+    document.body.appendChild(probe);
+    try {
+      var cs = window.getComputedStyle(probe);
+      colorInfo.push(mc+':'+cs.color);
+    } catch(_) {}
+    try { document.body.removeChild(probe); } catch(_) {}
+  }
+  lines.push('mtk colors: '+colorInfo.join(' | '));
+
+  // Sample tokens with their text + class
+  var sample = [];
+  for (var s2 = 0; s2 < Math.min(mtkSpans.length, 12); s2++) {
+    var sp = mtkSpans[s2];
+    sample.push('"'+(sp.textContent||'').slice(0,15).replace(/\\n/g,'·')+'":'+(sp.className||''));
+  }
+  lines.push('token samples: '+sample.join(' / '));
+
+  return lines.join('\\n');
+};
+
+// Auto-snapshot first visible hover via MutationObserver. VS Code
+// creates the hover container first then populates content async — so
+// we observe the container itself for content additions, and snapshot
+// only once meaningful content (.rendered-markdown with children) is
+// present. Limited to first 3 successful snapshots.
+(function(){
+  var snapshotted = new WeakSet();
+  var snapshotCount = 0;
+  var watching = new WeakSet();
+  function isPopulated(el){
+    if (!el) return false;
+    if (el.classList.contains('hidden')) return false;
+    // Require a code block (PRE, or .codeBlock, or .markdown-tokenized-source)
+    // so we capture only structurally interesting hovers — those with
+    // tokenized content. Ignore plain-text-only hovers.
+    var hasCode = !!el.querySelector('pre, .codeBlock, .markdown-tokenized-source');
+    return hasCode;
+  }
+  function trySnapshot(el){
+    if (snapshotted.has(el) || snapshotCount >= 3) return false;
+    if (!isPopulated(el)) return false;
+    snapshotted.add(el);
+    snapshotCount++;
+    try {
+      var snap = window.__irSnapshotHover(el);
+      irLog('AUTO-SNAPSHOT['+snapshotCount+']:\\n'+snap);
+    } catch(eS) { irLog('snapshot err: '+(eS&&eS.message)); }
+    return true;
+  }
+  function watchHover(el){
+    if (!el || watching.has(el) || snapshotted.has(el)) return;
+    if (!el.classList || !(el.classList.contains('monaco-hover') || el.classList.contains('monaco-editor-hover'))) return;
+    watching.add(el);
+    // Try immediately in case content already arrived.
+    if (trySnapshot(el)) return;
+    // Otherwise watch for content additions inside it.
+    var inner = new MutationObserver(function(){
+      if (trySnapshot(el)) {
+        try { inner.disconnect(); } catch(_) {}
+      }
+    });
+    try { inner.observe(el, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] }); } catch(_) {}
+    // Safety fallback — give up after 3s
+    setTimeout(function(){
+      try { inner.disconnect(); } catch(_) {}
+      // One more try in case mutation observer missed it.
+      if (!snapshotted.has(el)) {
+        if (!trySnapshot(el)) {
+          // Force a snapshot anyway if we never got populated content,
+          // so we at least have the empty skeleton for diagnosis.
+          if (!snapshotted.has(el) && snapshotCount < 3) {
+            snapshotted.add(el);
+            snapshotCount++;
+            try {
+              var snap = window.__irSnapshotHover(el);
+              irLog('AUTO-SNAPSHOT['+snapshotCount+'] (timeout, may be empty):\\n'+snap);
+            } catch(_) {}
+          }
+        }
+      }
+    }, 3000);
+  }
+  var outer = new MutationObserver(function(muts){
+    for (var i = 0; i < muts.length; i++) {
+      var added = muts[i].addedNodes;
+      for (var j = 0; j < added.length; j++) {
+        var n = added[j];
+        if (n.nodeType !== 1) continue;
+        watchHover(n);
+        var hovers = n.querySelectorAll && n.querySelectorAll('.monaco-hover, .monaco-editor-hover');
+        if (hovers) for (var h = 0; h < hovers.length; h++) watchHover(hovers[h]);
+      }
+    }
+  });
+  outer.observe(document.body, { childList: true, subtree: true });
+  irLog('hover-observer installed (waits for content)');
+})();
+
+// Watches for any .monaco-tokenized-source landing in the DOM (which
+// happens whenever VS Code's MarkdownRenderer renders a hover with a
+// code fence). For the first 3, dumps ancestor private-keys so we can
+// see which DI-managed object owns the rendering pipeline. Helps locate
+// the actual renderer reference we need to call from drill-down.
+(function(){
+  var reported = 0;
+  var seenEl = new WeakSet();
+  function dumpAncestorPrivKeys(el){
+    var lines = [];
+    var anc = el;
+    for (var d = 0; d < 8 && anc; d++) {
+      var clsName = (anc.className || '').toString().replace(/\\s+/g,'.').slice(0,40);
+      var keys = [];
+      try { for (var k in anc) keys.push(k); } catch(_) {}
+      // Filter to private-looking enumerable keys (own + inherited)
+      var priv = keys.filter(function(k){
+        return (k && k.length > 0 && (k[0] === '_' || k[0] === '$')) || k === 'render' || k === 'renderer';
+      });
+      // Also Symbol-keyed properties
+      var syms = [];
+      try {
+        var sk = Object.getOwnPropertySymbols(anc) || [];
+        for (var si = 0; si < sk.length && si < 5; si++) syms.push(String(sk[si]));
+      } catch(_) {}
+      lines.push(anc.tagName + (clsName?'.'+clsName:'') + (priv.length?' priv=['+priv.slice(0,5).join(',')+']':'') + (syms.length?' sym=['+syms.join(',')+']':''));
+      anc = anc.parentElement;
+    }
+    return lines.join(' < ');
+  }
+  function visit(node){
+    if (reported >= 3) return;
+    if (!node || node.nodeType !== 1) return;
+    var direct = node.classList && node.classList.contains('monaco-tokenized-source') ? node : null;
+    var found = direct || (node.querySelector && node.querySelector('.monaco-tokenized-source'));
+    if (!found || seenEl.has(found)) return;
+    seenEl.add(found);
+    reported++;
+    try {
+      irLog('TOKEN-DOM['+reported+'] outer="'+(found.outerHTML||'').slice(0,200)+'"');
+      irLog('TOKEN-DOM['+reported+'] anc: '+dumpAncestorPrivKeys(found));
+    } catch(eD) { irLog('TOKEN-DOM dump err: '+(eD&&eD.message)); }
+    // Strategy 1: try to locate renderer via DOM walk (rarely works
+    // because DOM elements don\\'t carry widget refs).
+    if (!window.__irMdRenderer && typeof window.__irFindMdRendererFromDom === 'function') {
+      try {
+        var r = window.__irFindMdRendererFromDom(found);
+        if (r) irLog('TOKEN-DOM['+reported+'] mdRenderer FOUND: '+r);
+      } catch(eF) { irLog('mdRenderer DOM-walk err: '+(eF&&eF.message)); }
+    }
+    // Strategy 2: re-enable prototype hooks briefly. The NEXT hover
+    // render will instantiate fresh HoverWidget / MarkdownRenderer
+    // through DI, which flows through Map.set / Reflect.construct hooks
+    // and lands in caps. After 2s, capture stop runs the agg search
+    // again — this time with MarkdownRenderer in the graph.
+    if (!window.__irMdRenderer && reported === 1 && !window.__irRecaptureScheduled) {
+      window.__irRecaptureScheduled = true;
+      irLog('mdRenderer recatch: re-enabling hooks for next hover');
+      try {
+        if (window.__irStartCapture) window.__irStartCapture('hover-recatch');
+      } catch(eRC) { irLog('mdRenderer recatch start err: '+(eRC&&eRC.message)); }
+    }
+  }
+  var obs = new MutationObserver(function(muts){
+    for (var i = 0; i < muts.length && reported < 3; i++) {
+      var added = muts[i].addedNodes;
+      for (var j = 0; j < added.length; j++) visit(added[j]);
+    }
+  });
+  obs.observe(document.body, { childList: true, subtree: true });
+  irLog('token-observer installed');
+})();
+
 // ── Monaco capture (host-driven, brief activation) ────────────────────
 // Modern VS Code hides the monaco namespace and AMD loader. To get
 // theme-matched syntax highlighting we capture VS Code's internal
@@ -1829,7 +2206,11 @@ irLog('renderer: setInterval started');
 // Default: no hooks, no impact on normal editor operation.
 window.__irStartCapture = function(reason){
   if (window.__irCaptureActive) return 'already-active';
-  var caps = { widgets: [], services: [], widgetCtors: [] };
+  // rendererCtors: classes whose prototype has .render — candidates for
+  // VS Code's MarkdownRenderer (used by hover to tokenize/render markdown
+  // via Monaco's tokenizer with full theme awareness). We exclude widget
+  // signatures so we only collect non-widget renderers.
+  var caps = { widgets: [], services: [], widgetCtors: [], rendererCtors: [], rendererInstances: [] };
   window.__irMonacoCaps = caps;
   window.__irCaptureActive = true;
   var capturing = true;
@@ -1855,6 +2236,26 @@ window.__irStartCapture = function(reason){
         return;
       }
     } catch(_) {}
+    // Possible MarkdownRenderer instance — has .render method, is a
+    // proper class instance (not vanilla Object), and not a widget.
+    // Dedupe by constructor so we keep one per class.
+    try {
+      if (typeof v.render==='function' &&
+          typeof v.layout!=='function' &&
+          typeof v.getModel!=='function' &&
+          v.constructor && v.constructor !== Object &&
+          v.constructor.prototype !== Object.prototype &&
+          // .render must be on the PROTOTYPE (real class), not own property
+          typeof Object.getPrototypeOf(v).render === 'function' &&
+          caps.rendererInstances.length < 50) {
+        // Dedupe by constructor — keep one instance per class.
+        var alreadyHave = false;
+        for (var ri = 0; ri < caps.rendererInstances.length; ri++) {
+          if (caps.rendererInstances[ri].constructor === v.constructor) { alreadyHave = true; break; }
+        }
+        if (!alreadyHave) caps.rendererInstances.push(v);
+      }
+    } catch(_) {}
   }
   var oM=Map.prototype.set, oW=WeakMap.prototype.set, oS=Set.prototype.add, oA=Array.prototype.push, oR=Reflect.construct;
   Map.prototype.set = function(k,v){ try { sniff(v); } catch(_) {} return oM.call(this,k,v); };
@@ -1867,6 +2268,11 @@ window.__irStartCapture = function(reason){
         var p = target.prototype;
         if (typeof p.layout==='function' && typeof p.getModel==='function' && typeof p.getDomNode==='function') {
           if (caps.widgetCtors.indexOf(target) < 0 && caps.widgetCtors.length < 20) caps.widgetCtors.push(target);
+        } else if (typeof p.render==='function' &&
+                   typeof p.layout!=='function' &&
+                   typeof p.getModel!=='function') {
+          // Likely a renderer (MarkdownRenderer / similar)
+          if (caps.rendererCtors.indexOf(target) < 0 && caps.rendererCtors.length < 30) caps.rendererCtors.push(target);
         }
       }
     } catch(_) {}
@@ -1883,14 +2289,291 @@ window.__irStartCapture = function(reason){
     window.__irCaptureActive = false;
     var kinds = {};
     for (var i = 0; i < caps.services.length; i++) { kinds[caps.services[i].kind] = (kinds[caps.services[i].kind]||0)+1; }
-    irLog('capture stopped: widgets='+caps.widgets.length+' ctors='+caps.widgetCtors.length+' svcs='+JSON.stringify(kinds));
+    irLog('capture stopped: widgets='+caps.widgets.length+' ctors='+caps.widgetCtors.length+' svcs='+JSON.stringify(kinds)+' rendererCtors='+caps.rendererCtors.length+' rendererInst='+caps.rendererInstances.length);
+    // DIAG: list captured renderer instances with constructor name +
+    // prototype methods + own field names. Helps identify MarkdownRenderer.
+    try {
+      for (var ri = 0; ri < Math.min(caps.rendererInstances.length, 15); ri++) {
+        var rinst = caps.rendererInstances[ri];
+        var ctorName = (rinst.constructor && rinst.constructor.name) || '?';
+        var protoKeys = [];
+        try {
+          var pn = Object.getOwnPropertyNames(Object.getPrototypeOf(rinst) || {});
+          for (var pmi = 0; pmi < pn.length && protoKeys.length < 8; pmi++) {
+            protoKeys.push(pn[pmi]);
+          }
+        } catch(_) {}
+        var ownKeys = [];
+        try {
+          var on = Object.getOwnPropertyNames(rinst);
+          for (var omi = 0; omi < on.length && ownKeys.length < 6; omi++) {
+            ownKeys.push(on[omi]);
+          }
+        } catch(_) {}
+        irLog('cand['+ri+'] ctor='+ctorName+' proto=['+protoKeys.join(',')+'] own=['+ownKeys.join(',')+']');
+      }
+    } catch(_) {}
+    // Try each candidate: call .render() with a small markdown and see
+    // which one returns an HTMLElement with .mtkN spans.
+    try {
+      var testMd = { value: '\\\`\\\`\\\`typescript\\nconst x: number = 1;\\n\\\`\\\`\\\`', isTrusted: true };
+      for (var ri2 = 0; ri2 < caps.rendererInstances.length; ri2++) {
+        var inst2 = caps.rendererInstances[ri2];
+        try {
+          var r = inst2.render(testMd);
+          if (r && r.element instanceof HTMLElement) {
+            var hasMtk = !!r.element.querySelector('[class*="mtk"]');
+            irLog('cand['+ri2+'] '+(inst2.constructor && inst2.constructor.name)+' render→element ('+(r.element.tagName)+') hasMtk='+hasMtk+' html="'+(r.element.outerHTML||'').slice(0,120)+'"');
+            if (hasMtk && !window.__irMdRenderer) {
+              window.__irMdRenderer = inst2;
+              irLog('cand['+ri2+'] ★ stored as __irMdRenderer');
+            }
+            try { r.dispose && r.dispose(); } catch(_) {}
+          }
+        } catch(eR) { /* not a renderer */ }
+      }
+      irLog('mdRenderer found: '+!!window.__irMdRenderer);
+    } catch(_) {}
+    // Aggressive deep duck-typing — walk through ALL captured graphs
+    // (widgets, services, their nested fields), looking for any object
+    // whose render() returns an HTMLElement with .mtkN spans. Markdown-
+    // Renderer is often a private field on a higher-level widget rather
+    // than itself surfaced through prototype hooks.
+    if (!window.__irMdRenderer) try {
+      var seenAgg = new WeakSet();
+      var foundAgg = null;
+      var testMd2 = { value: '\\\`\\\`\\\`typescript\\nconst x: number = 1;\\n\\\`\\\`\\\`', isTrusted: true };
+      function looksLikeMd(o){
+        // Field-name check is useless in minified VS Code (names are
+        // munged to '_a', 'Tu' etc). So we just gate on STRUCTURE: a
+        // render method with sane arity, on a real class. The actual
+        // identification happens by calling render() and checking the
+        // result has .element with .mtkN spans.
+        if (typeof o.render !== 'function') return false;
+        if (o.render.length > 3) return false;
+        try {
+          if (!o.constructor || o.constructor === Object) return false;
+          if (o.constructor.prototype === Object.prototype) return false;
+        } catch(_) { return false; }
+        // Skip widgets (have layout/getModel) — we tested those already.
+        if (typeof o.layout === 'function' && typeof o.getModel === 'function') return false;
+        return true;
+      }
+      var candDiag = [];
+      function tryRender(o){
+        var ctorName = (o.constructor && o.constructor.name) || '?';
+        var arity = o.render.length;
+        var ownKeys = [];
+        try { ownKeys = Object.getOwnPropertyNames(o).slice(0,5); } catch(_) {}
+        var info = 'ctor='+ctorName+' arity='+arity+' own=['+ownKeys.join(',')+']';
+        // MarkdownRenderer signature check via own keys (more reliable
+        // than calling render — render\\'s code-block fill is async, so
+        // mtkN spans appear later than our sync check).
+        var hasMdSignature = false;
+        try {
+          for (var ki = 0; ki < ownKeys.length; ki++) {
+            if (/_(defaultCodeBlockRenderer|openerService|languageService|codeBlockRenderer)/.test(ownKeys[ki]) ||
+                /setDefaultCodeBlockRenderer|getMarkdown/.test(ownKeys[ki])) {
+              hasMdSignature = true; break;
+            }
+          }
+          if (!hasMdSignature) {
+            var protoKeys = Object.getOwnPropertyNames(Object.getPrototypeOf(o) || {});
+            for (var pi = 0; pi < protoKeys.length; pi++) {
+              if (/setDefaultCodeBlockRenderer|render(Markdown|CodeBlock)/.test(protoKeys[pi])) {
+                hasMdSignature = true; break;
+              }
+            }
+          }
+        } catch(_) {}
+        try {
+          var r = o.render(testMd2);
+          if (r === null || r === undefined) {
+            info += ' → '+typeof r;
+          } else if (r instanceof HTMLElement) {
+            info += ' → HTMLElement('+r.tagName+') hasMtk='+(!!r.querySelector('[class*="mtk"]'));
+            if (candDiag.length < 8) candDiag.push(info+(hasMdSignature?' [MD-SIG]':''));
+            try { r.dispose && r.dispose(); } catch(_) {}
+            return !!r.querySelector('[class*="mtk"]');
+          } else if (typeof r === 'object') {
+            var rkeys = [];
+            try { rkeys = Object.getOwnPropertyNames(r).slice(0,5); } catch(_) {}
+            info += ' → obj keys=['+rkeys.join(',')+']';
+            if (r.element instanceof HTMLElement) {
+              var hasMtk = !!r.element.querySelector('[class*="mtk"]');
+              info += ' .element('+r.element.tagName+') hasMtk='+hasMtk;
+              if (candDiag.length < 8) candDiag.push(info+(hasMdSignature?' [MD-SIG]':''));
+              try { r.dispose && r.dispose(); } catch(_) {}
+              // Accept based on SHAPE + signature, not just immediate
+              // mtkN. MarkdownRenderer.render returns sync but populates
+              // code blocks via async codeBlockRenderer callback. mtkN
+              // spans appear AFTER our sync check.
+              if (hasMdSignature && typeof r.dispose === 'function' && r.element instanceof HTMLElement) {
+                return true;
+              }
+              return hasMtk;
+            }
+          } else {
+            info += ' → '+typeof r;
+          }
+          if (candDiag.length < 8) candDiag.push(info+(hasMdSignature?' [MD-SIG]':''));
+        } catch(eR) {
+          info += ' → THREW: '+(eR&&eR.message?eR.message.slice(0,60):String(eR).slice(0,60));
+          if (candDiag.length < 8) candDiag.push(info+(hasMdSignature?' [MD-SIG]':''));
+        }
+        return false;
+      }
+      var visited = 0, candidates = 0, tested = 0, mapsWalked = 0;
+      var triedCtors = new WeakSet(); // dedup tryRender by class
+      function walkAgg(o, path, depth){
+        if (foundAgg || depth > 7 || visited > 200000) return;
+        if (!o) return;
+        var t = typeof o;
+        if (t !== 'object' && t !== 'function') return;
+        try { if (seenAgg.has(o)) return; seenAgg.add(o); } catch(_) { return; }
+        visited++;
+        if (t === 'object') {
+          try {
+            if (looksLikeMd(o)) {
+              candidates++;
+              var ctor = o.constructor;
+              if (ctor && !triedCtors.has(ctor)) {
+                try { triedCtors.add(ctor); } catch(_) {}
+                if (tryRender(o)) {
+                  foundAgg = { obj: o, path: path, ctor: (ctor.name || '?') };
+                  return;
+                }
+                tested++;
+              }
+            }
+          } catch(_) {}
+        }
+        // VS Code stores DI services in Maps. Walk Map.values()/Set
+        // entries so we don\\'t miss MarkdownRenderer instances stashed
+        // in service collections.
+        if (o instanceof Map) {
+          mapsWalked++;
+          try {
+            var ent = o.values();
+            var n = 0;
+            while (n < 500) {
+              var nx = ent.next();
+              if (nx.done) break;
+              walkAgg(nx.value, path+'.<map>', depth+1);
+              if (foundAgg) return;
+              n++;
+            }
+          } catch(_) {}
+        } else if (o instanceof Set) {
+          try {
+            var sIter = o.values();
+            var sn = 0;
+            while (sn < 500) {
+              var snx = sIter.next();
+              if (snx.done) break;
+              walkAgg(snx.value, path+'.<set>', depth+1);
+              if (foundAgg) return;
+              sn++;
+            }
+          } catch(_) {}
+        }
+        var keys;
+        try { keys = Object.getOwnPropertyNames(o); } catch(_) { return; }
+        for (var ki = 0; ki < keys.length; ki++) {
+          var kk = keys[ki];
+          if (t === 'function' && (kk === 'caller' || kk === 'arguments' || kk === 'callee' || kk === 'prototype')) continue;
+          if (kk === '_textModel' || kk === '_buffer' || kk === '_lines') continue;
+          var vv;
+          try { vv = o[kk]; } catch(_) { continue; }
+          walkAgg(vv, path+'.'+kk, depth+1);
+          if (foundAgg) return;
+        }
+      }
+      // Seed from all our capture buckets
+      walkAgg(caps.widgets, 'caps.widgets', 0);
+      if (!foundAgg) walkAgg(caps.services, 'caps.services', 0);
+      if (!foundAgg) walkAgg(caps.rendererInstances, 'caps.rendererInstances', 0);
+      if (!foundAgg) walkAgg(caps.widgetCtors, 'caps.widgetCtors', 0);
+      if (!foundAgg) walkAgg(caps.rendererCtors, 'caps.rendererCtors', 0);
+      irLog('mdRenderer agg: visited='+visited+' maps='+mapsWalked+' candidates='+candidates+' tested='+tested+' found='+(!!foundAgg));
+      for (var di = 0; di < candDiag.length; di++) irLog('mdRenderer cand['+di+']: '+candDiag[di]);
+      if (foundAgg) {
+        window.__irMdRenderer = foundAgg.obj;
+        irLog('mdRenderer agg ★ '+foundAgg.path+' ctor='+foundAgg.ctor);
+      }
+    } catch(eA) { irLog('mdRenderer agg err: '+(eA&&eA.message)); }
+    // Deep scan ALL captures (services + widgets + their object graphs)
+    // for any function whose .toString() contains 'monaco-tokenized-source'.
+    // This is the actual VS Code tokenizer entry point — finding it lets
+    // us call it directly with our own (text, lang) instead of trying to
+    // re-render via a DI-wrapped MarkdownRenderer.
+    try {
+      var seen = new WeakSet();
+      var hits = [];
+      function scanFn(obj, path, depth){
+        if (depth > 6 || hits.length >= 5) return;
+        if (!obj) return;
+        var t = typeof obj;
+        if (t !== 'object' && t !== 'function') return;
+        try { if (seen.has(obj)) return; seen.add(obj); } catch(_) { return; }
+        if (t === 'function') {
+          var src;
+          try { src = Function.prototype.toString.call(obj); } catch(_) { src = ''; }
+          if (src.indexOf('monaco-tokenized-source') >= 0) {
+            hits.push({ path: path, len: src.length, head: src.slice(0,180) });
+            return;
+          }
+          // Also walk function's own props (e.g. static methods)
+        }
+        var keys;
+        try { keys = Object.getOwnPropertyNames(obj); } catch(_) { return; }
+        for (var ki = 0; ki < keys.length; ki++) {
+          var k = keys[ki];
+          // Skip noisy native props on functions
+          if (t === 'function' && (k === 'caller' || k === 'arguments' || k === 'callee')) continue;
+          var v;
+          try { v = obj[k]; } catch(_) { continue; }
+          scanFn(v, path + '.' + k, depth + 1);
+          if (hits.length >= 5) return;
+        }
+      }
+      try { scanFn(caps, 'caps', 0); } catch(_) {}
+      try { if (window.__irMonaco) scanFn(window.__irMonaco, '__irMonaco', 0); } catch(_) {}
+      if (hits.length) {
+        for (var hi = 0; hi < hits.length; hi++) {
+          irLog('TOKEN-FN['+hi+'] '+hits[hi].path+' len='+hits[hi].len+' head="'+hits[hi].head.replace(/\\n/g,' ').slice(0,160)+'"');
+        }
+        // Stash the first match for direct use by drill-down.
+        try {
+          var firstPath = hits[0].path.split('.');
+          var node = firstPath[0]==='caps'?caps:window.__irMonaco;
+          for (var pi = 1; pi < firstPath.length; pi++) node = node[firstPath[pi]];
+          if (typeof node === 'function') window.__irTokenizeToString = node;
+        } catch(eS) {}
+      } else {
+        irLog('TOKEN-FN: none found in capture graph');
+      }
+    } catch(eF) { irLog('TOKEN-FN scan err: '+(eF&&eF.message)); }
     try {
       var mz = window.__irMaterializeMonaco ? window.__irMaterializeMonaco() : 'no-fn';
       irLog('materialize: '+mz);
     } catch(eMz) { irLog('materialize threw: '+(eMz&&eMz.message)); }
     return 'stopped';
   };
-  setTimeout(function(){ try { if (window.__irCaptureActive) window.__irStopCapture(); } catch(_) {} }, 3000);
+  // Per-session ID so a stale timer from a previous capture session
+  // can\\'t fire and kill our brand-new session. Each start increments
+  // the global counter, and the auto-stop timer only fires if the
+  // current session ID still matches.
+  if (typeof window.__irCaptureSessionId !== 'number') window.__irCaptureSessionId = 0;
+  window.__irCaptureSessionId++;
+  var mySessionId = window.__irCaptureSessionId;
+  setTimeout(function(){
+    try {
+      if (window.__irCaptureActive && window.__irCaptureSessionId === mySessionId) {
+        window.__irStopCapture();
+      }
+    } catch(_) {}
+  }, 3000);
   irLog('capture started ('+reason+', max 3s)');
   return 'started';
 };
@@ -1964,7 +2647,7 @@ window.__irMaterializeMonaco = function(){
   // initial Map.set call (boot-time pre-existing entries).
   if (!modelSvc) {
     for (var ix = 0; ix < insts.length && !modelSvc; ix++) {
-      modelSvc = irDeepFind(insts[ix], 3, new Set(), irIsModelSvc);
+      modelSvc = irDeepFind(insts[ix], 6, new Set(), irIsModelSvc);
     }
     if (modelSvc) irLog('modelSvc found via inst deep-find');
   }
@@ -1972,13 +2655,21 @@ window.__irMaterializeMonaco = function(){
   // _modelService injected by DI).
   if (!modelSvc) {
     for (var w = 0; w < caps.widgets.length && !modelSvc; w++) {
-      modelSvc = irDeepFind(caps.widgets[w], 3, new Set(), irIsModelSvc);
+      modelSvc = irDeepFind(caps.widgets[w], 5, new Set(), irIsModelSvc);
     }
     if (modelSvc) irLog('modelSvc found via widget deep-find');
   }
+  // Fallback 3: deep-search captured renderer instances (also DI-injected).
+  if (!modelSvc) {
+    for (var ri3 = 0; ri3 < caps.rendererInstances.length && !modelSvc; ri3++) {
+      modelSvc = irDeepFind(caps.rendererInstances[ri3], 5, new Set(), irIsModelSvc);
+    }
+    if (modelSvc) irLog('modelSvc found via rendererInst deep-find');
+  }
+  if (!modelSvc) irLog('modelSvc deep-find: STILL not found across '+insts.length+' insts, '+caps.widgets.length+' widgets, '+caps.rendererInstances.length+' renderer insts');
   if (!codeEditorSvc) {
     for (var w2 = 0; w2 < caps.widgets.length && !codeEditorSvc; w2++) {
-      codeEditorSvc = irDeepFind(caps.widgets[w2], 3, new Set(), irIsCodeEditorSvc);
+      codeEditorSvc = irDeepFind(caps.widgets[w2], 5, new Set(), irIsCodeEditorSvc);
     }
   }
   // Capture monaco.Uri class so tokenize can construct URIs. First try
@@ -2110,6 +2801,270 @@ window.__irProbeMdRenderer = function(){
   return lines.join('\\n');
 };
 
+// Find a tokenizationSupport with grammar actually loaded. Walks all
+// open models via captured IModelService — the user's real editors
+// have full TextMate / TreeSitter grammar attached, so tokenizeEncoded
+// returns proper mtk classes. Verifies via a probe (tokenize a known
+// mixed string and check we get >=2 distinct fg colors).
+// DOM-walk fallback for MarkdownRenderer. Triggered when a native
+// .monaco-tokenized-source first appears (TOKEN-DOM observer). At that
+// moment the renderer JUST executed and is still reachable from the
+// hover element\\'s ancestor chain — VS Code attaches widget refs via
+// Symbol-keyed properties on DOM elements. Walks the DOM tree (incl.
+// Symbol props), then descends through each candidate widget\\'s own
+// fields + Map/Set entries until it finds an object whose render()
+// returns a result containing .mtkN spans.
+window.__irFindMdRendererFromDom = function(seedEl){
+  if (window.__irMdRenderer) return 'already-found';
+  var seen = new WeakSet();
+  var triedCtors = new WeakSet();
+  var found = null;
+  var visited = 0;
+  var testMd = { value: '\\\`\\\`\\\`typescript\\nconst x: number = 1;\\n\\\`\\\`\\\`', isTrusted: true };
+  function tryRender(o){
+    try {
+      var r = o.render(testMd);
+      if (r && r.element instanceof HTMLElement) {
+        var hasMtk = !!r.element.querySelector('[class*="mtk"]');
+        try { r.dispose && r.dispose(); } catch(_) {}
+        return hasMtk;
+      }
+    } catch(_) {}
+    return false;
+  }
+  function looksLikeMd(o){
+    if (typeof o.render !== 'function') return false;
+    if (o.render.length > 3) return false;
+    try {
+      if (!o.constructor || o.constructor === Object) return false;
+      if (o.constructor.prototype === Object.prototype) return false;
+    } catch(_) { return false; }
+    if (typeof o.layout === 'function' && typeof o.getModel === 'function') return false;
+    return true;
+  }
+  function walk(o, path, depth){
+    if (found || depth > 8 || visited > 30000) return;
+    if (!o) return;
+    var t = typeof o;
+    if (t !== 'object' && t !== 'function') return;
+    try { if (seen.has(o)) return; seen.add(o); } catch(_) { return; }
+    visited++;
+    if (t === 'object') {
+      try {
+        if (looksLikeMd(o)) {
+          var c = o.constructor;
+          if (c && !triedCtors.has(c)) {
+            try { triedCtors.add(c); } catch(_) {}
+            if (tryRender(o)) {
+              found = { obj: o, path: path, ctor: (c.name||'?') };
+              return;
+            }
+          }
+        }
+      } catch(_) {}
+    }
+    // Map / Set entries
+    if (o instanceof Map) {
+      try {
+        var iter = o.values(), n = 0;
+        while (n < 500) {
+          var nx = iter.next(); if (nx.done) break;
+          walk(nx.value, path+'.<map>', depth+1); if (found) return;
+          n++;
+        }
+      } catch(_) {}
+    } else if (o instanceof Set) {
+      try {
+        var sIter = o.values(), sn = 0;
+        while (sn < 500) {
+          var snx = sIter.next(); if (snx.done) break;
+          walk(snx.value, path+'.<set>', depth+1); if (found) return;
+          sn++;
+        }
+      } catch(_) {}
+    }
+    // Own props (string keys)
+    var keys;
+    try { keys = Object.getOwnPropertyNames(o); } catch(_) { return; }
+    for (var ki = 0; ki < keys.length; ki++) {
+      var k = keys[ki];
+      if (t === 'function' && (k === 'caller' || k === 'arguments' || k === 'callee' || k === 'prototype')) continue;
+      if (k === '_textModel' || k === '_buffer' || k === '_lines' || k === 'children' || k === 'childNodes') continue;
+      var v;
+      try { v = o[k]; } catch(_) { continue; }
+      walk(v, path+'.'+k, depth+1);
+      if (found) return;
+    }
+    // Symbol-keyed props (DOM elements: VS Code attaches widget refs here)
+    if (t === 'object') {
+      var syms = [];
+      try { syms = Object.getOwnPropertySymbols(o); } catch(_) {}
+      for (var si = 0; si < syms.length; si++) {
+        var v2;
+        try { v2 = o[syms[si]]; } catch(_) { continue; }
+        walk(v2, path+'.['+String(syms[si]).slice(0,20)+']', depth+1);
+        if (found) return;
+      }
+    }
+  }
+  // Walk seed element + 12 ancestors
+  var node = seedEl;
+  for (var d = 0; d < 12 && node && !found; d++) {
+    walk(node, 'dom['+d+']', 0);
+    node = node.parentElement;
+  }
+  irLog('mdRenderer DOM-walk: visited='+visited+' found='+(!!found));
+  if (found) {
+    window.__irMdRenderer = found.obj;
+    return found.path+' ctor='+found.ctor;
+  }
+  return null;
+};
+
+window.__irFindTokenSupport = function(langId){
+  if (!window.__irTokSupports) window.__irTokSupports = {};
+  if (window.__irTokSupports[langId]) return window.__irTokSupports[langId];
+  var family = [langId];
+  if (langId === 'typescript') family = ['typescript','typescriptreact','javascript','javascriptreact'];
+  else if (langId === 'typescriptreact') family = ['typescriptreact','typescript','javascriptreact','javascript'];
+  else if (langId === 'javascript') family = ['javascript','javascriptreact','typescript','typescriptreact'];
+  else if (langId === 'javascriptreact') family = ['javascriptreact','javascript','typescriptreact','typescript'];
+  var caps = window.__irMonacoCaps || window.__irCaptures;
+  if (!caps) { irLog('tokSupport: no caps'); return null; }
+  // Probe: tokenize a known mixed-content string. If it produces only
+  // one foreground color, the grammar isn't loaded for that model.
+  function probe(sup){
+    try {
+      var st = sup.getInitialState();
+      var r = sup.tokenizeEncoded('const x: number = 1', false, st);
+      if (!r || !r.tokens || r.tokens.length < 4) return false;
+      var fgs = {};
+      for (var ti = 0; ti < r.tokens.length; ti += 2) {
+        fgs[(r.tokens[ti+1] >>> 15) & 0x1FF] = true;
+      }
+      return Object.keys(fgs).length >= 2;
+    } catch(_) { return false; }
+  }
+  // Collect all open models via IModelService.getModels(). Sometimes
+  // capture misses IModelService directly but materialize finds it via
+  // deep-find through IInstantiationService — try both sources.
+  var modelSvcs = [];
+  if (caps.services) {
+    for (var si = 0; si < caps.services.length; si++) {
+      var svc = caps.services[si];
+      if (svc.kind === 'IModelService' && svc.v && typeof svc.v.getModels === 'function') {
+        modelSvcs.push(svc.v);
+      }
+    }
+  }
+  // Fallback: modelSvc captured during materialization (may have been
+  // deep-found through IInstantiationService when not surfaced in caps).
+  if (window.__irMonaco && window.__irMonaco.modelSvc && typeof window.__irMonaco.modelSvc.getModels === 'function') {
+    if (modelSvcs.indexOf(window.__irMonaco.modelSvc) < 0) modelSvcs.push(window.__irMonaco.modelSvc);
+  }
+  var allModels = [];
+  var seenModel = new Set();
+  for (var msi = 0; msi < modelSvcs.length; msi++) {
+    try {
+      var ml = modelSvcs[msi].getModels();
+      if (ml && ml.length) {
+        for (var mi = 0; mi < ml.length; mi++) {
+          if (!seenModel.has(ml[mi])) { seenModel.add(ml[mi]); allModels.push(ml[mi]); }
+        }
+      }
+    } catch(_) {}
+  }
+  // Diagnostic: how many models per language
+  var langCounts = {};
+  for (var ci = 0; ci < allModels.length; ci++) {
+    try {
+      var l = typeof allModels[ci].getLanguageId === 'function' ? allModels[ci].getLanguageId() : '?';
+      langCounts[l] = (langCounts[l] || 0) + 1;
+    } catch(_) {}
+  }
+  irLog('tokSupport: scan models='+allModels.length+' langs='+JSON.stringify(langCounts));
+  // Scan in family priority order
+  for (var fi = 0; fi < family.length; fi++) {
+    var target = family[fi];
+    for (var mi2 = 0; mi2 < allModels.length; mi2++) {
+      try {
+        var mdl = allModels[mi2];
+        if (typeof mdl.getLanguageId !== 'function') continue;
+        if (mdl.getLanguageId() !== target) continue;
+        var tk = mdl.tokenization;
+        if (!tk || !tk.tokens || !tk.tokens._value || !tk.tokens._value._tokenizer) continue;
+        var sup = tk.tokens._value._tokenizer.tokenizationSupport;
+        if (!sup || typeof sup.tokenizeEncoded !== 'function') continue;
+        if (!probe(sup)) continue;
+        var uriStr = mdl.uri ? ((mdl.uri.scheme||'?')+':'+(mdl.uri.path||'?').slice(-30)) : '?';
+        irLog('tokSupport: '+langId+' → ok via lang='+target+' uri='+uriStr);
+        window.__irTokSupports[langId] = sup;
+        return sup;
+      } catch(_) {}
+    }
+  }
+  irLog('tokSupport: no working support for '+langId+' (tried family '+family.join(',')+')');
+  return null;
+};
+
+// Tokenize text using a captured grammar-loaded tokenizationSupport.
+// Returns a DocumentFragment of <span class="mtkN">…</span> nodes
+// (matching VS Code's native rendering exactly), or null on failure.
+window.__irTokenizeToFragment = function(text, lang){
+  var langId = (lang || 'plaintext').toLowerCase();
+  var aliases = { ts:'typescript', js:'javascript', py:'python', tsx:'typescriptreact', jsx:'javascriptreact', sh:'shellscript', md:'markdown', yml:'yaml' };
+  if (aliases[langId]) langId = aliases[langId];
+  var support = window.__irFindTokenSupport(langId);
+  if (!support) { irLog('tokFrag: no support for '+langId); return null; }
+  var lines = (text || '').split('\\n');
+  var state;
+  try { state = support.getInitialState(); }
+  catch(e) { irLog('tokFrag: getInitialState err: '+(e&&e.message)); return null; }
+  var frag = document.createDocumentFragment();
+  var fgCounts = {};
+  for (var li = 0; li < lines.length; li++) {
+    var line = lines[li];
+    var hasEOL = li < lines.length - 1;
+    var result;
+    try { result = support.tokenizeEncoded(line, hasEOL, state); }
+    catch(e2) { irLog('tokFrag: tokenizeEncoded err: '+(e2&&e2.message)); return null; }
+    state = result.endState;
+    var tokens = result.tokens;
+    if (!tokens || !tokens.length) {
+      if (li < lines.length - 1) frag.appendChild(document.createTextNode('\\n'));
+      continue;
+    }
+    var pos = 0;
+    for (var t = 0; t < tokens.length; t += 2) {
+      var endIdx = tokens[t];
+      var meta = tokens[t + 1];
+      // Bit layout (encodedTokenAttributes.ts):
+      //   FOREGROUND_OFFSET = 15, mask 9 bits → 0x1FF
+      //   ITALIC_MASK    = 0x00000800
+      //   BOLD_MASK      = 0x00001000
+      //   UNDERLINE_MASK = 0x00002000
+      var fg = (meta >>> 15) & 0x1FF;
+      var italic    = (meta & 0x0800) !== 0;
+      var bold      = (meta & 0x1000) !== 0;
+      var underline = (meta & 0x2000) !== 0;
+      fgCounts[fg] = (fgCounts[fg] || 0) + 1;
+      var part = line.substring(pos, endIdx);
+      pos = endIdx;
+      var cls = 'mtk' + fg;
+      if (italic) cls += ' mtki';
+      if (bold) cls += ' mtkb';
+      if (underline) cls += ' mtku';
+      var span = document.createElement('span');
+      span.className = cls;
+      span.textContent = part;
+      frag.appendChild(span);
+    }
+    if (li < lines.length - 1) frag.appendChild(document.createTextNode('\\n'));
+  }
+  irLog('tokFrag: '+langId+' lines='+lines.length+' fgs='+JSON.stringify(fgCounts));
+  return frag;
+};
+
 window.__irProbeMtk = function(){
   var hits = [];
   try {
@@ -2184,7 +3139,10 @@ window.__irTokenizeCode = function(text, lang){
         // tokenizers only attach to file-scheme models. inmemory://
         // models render text but never get a grammar tokenizer, so
         // every token collapses to .mtk1.
-        uri = m.uriCtor.parse('file:///tmp/ir-tokenize/'+Date.now()+'-'+Math.random().toString(36).slice(2,6)+'.'+ext);
+        // untitled: scheme = virtual buffer, won't be scanned by workspace
+        // tools (stylelint etc). Was using file:///tmp/ir-tokenize/ which
+        // stylelint picked up as a real folder and crashed its worker.
+        uri = m.uriCtor.parse('untitled:ir-tokenize-'+Date.now()+'-'+Math.random().toString(36).slice(2,6)+'.'+ext);
       } catch(_) {}
     }
     var model;
@@ -2211,7 +3169,126 @@ window.__irTokenizeCode = function(text, lang){
         if (typeof inner.tokenizeViewport === 'function') {
           try { inner.tokenizeViewport(1, lc); } catch(_) {}
         }
+        // tk.tokens is an Observable. Try Observable.get() to read its
+        // current value — might be the actual TokenInfo[] / TextMate
+        // result that VS Code uses for native hover tokenization.
+        try {
+          if (typeof inner.get === 'function') {
+            var obsVal = inner.get();
+            var t = typeof obsVal;
+            var info = 't='+t;
+            if (obsVal && t === 'object') {
+              var pn = Object.getOwnPropertyNames(obsVal).slice(0,8);
+              info += ' keys=['+pn.join(',')+']';
+              if (Array.isArray(obsVal)) info += ' arrLen='+obsVal.length+' first='+JSON.stringify(obsVal[0]).slice(0,80);
+              else if (typeof obsVal.getCount === 'function') info += ' tokenCount='+obsVal.getCount();
+              else if (typeof obsVal.getLineTokens === 'function') {
+                try { var lts = obsVal.getLineTokens(1); info += ' line1Tokens='+(lts&&lts.getCount?lts.getCount():'?'); } catch(_) {}
+              }
+            }
+            irLog('tokenize obs.get(): '+info);
+          }
+        } catch(eO) { irLog('tokenize obs.get err: '+(eO&&eO.message)); }
       }
+      // DIAG: walk tk recursively (depth 4) looking for a property
+      // called tokenizationSupport / _tokenizationSupport / a function
+      // called tokenize / tokenizeEncoded. This is the actual tokenizer
+      // entry point — once found, we can call it directly on text.
+      try {
+        var seenTk = new WeakSet();
+        var found = [];
+        function walkTk(o, path, depth){
+          if (depth > 4 || found.length >= 12) return;
+          if (!o) return;
+          var t = typeof o;
+          if (t !== 'object' && t !== 'function') return;
+          try { if (seenTk.has(o)) return; seenTk.add(o); } catch(_) { return; }
+          // Note any object with tokenize-y method
+          if (t === 'object') {
+            try {
+              var hasTokenize = typeof o.tokenize === 'function' || typeof o.tokenizeEncoded === 'function' || typeof o.tokenize2 === 'function';
+              if (hasTokenize) {
+                var ms = [];
+                try { ms = Object.getOwnPropertyNames(Object.getPrototypeOf(o) || {}).filter(function(k){ return typeof o[k]==='function' && k!=='constructor'; }).slice(0,6); } catch(_) {}
+                found.push({ kind: 'TOKENIZE-METHOD', path: path, methods: ms.join(',') });
+              }
+            } catch(_) {}
+          }
+          var keys;
+          try { keys = Object.getOwnPropertyNames(o); } catch(_) { return; }
+          for (var ki = 0; ki < keys.length; ki++) {
+            var k = keys[ki];
+            // Skip noisy/large fields
+            if (k === '_textModel' || k === '_buffer' || k === 'parent') continue;
+            // Hit on suspicious key names
+            if (/tokenization(Registry|Support)?$|tokenizer|^_tokens$|^tokens$/i.test(k)) {
+              try {
+                var v = o[k];
+                var vt = typeof v;
+                var info = 't='+vt;
+                if (v && (vt === 'object' || vt === 'function')) {
+                  var pn = [];
+                  try { pn = Object.getOwnPropertyNames(v).slice(0,6); } catch(_) {}
+                  info += ' own=['+pn.join(',')+']';
+                  if (vt === 'object') {
+                    try {
+                      var protoMs = Object.getOwnPropertyNames(Object.getPrototypeOf(v) || {}).filter(function(kk){ return typeof v[kk]==='function' && kk!=='constructor'; }).slice(0,8);
+                      info += ' methods=['+protoMs.join(',')+']';
+                    } catch(_) {}
+                  }
+                }
+                found.push({ kind: 'KEY', path: path+'.'+k, info: info });
+              } catch(_) {}
+            }
+            try {
+              var v2 = o[k];
+              walkTk(v2, path+'.'+k, depth+1);
+            } catch(_) {}
+            if (found.length >= 12) return;
+          }
+        }
+        walkTk(tk, 'tk', 0);
+        walkTk(model, 'model', 0);
+        for (var fi = 0; fi < found.length; fi++) {
+          var ff = found[fi];
+          irLog('TOK-PROBE['+fi+'] '+ff.kind+' '+ff.path+' '+(ff.info||'methods=['+ff.methods+']'));
+        }
+        if (!found.length) irLog('TOK-PROBE: nothing');
+      } catch(eW) { irLog('TOK-PROBE err: '+(eW&&eW.message)); }
+      // DIAG: dump methods on _languageService so we can find the
+      // grammar-load trigger API (e.g. requestRichLanguageFeatures).
+      // Without an explicit load call, file:/// URI alone doesn't
+      // auto-attach TextMate grammar to a hidden materialized widget.
+      try {
+        var lang = model._languageService || (tk && tk._languageService);
+        if (lang) {
+          var lProto = Object.getPrototypeOf(lang);
+          var lKeys = lProto ? Object.getOwnPropertyNames(lProto).filter(function(k){ return typeof lang[k]==='function' && k!=='constructor'; }) : [];
+          irLog('tokenize: langSvc methods=['+lKeys.slice(0,30).join(',')+']');
+          // Also dump non-method own properties (tokenizationRegistry
+          // is typically a non-method singleton attached as a field)
+          try {
+            var lOwn = Object.getOwnPropertyNames(lang);
+            var nonFn = [];
+            for (var loi = 0; loi < lOwn.length; loi++) {
+              try {
+                var lv = lang[lOwn[loi]];
+                var lvt = typeof lv;
+                if (lvt !== 'function' && lv !== null) nonFn.push(lOwn[loi]+':'+lvt);
+              } catch(_) {}
+            }
+            irLog('tokenize: langSvc own non-fn=['+nonFn.slice(0,15).join(',')+']');
+          } catch(_) {}
+        } else {
+          irLog('tokenize: no langSvc');
+        }
+        var trees = tk && tk._treeSitterLibraryService;
+        if (trees) {
+          var tProto = Object.getPrototypeOf(trees);
+          var tKeys = tProto ? Object.getOwnPropertyNames(tProto).filter(function(k){ return typeof trees[k]==='function' && k!=='constructor'; }) : [];
+          irLog('tokenize: tsSvc methods=['+tKeys.slice(0,15).join(',')+']');
+        }
+      } catch(eL) { irLog('tokenize: svc dump err: '+(eL&&eL.message)); }
       // DIAG: dump methods on tk.tokens so we can see what API is
       // actually available in this VS Code build.
       if (tk) {
@@ -2429,11 +3506,6 @@ function isCodeDoc(doc: vscode.TextDocument): boolean {
   if (p.endsWith('.log') || p.endsWith('.md') || p.endsWith('.git') || p.includes('/scm')) { return false; }
   return true;
 }
-
-// Definition-like line patterns (class/interface/struct/def/fn etc.)
-const DEF_PATTERN = /^\s*(export\s+)?(class|interface|struct|enum|type|def|fn|func|pub\s+struct|pub\s+enum|pub\s+fn)\s+/;
-// Assignment-style definitions (e.g. MutableMapping = _alias(...), X = TypeVar(...))
-const ASSIGN_DEF_PATTERN_PREFIX = /^[A-Z]/;
 
 // ── Import-follow engine: resolve identifier by tracing import statements ──
 
