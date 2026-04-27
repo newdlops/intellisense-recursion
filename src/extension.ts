@@ -651,22 +651,80 @@ export async function activate(context: vscode.ExtensionContext) {
 
 async function triggerMonacoCapture() {
   try {
-    const active = vscode.window.activeTextEditor;
-    if (!active) {
-      log.info('[capture] no active editor — skipping');
+    sendToRenderer("(window.__irStartCapture && window.__irStartCapture('side-open'))");
+
+    // Pick any workspace file to side-open. We deliberately avoid
+    // `activeTextEditor.document`: if the user already has it side-open,
+    // `Beside` would just reveal that existing tab (no fresh Monaco widget
+    // to capture, and we'd risk closing the user's pre-existing tab below).
+    let fileUri: vscode.Uri | undefined;
+    try {
+      const candidates = await vscode.workspace.findFiles(
+        '**/*.{json,md,txt,ts,tsx,js,py}',
+        '{**/node_modules/**,**/.git/**}',
+        1,
+      );
+      fileUri = candidates[0];
+    } catch (e) { log.warn(`[capture] findFiles err: ${e}`); }
+
+    if (!fileUri) {
+      log.info('[capture] no workspace file — skipping side-open');
+      sendToRenderer("(window.__irStopCapture && window.__irStopCapture())");
       return;
     }
-    sendToRenderer("(window.__irStartCapture && window.__irStartCapture('side-open'))");
-    log.info(`[capture] side-opening ${vscode.workspace.asRelativePath(active.document.uri)}`);
+
+    // Snapshot existing tab URIs *before* opening so we can close ONLY the
+    // tab we just created. The previous version called
+    // `workbench.action.closeEditorsInGroup`, which targets whichever group
+    // is focused — and `preserveFocus: true` kept focus in the user's
+    // original group, so that command wiped every document they had open.
+    const fileUriStr = fileUri.toString();
+    const preExisting = new Set<string>();
+    let userAlreadyHadThisTab = false;
+    for (const g of vscode.window.tabGroups.all) {
+      for (const t of g.tabs) {
+        if (t.input instanceof vscode.TabInputText) {
+          const u = t.input.uri.toString();
+          preExisting.add(u);
+          if (u === fileUriStr) { userAlreadyHadThisTab = true; }
+        }
+      }
+    }
+
+    log.info(
+      `[capture] side-opening ${vscode.workspace.asRelativePath(fileUri)}`
+      + (userAlreadyHadThisTab ? ' (already open — will NOT close afterwards)' : ''),
+    );
+
     try {
-      await vscode.window.showTextDocument(active.document, {
+      await vscode.window.showTextDocument(fileUri, {
         viewColumn: vscode.ViewColumn.Beside,
         preserveFocus: true,
         preview: true,
       });
     } catch (e) { log.warn(`[capture] showTextDocument err: ${e}`); }
     await new Promise(r => setTimeout(r, 700));
-    try { await vscode.commands.executeCommand('workbench.action.closeEditorsInGroup'); } catch {}
+
+    if (!userAlreadyHadThisTab) {
+      try {
+        const toClose: vscode.Tab[] = [];
+        for (const g of vscode.window.tabGroups.all) {
+          for (const t of g.tabs) {
+            if (!(t.input instanceof vscode.TabInputText)) continue;
+            const u = t.input.uri.toString();
+            if (u === fileUriStr && !preExisting.has(u)) {
+              toClose.push(t);
+            }
+          }
+        }
+        if (toClose.length) {
+          await vscode.window.tabGroups.close(toClose, true);
+        } else {
+          log.info('[capture] no new tab found to close');
+        }
+      } catch (e) { log.warn(`[capture] close err: ${e}`); }
+    }
+
     await new Promise(r => setTimeout(r, 300));
     sendToRenderer("(window.__irStopCapture && window.__irStopCapture())");
     await new Promise(r => setTimeout(r, 500));
