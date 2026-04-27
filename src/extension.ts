@@ -1373,7 +1373,7 @@ function httpGet(url: string): Promise<string> {
 
 function getHoverPatchScript(): string {
   return `(function(){
-var IR_PATCH_VERSION = 68;
+var IR_PATCH_VERSION = 70;
 if(window.__irPatchVersion === IR_PATCH_VERSION) return 'already patched';
 
 // Tear down any prior version's listeners and style so the new patch
@@ -1918,16 +1918,37 @@ window.irApplyPreview=function(typeName,md){
       if(hoverEl.scrollTop) hoverEl.scrollTop=0;
       var scrolls=hoverEl.querySelectorAll('*');
       for(var s=0;s<scrolls.length;s++){ if(scrolls[s].scrollTop) scrolls[s].scrollTop=0; }
-      // Nudge .monaco-scrollable-element to recompute scroll dimensions
-      // by reading scrollHeight (forces reflow). Then dispatch a synthetic
-      // resize event so any internal listeners reposition mouseleave
-      // boundaries to the new (larger) bbox. Without this the hover\\'s
-      // dismiss-on-mouseleave fires the moment the mouse moves into the
-      // newly-revealed area outside the original (smaller) box.
+      // VS Code\\'s SmoothScrollableElement caches scroll dimensions
+      // internally and the cache doesn\\'t refresh on DOM mutation.
+      // scanDomNode() calls didn\\'t take effect reliably, so instead
+      // we BYPASS the custom scrollable entirely: switch the .monaco-
+      // scrollable-element to browser-native overflow and reset the
+      // hover-content\\'s transform (VS Code translates content up to
+      // simulate scroll). The browser then handles scrolling natively
+      // against actual current content height. Hide the overlay
+      // scrollbar widgets since native scrollbar will appear instead.
       try {
         var sc=hoverEl.querySelector('.monaco-scrollable-element');
-        if(sc){ var _=sc.scrollHeight; var __=sc.offsetHeight; }
-        var _2=hoverEl.scrollHeight; var _3=hoverEl.offsetHeight;
+        if(sc){
+          sc.style.overflowY='auto';
+          sc.style.overflowX='auto';
+          sc.style.maxHeight='70vh';
+          sc.style.position='relative';
+        }
+        var hContent=hoverEl.querySelector('.monaco-hover-content');
+        if(hContent){
+          hContent.style.transform='none';
+          hContent.style.top='0';
+          hContent.style.left='0';
+          hContent.style.position='static';
+        }
+        // Hide VS Code\\'s overlay scrollbars (their slider sizing was
+        // computed from the old content height — now the native one
+        // shows correct extent).
+        var overlays=hoverEl.querySelectorAll(':scope > .monaco-scrollable-element > .scrollbar, :scope > .monaco-scrollable-element > .shadow');
+        for(var ov=0;ov<overlays.length;ov++) overlays[ov].style.display='none';
+        // Force layout flush.
+        try { var _=hoverEl.scrollHeight; var __=hoverEl.offsetHeight; } catch(_) {}
       } catch(_) {}
       try { window.dispatchEvent(new Event('resize')); } catch(_) {}
     } else if(target.scrollTop){ target.scrollTop=0; }
