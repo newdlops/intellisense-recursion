@@ -1322,15 +1322,39 @@ async function previewTypeHandler(docUriStr: string, identifier: string): Promis
     markdown = `\`${identifier}\` — *${relPath}:${startLine + 1}*\n\`\`\`${lang}\n${previewCode}\n\`\`\``;
   }
 
-  // Send markdown to the renderer's irApplyPreview which clears the
-  // visible .rendered-markdown and rebuilds DOM via createElement
-  // (TrustedHTML-safe). Theme variables in the patch script's CSS
-  // make the result match VS Code's hover styling.
-  const safeId = jsonStringifyAscii(identifier);
-  const safeMd = jsonStringifyAscii(markdown);
-  const rendererJs = `if(typeof window.irApplyPreview==='function')window.irApplyPreview(${safeId},${safeMd})`;
-  sendToRenderer(rendererJs);
-  log.info(`preview: "${identifier}" sent (${markdown.length}md, ${ms()})`);
+  // Drill-down via native hover refire. Set pendingPreviewHover so the
+  // next $provideHover call (triggered by editor.action.showHover) returns
+  // this markdown. Then dismiss the visible hover and re-show it — VS Code
+  // tears down the old widget and renders a fresh one through its native
+  // pipeline (theme + tokenization for free), instead of doing an in-place
+  // DOM swap.
+  pendingPreviewHover = {
+    identifier,
+    contents: [{ value: markdown, isTrusted: true, supportThemeIcons: true }],
+    expiresAt: Date.now() + 3000,
+  };
+
+  try {
+    // showHover triggers at the *cursor* (not the mouse). Move the cursor
+    // to the position where the original hover fired so the new hover
+    // appears in the same anchor — otherwise VS Code shows it at whatever
+    // arbitrary position the cursor happens to be at, or no-ops because
+    // there's no hoverable token there.
+    if (lastHoverFetchPosition) {
+      const editor = vscode.window.activeTextEditor;
+      const targetUriStr = lastHoverFetchPosition.uri.toString();
+      if (editor && editor.document.uri.toString() === targetUriStr) {
+        const newPos = new vscode.Position(lastHoverFetchPosition.line, lastHoverFetchPosition.character);
+        editor.selection = new vscode.Selection(newPos, newPos);
+      }
+    }
+    // hideHover first — showHover is a no-op while a hover is visible.
+    await vscode.commands.executeCommand('editor.action.hideHover');
+    await vscode.commands.executeCommand('editor.action.showHover');
+    log.info(`preview: "${identifier}" hide+showHover (${markdown.length}md, ${ms()})`);
+  } catch (err) {
+    log.warn(`preview: hide+showHover error: ${err} (${ms()})`);
+  }
 }
 
 function httpGet(url: string): Promise<string> {
