@@ -227,6 +227,20 @@ let previewHoverSuppressUntil = 0;
 // triggers hover for the wrong position.
 let lastHoverFetchPosition: { uri: vscode.Uri; line: number; character: number } | null = null;
 
+// Drill-down history: each forward drill-down pushes the previously
+// rendered drill-down state onto previewHistory; "Back" pops it back
+// into currentPreviewState and refires the hover. The stack is reset
+// whenever $provideHover reaches the genuine LSP path (i.e. past the
+// pending-preview consume + suppression window) — that's the moment a
+// brand-new hover session starts, so no prior chain should carry over.
+interface PreviewState {
+  identifier: string;
+  markdown: string;          // raw drill-down body, no back link prepended
+  anchor: { uri: vscode.Uri; line: number; character: number };
+}
+const previewHistory: PreviewState[] = [];
+let currentPreviewState: PreviewState | null = null;
+
 // ── Definition cache (LRU-style with TTL) ──
 // Key: "uri:line:character:typeName", Value: cached result or negative marker
 interface DefCacheEntry {
@@ -601,6 +615,7 @@ export async function activate(context: vscode.ExtensionContext) {
 
   context.subscriptions.push(
     vscode.commands.registerCommand('intellisenseRecursion.goToType', goToTypeHandler),
+    vscode.commands.registerCommand('intellisenseRecursion.previewBack', previewBackHandler),
     vscode.commands.registerCommand('intellisenseRecursion.getPatchStatus', () => ({
       hoverPatchActive,
       hoverRecursionDepth,
@@ -777,6 +792,16 @@ function patchSharedService(service: any) {
     if (Date.now() < previewHoverSuppressUntil) {
       log.info(`[hover] page-transition handle=${handle} suppressed (in window)`);
       return { contents: [] };
+    }
+
+    // Drill-down history reset: reaching this point means we've passed
+    // both the pending-preview consume and the post-consume suppression
+    // window, so this is a genuine LSP hover (a new hover session). Any
+    // prior drill-down chain should not carry across into the next click.
+    if (currentPreviewState) {
+      log.info(`[hover] drill-down history reset on fresh LSP hover (was at "${currentPreviewState.identifier}", stack=${previewHistory.length})`);
+      previewHistory.length = 0;
+      currentPreviewState = null;
     }
 
     const result = await original.call(this, handle, uri, position, context, token);
@@ -1257,6 +1282,10 @@ async function previewTypeHandler(docUriStr: string, identifier: string): Promis
   // showHover ends up firing the popup outside the viewport and the
   // user perceives it as "hover disappeared".
   const anchorPos = lastHoverFetchPosition;
+  if (!anchorPos) {
+    log.warn(`preview: "${identifier}" no anchorPos — skipping (no prior hover position)`);
+    return;
+  }
   log.info(`preview: "${identifier}" start`);
 
   // Resolve location: sidecar first (resolves nested types correctly),
@@ -1345,39 +1374,90 @@ async function previewTypeHandler(docUriStr: string, identifier: string): Promis
     markdown = `\`${identifier}\` — *${relPath}:${startLine + 1}*\n\`\`\`${lang}\n${previewCode}\n\`\`\``;
   }
 
-  // Drill-down via native hover refire. Set pendingPreviewHover so the
-  // next $provideHover call (triggered by editor.action.showHover) returns
-  // this markdown. Then dismiss the visible hover and re-show it — VS Code
-  // tears down the old widget and renders a fresh one through its native
-  // pipeline (theme + tokenization for free), instead of doing an in-place
-  // DOM swap.
-  pendingPreviewHover = {
+  // Drill-down history: push the page we're navigating away from (if
+  // any) onto the stack before installing the new one. The back link
+  // is appended via applyPreviewStateAsHover below — when history is
+  // non-empty, the rendered hover will include a "← Back" command link.
+  if (currentPreviewState) {
+    previewHistory.push(currentPreviewState);
+  }
+  currentPreviewState = {
     identifier,
-    contents: [{ value: markdown, isTrusted: true, supportThemeIcons: true }],
+    markdown,
+    anchor: anchorPos!,
+  };
+
+  await applyPreviewStateAsHover(currentPreviewState, ms);
+}
+
+/**
+ * Handle the [← Back] click in a drill-down hover. If previewHistory has
+ * entries, pop one and re-render. If empty (we're at the first drill-down),
+ * clear the override and refire — VS Code returns the original LSP hover.
+ */
+async function previewBackHandler(): Promise<void> {
+  const t0 = Date.now();
+  const ms = () => `${Date.now() - t0}ms`;
+  if (!currentPreviewState) {
+    log.info(`previewBack: no current drill-down state — ignoring`);
+    return;
+  }
+  if (previewHistory.length > 0) {
+    const prev = previewHistory.pop()!;
+    currentPreviewState = prev;
+    log.info(`previewBack: → "${prev.identifier}" stack=${previewHistory.length}`);
+    await applyPreviewStateAsHover(prev, ms);
+    return;
+  }
+  // History empty → back to original LSP hover. Clear our override and
+  // refire showHover at the saved anchor; $provideHover will take the
+  // genuine LSP path (which also clears state via the fresh-hover branch,
+  // but we clear here for clarity).
+  const anchor = currentPreviewState.anchor;
+  pendingPreviewHover = null;
+  previewHoverSuppressUntil = 0;
+  currentPreviewState = null;
+  log.info(`previewBack: → original LSP hover at ${anchor.line}:${anchor.character} (${ms()})`);
+  try {
+    const editor = vscode.window.activeTextEditor;
+    if (editor && editor.document.uri.toString() === anchor.uri.toString()) {
+      const newPos = new vscode.Position(anchor.line, anchor.character);
+      editor.selection = new vscode.Selection(newPos, newPos);
+    }
+    await vscode.commands.executeCommand('editor.action.hideHover');
+    await vscode.commands.executeCommand('editor.action.showHover');
+  } catch (err) {
+    log.warn(`previewBack: hide+showHover error: ${err} (${ms()})`);
+  }
+}
+
+/**
+ * Build pendingPreviewHover from a PreviewState (always prepends a
+ * "← Back" command link — first drill-down's back returns to the LSP
+ * hover; deeper drill-downs pop the prior page off history), move the
+ * editor cursor to the state's anchor, then hide+show the hover so VS
+ * Code's native pipeline picks up the override. Shared by drill-down
+ * and back.
+ */
+async function applyPreviewStateAsHover(state: PreviewState, ms: () => string): Promise<void> {
+  const renderedMarkdown = `[$(arrow-left) Back](command:intellisenseRecursion.previewBack "Back")\n\n${state.markdown}`;
+  pendingPreviewHover = {
+    identifier: state.identifier,
+    contents: [{ value: renderedMarkdown, isTrusted: true, supportThemeIcons: true }],
     expiresAt: Date.now() + 3000,
   };
-  // Reset suppression window — a new drill-down should not be silently
-  // dropped just because a previous one's window is still open.
   previewHoverSuppressUntil = 0;
 
   try {
-    // showHover triggers at the *cursor* (not the mouse). Move the cursor
-    // to the snapshotted anchor position so the new hover appears in the
-    // same place the original hover did — never to the target symbol's
-    // (possibly off-screen) location, which would scroll the editor and
-    // pop the hover outside the viewport.
-    if (anchorPos) {
-      const editor = vscode.window.activeTextEditor;
-      const targetUriStr = anchorPos.uri.toString();
-      if (editor && editor.document.uri.toString() === targetUriStr) {
-        const newPos = new vscode.Position(anchorPos.line, anchorPos.character);
-        editor.selection = new vscode.Selection(newPos, newPos);
-      }
+    const editor = vscode.window.activeTextEditor;
+    const targetUriStr = state.anchor.uri.toString();
+    if (editor && editor.document.uri.toString() === targetUriStr) {
+      const newPos = new vscode.Position(state.anchor.line, state.anchor.character);
+      editor.selection = new vscode.Selection(newPos, newPos);
     }
-    // hideHover first — showHover is a no-op while a hover is visible.
     await vscode.commands.executeCommand('editor.action.hideHover');
     await vscode.commands.executeCommand('editor.action.showHover');
-    log.info(`preview: "${identifier}" hide+showHover (${markdown.length}md, ${ms()})`);
+    log.info(`preview: "${state.identifier}" hide+showHover hist=${previewHistory.length} (${state.markdown.length}md, ${ms()})`);
   } catch (err) {
     log.warn(`preview: hide+showHover error: ${err} (${ms()})`);
   }
@@ -2086,6 +2166,16 @@ window.__irScanInterval = setInterval(function(){
     var walker=document.createTreeWalker(block,NodeFilter.SHOW_TEXT);
     var node,replacements=[];
     while(node=walker.nextNode()){
+      // Skip text inside <a> elements (e.g. our [← Back](command:...) link
+      // or any markdown link). Wrapping them as ir-type-link would let the
+      // capture-phase click handler intercept and treat the label as a
+      // type-name click instead of following the command: URI.
+      var nAnc=node.parentNode,inAnchor=false;
+      while(nAnc&&nAnc!==block){
+        if(nAnc.nodeName==='A'){inAnchor=true;break}
+        nAnc=nAnc.parentNode;
+      }
+      if(inAnchor)continue;
       var nv=node.nodeValue||'';
       for(var k=0;k<types.length;k++){
         var idx=nv.indexOf(types[k]);
