@@ -20,6 +20,7 @@ import {
   SidecarHit,
   SidecarLanguage,
   SidecarLogger,
+  SidecarReady,
   SidecarRoot,
   SidecarSource,
 } from './sidecar';
@@ -243,10 +244,59 @@ function checksumForAsset(sums: string, assetName: string): string | null {
   return null;
 }
 
-function cachePathFor(workspaceRoot: string): string {
-  const hash = crypto.createHash('sha1').update(workspaceRoot).digest('hex').slice(0, 16);
-  const dir = path.join(os.homedir(), '.cache', 'intellisense-recursion');
-  return path.join(dir, `${hash}.bin`);
+function canonicalFsPath(fsPath: string): string {
+  let resolved: string;
+  try {
+    resolved = fs.realpathSync.native(fsPath);
+  } catch {
+    resolved = path.resolve(fsPath);
+  }
+  return process.platform === 'win32' ? resolved.toLowerCase() : resolved;
+}
+
+function rootStatKey(fsPath: string): string {
+  try {
+    const st = fs.statSync(fsPath);
+    return `${st.dev}:${st.ino}:${Math.trunc(st.birthtimeMs || st.ctimeMs || st.mtimeMs)}`;
+  } catch {
+    return 'missing';
+  }
+}
+
+function sameFsPath(a: string, b: string): boolean {
+  return canonicalFsPath(a) === canonicalFsPath(b);
+}
+
+function isSameOrInside(parent: string, child: string): boolean {
+  const rel = path.relative(parent, canonicalFsPath(child));
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+interface WorkspaceIdentity {
+  root: string;
+  key: string;
+}
+
+function currentWorkspaceIdentity(): WorkspaceIdentity | null {
+  const folders = vscode.workspace.workspaceFolders?.filter((f) => f.uri.scheme === 'file') ?? [];
+  if (folders.length === 0) { return null; }
+  const roots = folders.map((f) => canonicalFsPath(f.uri.fsPath));
+  const workspaceFile = vscode.workspace.workspaceFile?.scheme === 'file'
+    ? canonicalFsPath(vscode.workspace.workspaceFile.fsPath)
+    : '';
+  const keyPayload = {
+    workspaceFile,
+    roots: roots.map((root) => ({ root, stat: rootStatKey(root) })),
+  };
+  return {
+    root: roots[0],
+    key: JSON.stringify(keyPayload),
+  };
+}
+
+function cachePathFor(storagePath: string, workspaceKey: string): string {
+  const hash = crypto.createHash('sha1').update(workspaceKey).digest('hex').slice(0, 20);
+  return path.join(storagePath, 'workspace-indexes', hash, 'index.bin');
 }
 
 type ExtraRoot = { tag: Exclude<SidecarSource, 'project'>; path: string };
@@ -266,7 +316,7 @@ function detectVenvRoots(workspaceRoot: string): ExtraRoot[] {
       const sp = path.join(libDir, ent, 'site-packages');
       try {
         if (fs.statSync(sp).isDirectory()) {
-          found.push({ tag: 'venv', path: sp });
+          found.push({ tag: 'venv', path: canonicalFsPath(sp) });
         }
       } catch {}
     }
@@ -295,7 +345,7 @@ function detectStdlib(workspaceRoot: string): ExtraRoot | null {
       if (result.status !== 0) { continue; }
       const stdlib = (result.stdout || '').trim();
       if (stdlib && fs.existsSync(stdlib)) {
-        return { tag: 'stdlib', path: stdlib };
+        return { tag: 'stdlib', path: canonicalFsPath(stdlib) };
       }
     } catch {
       // next candidate
@@ -319,7 +369,7 @@ function detectPylanceTypeshed(): ExtraRoot | null {
   for (let i = pylances.length - 1; i >= 0; i--) {
     const p = path.join(extDir, pylances[i], 'dist', 'typeshed-fallback');
     if (fs.existsSync(p)) {
-      return { tag: 'typeshed', path: p };
+      return { tag: 'typeshed', path: canonicalFsPath(p) };
     }
   }
   return null;
@@ -333,7 +383,7 @@ function detectNodeModules(workspaceRoot: string): ExtraRoot | null {
   const nm = path.join(workspaceRoot, 'node_modules');
   try {
     if (fs.statSync(nm).isDirectory()) {
-      return { tag: 'other', path: nm };
+      return { tag: 'other', path: canonicalFsPath(nm) };
     }
   } catch {}
   return null;
@@ -381,13 +431,13 @@ export class IndexManager {
     private readonly log: SidecarLogger,
   ) {
     this.binary = locateBinary(extensionPath, storagePath);
-    const folders = vscode.workspace.workspaceFolders;
-    if (!folders || folders.length === 0 || folders[0].uri.scheme !== 'file') {
+    const workspace = currentWorkspaceIdentity();
+    if (!workspace) {
       this.workspaceRoot = null;
       this.indexPath = null;
     } else {
-      this.workspaceRoot = folders[0].uri.fsPath;
-      this.indexPath = cachePathFor(this.workspaceRoot);
+      this.workspaceRoot = workspace.root;
+      this.indexPath = cachePathFor(storagePath, workspace.key);
     }
   }
 
@@ -440,7 +490,18 @@ export class IndexManager {
     if (fs.existsSync(this.indexPath)) {
       this.log.info('[ir] using existing index');
       try {
-        await this.spawnSidecar();
+        const info = await this.spawnSidecar();
+        const mismatch = this.indexWorkspaceMismatch(info);
+        if (mismatch) {
+          this.log.info(`[ir] existing index does not match current workspace (${mismatch}) — rebuilding`);
+          if (this.state.kind === 'ready') {
+            this.state.sidecar.dispose();
+          }
+          this.state = { kind: 'idle' };
+          this.indexedRoots = [];
+          await this.rebuild();
+          return;
+        }
         // If coverage is missing (e.g. v1 index predating external roots),
         // rebuild once in background so the next session has the full set.
         if (!this.hasFullCoverage() && this.extraRoots.length > 0) {
@@ -493,7 +554,7 @@ export class IndexManager {
   registerWatchers(context: vscode.ExtensionContext) {
     const onSave = vscode.workspace.onDidSaveTextDocument((doc) => {
       if (!isSupportedPath(doc.uri.fsPath)) { return; }
-      if (this.workspaceRoot && !doc.uri.fsPath.startsWith(this.workspaceRoot)) { return; }
+      if (this.workspaceRoot && !isSameOrInside(this.workspaceRoot, doc.uri.fsPath)) { return; }
       this.scheduleRebuild();
     });
     context.subscriptions.push(onSave);
@@ -747,8 +808,37 @@ export class IndexManager {
     });
   }
 
-  private async spawnSidecar(): Promise<void> {
-    if (!this.binary || !this.indexPath) { return; }
+  private indexWorkspaceMismatch(info: SidecarReady): string | null {
+    if (!this.workspaceRoot) { return 'no current workspace root'; }
+    const project = info.roots.find((r) => r.tag === 'project');
+    if (!project) { return 'missing project root'; }
+    if (!sameFsPath(project.path, this.workspaceRoot)) {
+      return `project root ${project.path} != ${this.workspaceRoot}`;
+    }
+
+    const expected = [
+      { tag: 'project' as const, path: this.workspaceRoot },
+      ...this.extraRoots,
+    ];
+    const expectedKeys = new Set(expected.map((root) =>
+      `${root.tag}:${canonicalFsPath(root.path)}`));
+    const actualKeys = new Set(info.roots.map((root) =>
+      `${root.tag}:${canonicalFsPath(root.path)}`));
+    for (const root of expected) {
+      if (!actualKeys.has(`${root.tag}:${canonicalFsPath(root.path)}`)) {
+        return `missing root ${root.tag}:${root.path}`;
+      }
+    }
+    for (const root of info.roots) {
+      if (!expectedKeys.has(`${root.tag}:${canonicalFsPath(root.path)}`)) {
+        return `unexpected root ${root.tag}:${root.path}`;
+      }
+    }
+    return null;
+  }
+
+  private async spawnSidecar(): Promise<SidecarReady> {
+    if (!this.binary || !this.indexPath) { throw new Error('sidecar spawn requested before binary/index path is available'); }
     const sidecar = new IndexSidecar(this.binary, this.indexPath, this.log);
     const info = await sidecar.start(); // rethrow on failure so start() can recover
     this.indexedRoots = info.roots;
@@ -759,6 +849,7 @@ export class IndexManager {
         `(roots: ${sources})`,
     );
     this.state = { kind: 'ready', sidecar };
+    return info;
   }
 
   dispose() {

@@ -193,12 +193,9 @@ let currentClickController: AbortController | null = null;
 let hoverPatchActive = false;
 let lastPreviewKey = '';
 let lastPreviewTime = 0;
-// Persistent main-process CDP WebSocket — set by startClickListener after
-// injection succeeds. previewTypeHandler reuses it via sendToRenderer to
-// push Runtime.evaluate calls back into the renderer (in-place hover
-// content swap on plain click).
+// Current main-process CDP WebSocket, tracked so reconnect cleanup only
+// clears the listener that originally owned the socket.
 let mainWsRef: WebSocket | null = null;
-let cdpMsgIdCounter = 100_000;
 
 // "Page-transition" state: when set, the next $provideHover call (within
 // the time window) returns this markdown as its only content instead of
@@ -657,26 +654,15 @@ export async function activate(context: vscode.ExtensionContext) {
     log.warn('Could not find shared ExtHostLanguageFeatures');
   }
 
-  // Inject renderer script + re-inject periodically for new windows
+  // Inject renderer script and keep a low-frequency safety pass for new windows.
   await injectRenderer();
-  reinjectTimer = setInterval(() => { reinjectRenderer().catch(() => {}); }, 10000);
+  reinjectTimer = setInterval(() => { reinjectRenderer().catch(() => {}); }, 60000);
 
-  // Arm Monaco capture hooks passively. The renderer's prototype hooks
-  // self-disarm 2s after the first real CodeEditorWidget passes through
-  // (or after a 5min fallback). No forced side-open — we rely on the
-  // user naturally opening a file to flow a fresh widget through the
-  // hooks. See vscode_monacoeditor_monkeypatch.md for the technique.
-  setTimeout(() => { triggerMonacoCapture().catch(() => {}); }, 2000);
+  // Do not arm renderer prototype capture on activation. Capture is useful
+  // only for hover drill-down rendering, and even brief global prototype
+  // hooks can be felt as VS Code UI lag if they run during normal editing.
 
   log.info('Extension activated');
-}
-
-async function triggerMonacoCapture() {
-  try {
-    sendToRenderer("(window.__irStartCapture && window.__irStartCapture('passive'))");
-  } catch (e) {
-    log.warn(`[capture] trigger error: ${e}`);
-  }
 }
 
 // ── V8 Inspector: extract shared ExtHostLanguageFeatures ──
@@ -1036,24 +1022,34 @@ async function injectRenderer() {
             for (var i = 0; i < wins.length; i++) {
               var w = wins[i];
               try {
-                try { w.webContents.debugger.detach(); } catch(e2) {}
-                w.webContents.debugger.attach('1.3');
+                var alreadyAttached = false;
+                try { alreadyAttached = w.webContents.debugger.isAttached(); } catch(eIs) {}
+                if (!alreadyAttached) {
+                  try { w.webContents.debugger.attach('1.3'); }
+                  catch(eAttach) { results.push('attach-fail:' + w.id + ':' + eAttach.message); continue; }
+                }
                 await w.webContents.debugger.sendCommand('Runtime.enable');
-                var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(evalExpr)} });
+                var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(evalExpr)}, includeCommandLineAPI: true, returnByValue: true });
                 if (r.result && (r.result.value === 'hover patch installed' || r.result.value === 'already patched')) {
                   results.push('injected:' + w.id + '(' + r.result.value + ')');
                   try {
                     await w.webContents.debugger.sendCommand('Runtime.addBinding', { name: 'irGoToType' });
-                    w.webContents.debugger.on('message', function(event, method, params) {
+                    if (!global.__irGoToTypeBridgeListeners) { global.__irGoToTypeBridgeListeners = new Map(); }
+                    var prev = global.__irGoToTypeBridgeListeners.get(w.id);
+                    if (prev) {
+                      try { w.webContents.debugger.removeListener('message', prev); } catch(eRm) {}
+                    }
+                    var bridge = function(event, method, params) {
                       if (method === 'Runtime.bindingCalled' && params.name === 'irGoToType') {
                         if(typeof global.irClickNotify==='function'){global.irClickNotify(params.payload)}
                       }
-                    });
+                    };
+                    w.webContents.debugger.on('message', bridge);
+                    global.__irGoToTypeBridgeListeners.set(w.id, bridge);
                     results.push('binding:' + w.id + ':ok');
                   } catch(eb) { results.push('binding:' + w.id + ':' + eb.message); }
                 } else {
                   results.push('skip:' + w.id + '(' + (r.result ? r.result.value : 'no result') + ')');
-                  w.webContents.debugger.detach();
                 }
               } catch(e) { results.push('err:' + w.id + ':' + e.message); }
             }
@@ -1105,10 +1101,14 @@ async function reinjectRenderer() {
             var n = 0;
             for (var i = 0; i < wins.length; i++) {
               try {
-                wins[i].webContents.debugger.attach('1.3');
-                var r = await wins[i].webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(evalExpr)} });
+                var attached = false;
+                try { attached = wins[i].webContents.debugger.isAttached(); } catch(eIs) {}
+                if (!attached) {
+                  try { wins[i].webContents.debugger.attach('1.3'); } catch(eAttach) { continue; }
+                }
+                await wins[i].webContents.debugger.sendCommand('Runtime.enable');
+                var r = await wins[i].webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(evalExpr)}, includeCommandLineAPI: true, returnByValue: true });
                 if (r.result && r.result.value === 'hover patch installed') n++;
-                wins[i].webContents.debugger.detach();
               } catch(e) {}
             }
             return n;
@@ -1140,22 +1140,6 @@ function startClickListener(mainWs: any) {
   mainWs.on('message', (data: string) => {
     try {
       const resp = JSON.parse(data);
-      // sendToRenderer responses use ids >= 100000 — surface exceptions
-      // and result values so silent failures aren't invisible.
-      if (typeof resp.id === 'number' && resp.id >= 100_000) {
-        if (resp.error) {
-          log.warn(`[send-resp] id=${resp.id} error=${JSON.stringify(resp.error)}`);
-        } else if (resp.result?.exceptionDetails) {
-          const ex = resp.result.exceptionDetails;
-          const msg = ex.exception?.description || ex.exception?.value || ex.text || '?';
-          log.warn(`[send-resp] id=${resp.id} exception=${msg}`);
-        } else if (resp.result?.result) {
-          const r = resp.result.result;
-          const v = r.value !== undefined ? JSON.stringify(r.value) : `(type=${r.type})`;
-          log.info(`[send-resp] id=${resp.id} value=${v}`);
-        }
-        return;
-      }
       if (resp.method === 'Runtime.bindingCalled' && resp.params?.name === 'irClickNotify') {
         const val = String(resp.params.payload);
         if (val.startsWith('LOG:')) {
@@ -1199,64 +1183,6 @@ function startClickListener(mainWs: any) {
   mainWs.on('error', (err: any) => {
     log.warn(`[listen] CDP WebSocket error: ${err}`);
   });
-}
-
-/**
- * Push a Runtime.evaluate via the persistent main-process CDP WebSocket so
- * the given JS runs inside the focused renderer window (where our hover
- * popup lives). Used to update visible hover content in place after a
- * plain click on a type link, and to start/stop monaco capture hooks.
- */
-function sendToRenderer(rendererJs: string): void {
-  const ws = mainWsRef;
-  if (!ws || ws.readyState !== 1 /* OPEN */) {
-    log.warn(`sendToRenderer: no active main-process WebSocket`);
-    return;
-  }
-  const b64 = Buffer.from(rendererJs).toString('base64');
-  const expr = `(async function() {
-    var BW = require('electron').BrowserWindow;
-    var w = BW.getFocusedWindow();
-    if (!w) {
-      // Fallback: VSCode in background / no focus → use first window.
-      // Prefer one with debugger already attached so we don't have to
-      // re-attach mid-flight.
-      var all = BW.getAllWindows();
-      for (var i = 0; i < all.length; i++) {
-        try { if (all[i].webContents && all[i].webContents.debugger && all[i].webContents.debugger.isAttached && all[i].webContents.debugger.isAttached()) { w = all[i]; break; } } catch(_) {}
-      }
-      if (!w) w = all[0];
-      if (!w) {
-        if (typeof global.irClickNotify === 'function') { global.irClickNotify('SEND:no-window-at-all'); }
-        return 'no-window-at-all';
-      }
-    }
-    var wid = w.id;
-    var summary;
-    try {
-      var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: "eval(atob('" + ${JSON.stringify(b64)} + "'))" });
-      if (r && r.exceptionDetails) {
-        var et = r.exceptionDetails.exception ? (r.exceptionDetails.exception.description || r.exceptionDetails.exception.value) : r.exceptionDetails.text;
-        summary = 'wid=' + wid + ' exc=' + (et || '?');
-      } else {
-        summary = 'wid=' + wid + ' ok';
-      }
-    } catch (e) {
-      summary = 'wid=' + wid + ' snd=' + (e && e.message ? e.message : String(e));
-    }
-    if (typeof global.irClickNotify === 'function') { global.irClickNotify('SEND:' + summary); }
-    return summary;
-  })()`;
-  const id = ++cdpMsgIdCounter;
-  try {
-    ws.send(JSON.stringify({
-      id,
-      method: 'Runtime.evaluate',
-      params: { expression: expr, awaitPromise: true, returnByValue: true, includeCommandLineAPI: true },
-    }));
-  } catch (err) {
-    log.warn(`sendToRenderer error: ${err}`);
-  }
 }
 
 // ASCII-escape every non-ASCII char to \\uXXXX. The payload is base64-
@@ -1480,7 +1406,7 @@ function httpGet(url: string): Promise<string> {
 
 function getHoverPatchScript(): string {
   return `(function(){
-var IR_PATCH_VERSION = 75;
+var IR_PATCH_VERSION = 78;
 if(window.__irPatchVersion === IR_PATCH_VERSION) return 'already patched';
 
 // Tear down any prior version's listeners and style so the new patch
@@ -1497,6 +1423,30 @@ try {
     window.__irStyleEl.parentNode.removeChild(window.__irStyleEl);
   }
   if (window.__irScanInterval) { clearInterval(window.__irScanInterval); }
+  if (window.__irScanTimer) { clearTimeout(window.__irScanTimer); }
+  if (window.__irMarkdownObserver) { try { window.__irMarkdownObserver.disconnect(); } catch(_) {} }
+  if (window.__irDisposeMonaco) { try { window.__irDisposeMonaco('patch-upgrade'); } catch(_) {} }
+  if (window.__irMonaco) {
+    try {
+      var oldM = window.__irMonaco;
+      if (oldM.editorRegistration && typeof oldM.editorRegistration.dispose === 'function') {
+        try { oldM.editorRegistration.dispose(); } catch(_) {}
+      }
+      if (oldM.codeEditorSvc && oldM.editor && typeof oldM.codeEditorSvc.removeCodeEditor === 'function') {
+        try { oldM.codeEditorSvc.removeCodeEditor(oldM.editor); } catch(_) {}
+      }
+      try {
+        if (oldM.editor && typeof oldM.editor.setModel === 'function') { oldM.editor.setModel(null); }
+      } catch(_) {}
+      try {
+        if (oldM.editor && typeof oldM.editor.dispose === 'function') { oldM.editor.dispose(); }
+      } catch(_) {}
+      try {
+        if (oldM.host && oldM.host.parentNode) { oldM.host.parentNode.removeChild(oldM.host); }
+      } catch(_) {}
+      window.__irMonaco = null;
+    } catch(_) {}
+  }
   if (window.__irStopCapture) { try { window.__irStopCapture(); } catch(_) {} }
 } catch(_) {}
 window.__irListeners = [];
@@ -2146,8 +2096,8 @@ var irScanCount=0;
 var irWrapCount=0;
 var irLastContainerCount=0;
 
-window.__irScanInterval = setInterval(function(){
-  var containers=document.querySelectorAll('.rendered-markdown');
+function irScanRenderedMarkdown(){
+  var containers=document.querySelectorAll('.monaco-hover .rendered-markdown, .monaco-editor-hover .rendered-markdown, .ij-find-hover-tooltip .rendered-markdown');
   if(containers.length!==irLastContainerCount){
     irLog('renderer: scan containers='+containers.length+' (was '+irLastContainerCount+')');
     irLastContainerCount=containers.length;
@@ -2206,9 +2156,34 @@ window.__irScanInterval = setInterval(function(){
     }
     if(replacements.length>0)irLog('renderer: total wrapped='+irWrapCount);
   }
-},100);
+}
 
-irLog('renderer: setInterval started');
+function irScheduleScan(){
+  if(window.__irScanTimer)return;
+  window.__irScanTimer=setTimeout(function(){
+    window.__irScanTimer=null;
+    try{irScanRenderedMarkdown()}catch(eScan){irLog('renderer: scan err '+(eScan&&eScan.message))}
+  },50);
+}
+
+window.__irMarkdownObserver=new MutationObserver(function(muts){
+  for(var mi=0;mi<muts.length;mi++){
+    var nodes=muts[mi].addedNodes||[];
+    for(var ni=0;ni<nodes.length;ni++){
+      var n=nodes[ni];
+      if(!n||n.nodeType!==1)continue;
+      if((n.matches&&n.matches('.rendered-markdown,.monaco-hover,.monaco-editor-hover,.ij-find-hover-tooltip'))||
+         (n.querySelector&&n.querySelector('.rendered-markdown'))){
+        irScheduleScan();
+        return;
+      }
+    }
+  }
+});
+window.__irMarkdownObserver.observe(document.body,{childList:true,subtree:true});
+irScheduleScan();
+
+irLog('renderer: MutationObserver scan installed');
 
 // ── Native hover anatomy probe ─────────────────────────────────────
 // Auto-snapshot any newly-appeared .monaco-hover so we can see the
@@ -2433,17 +2408,17 @@ window.__irSnapshotHover = function(hoverEl){
         if (r) irLog('TOKEN-DOM['+reported+'] mdRenderer FOUND: '+r);
       } catch(eF) { irLog('mdRenderer DOM-walk err: '+(eF&&eF.message)); }
     }
-    // Strategy 2: re-enable prototype hooks briefly. The NEXT hover
-    // render will instantiate fresh HoverWidget / MarkdownRenderer
-    // through DI, which flows through Map.set / Reflect.construct hooks
-    // and lands in caps. After 2s, capture stop runs the agg search
-    // again — this time with MarkdownRenderer in the graph.
-    if (!window.__irMdRenderer && reported === 1 && !window.__irRecaptureScheduled) {
+    // Strategy 2: re-enable prototype hooks only when our cached Monaco
+    // singleton is missing or no longer satisfies the CodeEditorWidget
+    // contract. Missing MarkdownRenderer alone is not a reason to recapture:
+    // the Monaco singleton is the expensive object we want to preserve.
+    var monacoErr = window.__irMonacoValidationError ? window.__irMonacoValidationError(window.__irMonaco) : 'no-validator';
+    if (monacoErr && reported === 1 && !window.__irRecaptureScheduled) {
       window.__irRecaptureScheduled = true;
-      irLog('mdRenderer recatch: re-enabling hooks for next hover');
+      irLog('monaco recatch: re-enabling hooks for next hover ('+monacoErr+')');
       try {
-        if (window.__irStartCapture) window.__irStartCapture('hover-recatch');
-      } catch(eRC) { irLog('mdRenderer recatch start err: '+(eRC&&eRC.message)); }
+        if (window.__irStartCapture) window.__irStartCapture('monaco-invalid:'+monacoErr);
+      } catch(eRC) { irLog('monaco recatch start err: '+(eRC&&eRC.message)); }
     }
   }
   var obs = new MutationObserver(function(muts){
@@ -2460,13 +2435,21 @@ window.__irSnapshotHover = function(hoverEl){
 // Modern VS Code hides the monaco namespace and AMD loader. To get
 // theme-matched syntax highlighting we capture VS Code's internal
 // IInstantiationService + CodeEditorWidget constructor + IModelService
-// by hooking native Map/WeakMap/Set/Array prototypes during widget
+// by hooking native Map/WeakMap/Set prototypes during widget
 // creation. Hooks are EXPENSIVE (every push/set in the renderer flows
 // through us), so they only activate during the brief window between
 // __irStartCapture() and __irStopCapture() — both driven by the host.
 // Default: no hooks, no impact on normal editor operation.
 window.__irStartCapture = function(reason){
   if (window.__irCaptureActive) return 'already-active';
+  var existingErr = irMonacoValidationError(window.__irMonaco);
+  if (!existingErr) {
+    irLog('capture skipped: valid monaco singleton');
+    return 'skipped-valid-monaco';
+  }
+  if (window.__irMonaco) {
+    irDisposeMonaco('invalid-before-capture:' + existingErr);
+  }
   // rendererCtors: classes whose prototype has .render — candidates for
   // VS Code's MarkdownRenderer (used by hover to tokenize/render markdown
   // via Monaco's tokenizer with full theme awareness). We exclude widget
@@ -2476,6 +2459,10 @@ window.__irStartCapture = function(reason){
   window.__irCaptureActive = true;
   var capturing = true;
   var graceScheduled = false;
+  if (window.__irCaptureFallbackTimer) {
+    try { clearTimeout(window.__irCaptureFallbackTimer); } catch(_) {}
+    window.__irCaptureFallbackTimer = null;
+  }
   // After the first real CodeEditorWidget (one with a model whose URI
   // is set) flows through our hooks, schedule auto-stop after a short
   // grace period. The grace lets related services (IInstantiationService,
@@ -2543,35 +2530,20 @@ window.__irStartCapture = function(reason){
       }
     } catch(_) {}
   }
-  var oM=Map.prototype.set, oW=WeakMap.prototype.set, oS=Set.prototype.add, oA=Array.prototype.push, oR=Reflect.construct;
+  var oM=Map.prototype.set, oW=WeakMap.prototype.set, oS=Set.prototype.add;
   Map.prototype.set = function(k,v){ try { sniff(v); } catch(_) {} return oM.call(this,k,v); };
   WeakMap.prototype.set = function(k,v){ try { sniff(v); } catch(_) {} return oW.call(this,k,v); };
   Set.prototype.add = function(v){ try { sniff(v); } catch(_) {} return oS.call(this,v); };
-  Array.prototype.push = function(){ try { for(var i=0;i<arguments.length;i++) sniff(arguments[i]); } catch(_) {} return oA.apply(this,arguments); };
-  Reflect.construct = function(target){
-    try {
-      if (capturing && target && target.prototype) {
-        var p = target.prototype;
-        if (typeof p.layout==='function' && typeof p.getModel==='function' && typeof p.getDomNode==='function') {
-          if (caps.widgetCtors.indexOf(target) < 0 && caps.widgetCtors.length < 20) caps.widgetCtors.push(target);
-        } else if (typeof p.render==='function' &&
-                   typeof p.layout!=='function' &&
-                   typeof p.getModel!=='function') {
-          // Likely a renderer (MarkdownRenderer / similar)
-          if (caps.rendererCtors.indexOf(target) < 0 && caps.rendererCtors.length < 30) caps.rendererCtors.push(target);
-        }
-      }
-    } catch(_) {}
-    return oR.apply(Reflect, arguments);
-  };
   window.__irStopCapture = function(){
     if (!capturing) return 'already-stopped';
     capturing = false;
+    if (window.__irCaptureFallbackTimer) {
+      try { clearTimeout(window.__irCaptureFallbackTimer); } catch(_) {}
+      window.__irCaptureFallbackTimer = null;
+    }
     try { Map.prototype.set = oM; } catch(_) {}
     try { WeakMap.prototype.set = oW; } catch(_) {}
     try { Set.prototype.add = oS; } catch(_) {}
-    try { Array.prototype.push = oA; } catch(_) {}
-    try { Reflect.construct = oR; } catch(_) {}
     window.__irCaptureActive = false;
     var kinds = {};
     for (var i = 0; i < caps.services.length; i++) { kinds[caps.services[i].kind] = (kinds[caps.services[i].kind]||0)+1; }
@@ -2844,6 +2816,7 @@ window.__irStartCapture = function(reason){
       var mz = window.__irMaterializeMonaco ? window.__irMaterializeMonaco() : 'no-fn';
       irLog('materialize: '+mz);
     } catch(eMz) { irLog('materialize threw: '+(eMz&&eMz.message)); }
+    window.__irRecaptureScheduled = false;
     return 'stopped';
   };
   // Per-session ID so a stale timer from a previous capture session
@@ -2853,14 +2826,14 @@ window.__irStartCapture = function(reason){
   if (typeof window.__irCaptureSessionId !== 'number') window.__irCaptureSessionId = 0;
   window.__irCaptureSessionId++;
   var mySessionId = window.__irCaptureSessionId;
-  setTimeout(function(){
+  window.__irCaptureFallbackTimer=setTimeout(function(){
     try {
       if (window.__irCaptureActive && window.__irCaptureSessionId === mySessionId) {
         window.__irStopCapture();
       }
     } catch(_) {}
-  }, 300000);
-  irLog('capture started ('+reason+', fallback 5min, auto-stops 2s after first real widget)');
+  }, 8000);
+  irLog('capture started ('+reason+', fallback 8s, auto-stops 2s after first real widget)');
   return 'started';
 };
 
@@ -2909,12 +2882,166 @@ function irIsCodeEditorSvc(v){
     typeof v.listCodeEditors === 'function';
 }
 
+function irEditorRegistryValidationError(ed){
+  if (!ed || typeof ed !== 'object') return 'not-object';
+  var required = [
+    'getModel',
+    'setModel',
+    'hasModel',
+    'hasWidgetFocus',
+    'onDidChangeModel',
+    'onDidChangeModelLanguage',
+    'onDidChangeModelContent',
+    'removeDecorationsByType',
+    'layout',
+    'getDomNode',
+    'dispose',
+  ];
+  var missing = [];
+  for (var i = 0; i < required.length; i++) {
+    if (typeof ed[required[i]] !== 'function') missing.push(required[i]);
+  }
+  if (missing.length) return 'missing:' + missing.join(',');
+  try {
+    var dom = ed.getDomNode();
+    if (!dom || !(dom instanceof HTMLElement)) return 'bad-dom';
+  } catch(eDom) {
+    return 'bad-dom:' + (eDom && eDom.message ? eDom.message : eDom);
+  }
+  try {
+    ed.hasModel();
+  } catch(eHasModel) {
+    return 'hasModel-throws:' + (eHasModel && eHasModel.message ? eHasModel.message : eHasModel);
+  }
+  try {
+    ed.hasWidgetFocus();
+  } catch(eFocus) {
+    return 'hasWidgetFocus-throws:' + (eFocus && eFocus.message ? eFocus.message : eFocus);
+  }
+  return '';
+}
+
+function irMonacoValidationError(m){
+  if (!m || typeof m !== 'object') return 'missing';
+  if (!m.editor || typeof m.editor !== 'object') return 'missing-editor';
+  var edErr = irEditorRegistryValidationError(m.editor);
+  if (edErr) return 'editor:' + edErr;
+  if (!m.host || !(m.host instanceof HTMLElement)) return 'missing-host';
+  try {
+    if (!document.documentElement.contains(m.host)) return 'host-detached';
+  } catch(eHost) {
+    return 'host-check-throws:' + (eHost && eHost.message ? eHost.message : eHost);
+  }
+  if (!irIsModelSvc(m.modelSvc)) return 'missing-modelSvc';
+  if (m.registeredInCodeEditorSvc) {
+    if (!m.editorRegistration || typeof m.editorRegistration.dispose !== 'function') {
+      return 'missing-editor-registration';
+    }
+    if (!irIsCodeEditorSvc(m.codeEditorSvc)) return 'missing-codeEditorSvc';
+  }
+  if (m.uriCtor && typeof m.uriCtor.parse !== 'function') return 'bad-uriCtor';
+  return '';
+}
+window.__irMonacoValidationError = irMonacoValidationError;
+
+function irDisposeMonaco(reason){
+  var m = window.__irMonaco;
+  if (!m) return 'none';
+  var out = [];
+  try {
+    if (m.editorRegistration && typeof m.editorRegistration.dispose === 'function') {
+      m.editorRegistration.dispose();
+      out.push('registration=disposed');
+    }
+  } catch(eReg) {
+    out.push('registration=err:' + (eReg && eReg.message ? eReg.message : eReg));
+  }
+  try {
+    var ed = m.editor;
+    var model = ed && typeof ed.getModel === 'function' ? ed.getModel() : null;
+    if (ed && typeof ed.setModel === 'function') {
+      try { ed.setModel(null); } catch(_) {}
+    }
+    if (model && typeof model.dispose === 'function') {
+      try { model.dispose(); out.push('model=disposed'); } catch(eModel) { out.push('model=err'); }
+    }
+  } catch(eDetach) {
+    out.push('model-detach=err:' + (eDetach && eDetach.message ? eDetach.message : eDetach));
+  }
+  try {
+    if (m.editor && typeof m.editor.dispose === 'function') {
+      m.editor.dispose();
+      out.push('editor=disposed');
+    }
+  } catch(eEd) {
+    out.push('editor=err:' + (eEd && eEd.message ? eEd.message : eEd));
+  }
+  try {
+    if (m.host && m.host.parentNode) {
+      m.host.parentNode.removeChild(m.host);
+      out.push('host=removed');
+    }
+  } catch(eHost) {
+    out.push('host=err:' + (eHost && eHost.message ? eHost.message : eHost));
+  }
+  window.__irMonaco = null;
+  irLog('monaco disposed reason=' + (reason || 'unknown') + ' ' + out.join(' '));
+  return out.join(',') || 'disposed';
+}
+window.__irDisposeMonaco = irDisposeMonaco;
+
+window.__irRendererSafetyReport = function(){
+  var m = window.__irMonaco;
+  var validation = irMonacoValidationError(m);
+  return JSON.stringify({
+    patchVersion: IR_PATCH_VERSION,
+    captureActive: !!window.__irCaptureActive,
+    hasMonaco: !!m,
+    registeredInCodeEditorSvc: !!(m && m.registeredInCodeEditorSvc),
+    monacoValidation: validation || 'ok',
+  });
+};
+
+function irRegisterCodeEditorSafely(codeEditorSvc, ed){
+  if (!codeEditorSvc) return { ok: false, reason: 'no-codeEditorSvc', disposable: null };
+  var validation = irEditorRegistryValidationError(ed);
+  if (validation) return { ok: false, reason: validation, disposable: null };
+  try {
+    var before = [];
+    try { before = codeEditorSvc.listCodeEditors() || []; } catch(_) {}
+    var disposable = codeEditorSvc.addCodeEditor(ed);
+    if (disposable && typeof disposable.dispose === 'function') {
+      return { ok: true, reason: 'registered:disposable', disposable: disposable };
+    }
+    try {
+      if (typeof codeEditorSvc.removeCodeEditor === 'function') {
+        codeEditorSvc.removeCodeEditor(ed);
+        return { ok: false, reason: 'registered-without-disposable:removed', disposable: null };
+      }
+    } catch(eRemove) {
+      return { ok: false, reason: 'registered-without-disposable:remove-throws:' + (eRemove && eRemove.message ? eRemove.message : eRemove), disposable: null };
+    }
+    var after = [];
+    try { after = codeEditorSvc.listCodeEditors() || []; } catch(_) {}
+    return { ok: false, reason: 'registered-without-disposable:unrecoverable before=' + before.length + ' after=' + after.length, disposable: null };
+  } catch(eAdd) {
+    return { ok: false, reason: 'add-throws:' + (eAdd && eAdd.message ? eAdd.message : eAdd), disposable: null };
+  }
+}
+
 // Materialize a hidden, off-screen Monaco CodeEditorWidget using the
 // captured services. Try every (inst × ctor) pair — DI stubs throw,
 // real combos succeed. IModelService fallback: walk captured widgets
 // and the new widget itself for a private field matching the duck-type.
 window.__irMaterializeMonaco = function(){
-  if (window.__irMonaco) return 'already';
+  if (window.__irMonaco) {
+    var existingErr = irMonacoValidationError(window.__irMonaco);
+    if (existingErr) {
+      irDisposeMonaco('invalid-existing:' + existingErr);
+    } else {
+      return 'already';
+    }
+  }
   var caps = window.__irMonacoCaps;
   if (!caps) return 'no-caps';
   var insts = [], modelSvc = null, codeEditorSvc = null;
@@ -3010,14 +3137,36 @@ window.__irMaterializeMonaco = function(){
         if (ed && typeof ed === 'object' && typeof ed.setModel === 'function' && typeof ed.layout === 'function') {
           if (!modelSvc) modelSvc = irDeepFind(ed, 3, new Set(), irIsModelSvc);
           if (!modelSvc) { try { ed.dispose && ed.dispose(); } catch(_) {} continue; }
+          var editorErr = irEditorRegistryValidationError(ed);
+          if (editorErr) {
+            irLog('candidate editor rejected: ' + editorErr);
+            try { ed.dispose && ed.dispose(); } catch(_) {}
+            continue;
+          }
           // Register the widget with ICodeEditorService so the workbench
           // theme service applies token colors and the language service
           // attaches grammar-driven tokenizers to its models.
-          if (codeEditorSvc) {
-            try { codeEditorSvc.addCodeEditor(ed); irLog('addCodeEditor ok'); }
-            catch(eAdd) { irLog('addCodeEditor err: '+(eAdd&&eAdd.message)); }
+          var registration = irRegisterCodeEditorSafely(codeEditorSvc, ed);
+          if (registration.ok) {
+            irLog('addCodeEditor safe ok: ' + registration.reason);
+          } else {
+            irLog('addCodeEditor skipped: ' + registration.reason);
+            if (/unrecoverable/.test(registration.reason)) {
+              try { ed.dispose && ed.dispose(); } catch(_) {}
+              continue;
+            }
           }
-          window.__irMonaco = { editor: ed, host: host, modelSvc: modelSvc, inst: insts[ii], ctor: ctor, uriCtor: uriCtor, codeEditorSvc: codeEditorSvc };
+          window.__irMonaco = {
+            editor: ed,
+            host: host,
+            modelSvc: modelSvc,
+            inst: insts[ii],
+            ctor: ctor,
+            uriCtor: uriCtor,
+            codeEditorSvc: codeEditorSvc,
+            editorRegistration: registration.disposable || null,
+            registeredInCodeEditorSvc: !!registration.ok,
+          };
           return 'ok inst#'+ii+' ctor#'+ci;
         }
       } catch(_) { /* try next */ }
@@ -3665,7 +3814,11 @@ window.__irTokenizeCode = function(text, lang){
     }
     return frag;
   } catch(e) {
-    irLog('tokenize threw: '+(e&&e.message?e.message:String(e)));
+    var msg = e&&e.message?e.message:String(e);
+    irLog('tokenize threw: '+msg);
+    if (/hasModel|hasWidgetFocus|removeDecorationsByType|onDidChangeModelLanguage/.test(msg)) {
+      try { irDisposeMonaco('tokenize-contract-error:' + msg.slice(0, 120)); } catch(_) {}
+    }
     return null;
   }
 };
