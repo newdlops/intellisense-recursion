@@ -1,7 +1,9 @@
 //! ir-indexer: compact symbol index for the IntelliSense Recursion extension.
 
+mod discoveries;
 mod format;
 mod index;
+mod overlay;
 mod parse;
 mod query;
 mod serve;

@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 1,
+            "activePatchIndex": 6,
             "patches": [
                 {
                     "date": 1776576981553,
@@ -12,6 +12,26 @@
                 {
                     "date": 1776595173659,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellisense-recursion\",\n   \"displayName\": \"IntelliSense Recursion\",\n   \"description\": \"Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA\",\n-  \"version\": \"0.2.2\",\n+  \"version\": \"0.2.3\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n@@ -59,8 +59,11 @@\n   \"scripts\": {\n     \"vscode:prepublish\": \"npm run bundle\",\n     \"compile\": \"tsc -p ./\",\n     \"bundle\": \"tsc -p ./ && node esbuild.js\",\n+    \"bin:build\": \"cd indexer && cargo build --release\",\n+    \"bin:all\": \"bash scripts/build-all.sh\",\n+    \"bin:copy\": \"node scripts/prepackage.js\",\n     \"watch\": \"tsc -watch -p ./\",\n     \"pretest\": \"npm run compile\",\n     \"test\": \"node ./out/test/runTest.js\",\n     \"test:python\": \"TEST_FIXTURE=python node ./out/test/runTest.js\",\n"
+                },
+                {
+                    "date": 1777308617333,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellisense-recursion\",\n   \"displayName\": \"IntelliSense Recursion\",\n   \"description\": \"Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA\",\n-  \"version\": \"0.2.3\",\n+  \"version\": \"0.2.5\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n"
+                },
+                {
+                    "date": 1777309264717,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellisense-recursion\",\n   \"displayName\": \"IntelliSense Recursion\",\n   \"description\": \"Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA\",\n-  \"version\": \"0.2.5\",\n+  \"version\": \"0.2.51\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n"
+                },
+                {
+                    "date": 1777335934744,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellisense-recursion\",\n   \"displayName\": \"IntelliSense Recursion\",\n   \"description\": \"Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA\",\n-  \"version\": \"0.2.51\",\n+  \"version\": \"0.2.52\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n"
+                },
+                {
+                    "date": 1778130177561,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellisense-recursion\",\n   \"displayName\": \"IntelliSense Recursion\",\n   \"description\": \"Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA\",\n-  \"version\": \"0.2.52\",\n+  \"version\": \"0.2.54\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n@@ -52,8 +52,12 @@\n       },\n       {\n         \"command\": \"intellisenseRecursion.rebuildIndex\",\n         \"title\": \"IR: Rebuild Symbol Index\"\n+      },\n+      {\n+        \"command\": \"intellisenseRecursion.rebuildIndexHard\",\n+        \"title\": \"IR: Rebuild Symbol Index (Clear Cache)\"\n       }\n     ]\n   },\n   \"scripts\": {\n"
+                },
+                {
+                    "date": 1778130555484,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellisense-recursion\",\n   \"displayName\": \"IntelliSense Recursion\",\n   \"description\": \"Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA\",\n-  \"version\": \"0.2.54\",\n+  \"version\": \"0.2.55\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n@@ -51,13 +51,9 @@\n         \"title\": \"Go to Definition (from hover)\"\n       },\n       {\n         \"command\": \"intellisenseRecursion.rebuildIndex\",\n-        \"title\": \"IR: Rebuild Symbol Index\"\n-      },\n-      {\n-        \"command\": \"intellisenseRecursion.rebuildIndexHard\",\n-        \"title\": \"IR: Rebuild Symbol Index (Clear Cache)\"\n+        \"title\": \"IR: Rebuild Symbol Index (Force)\"\n       }\n     ]\n   },\n   \"scripts\": {\n"
                 }
             ],
             "date": 1776576981553,

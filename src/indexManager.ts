@@ -18,6 +18,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import {
   IndexSidecar,
   SidecarHit,
+  SidecarKind,
   SidecarLanguage,
   SidecarLogger,
   SidecarReady,
@@ -26,6 +27,7 @@ import {
 } from './sidecar';
 
 const REBUILD_DEBOUNCE_MS = 10_000;
+const OVERLAY_DEBOUNCE_MS = 250;
 const BUILD_TIMEOUT_MS = 180_000;
 const SIDECAR_BUILD_TIMEOUT_MS = 600_000;
 const SIDECAR_DOWNLOAD_TIMEOUT_MS = 120_000;
@@ -413,6 +415,12 @@ type State =
   | { kind: 'ready'; sidecar: IndexSidecar }
   | { kind: 'failed'; reason: string };
 
+export type IndexStatus =
+  | { kind: 'idle' }
+  | { kind: 'building' }
+  | { kind: 'ready'; files: number; symbols: number; roots: SidecarRoot[] }
+  | { kind: 'failed'; reason: string };
+
 export class IndexManager {
   private state: State = { kind: 'idle' };
   private binary: string | null;
@@ -424,6 +432,13 @@ export class IndexManager {
   private binaryBuildInFlight: Promise<string | null> | null = null;
   private extraRoots: ExtraRoot[] = [];
   private indexedRoots: SidecarRoot[] = [];
+  /** Per-document debounce timers for overlay updates, keyed by canonical fs path. */
+  private overlayTimers = new Map<string, ReturnType<typeof setTimeout>>();
+  private statusEmitter = new vscode.EventEmitter<IndexStatus>();
+  private lastStatus: IndexStatus = { kind: 'idle' };
+  private lastReady: { files: number; symbols: number } | null = null;
+  /** Fires whenever the index manager transitions between idle/building/ready/failed. */
+  readonly onStatusChange = this.statusEmitter.event;
 
   constructor(
     private readonly extensionPath: string,
@@ -439,6 +454,23 @@ export class IndexManager {
       this.workspaceRoot = workspace.root;
       this.indexPath = cachePathFor(storagePath, workspace.key);
     }
+  }
+
+  /** Last-emitted status; safe to read from any consumer. */
+  currentStatus(): IndexStatus {
+    return this.lastStatus;
+  }
+
+  /** Set internal state and emit a public IndexStatus to observers. */
+  private setStatus(next: IndexStatus, internal: State) {
+    this.state = internal;
+    this.lastStatus = next;
+    if (next.kind === 'ready') {
+      this.lastReady = { files: next.files, symbols: next.symbols };
+    } else if (next.kind === 'idle' || next.kind === 'failed') {
+      this.lastReady = null;
+    }
+    this.statusEmitter.fire(next);
   }
 
   isAvailable(): boolean {
@@ -470,7 +502,7 @@ export class IndexManager {
   async start(): Promise<void> {
     if (!this.workspaceRoot || !this.indexPath) {
       this.log.info('[ir] no workspace folder; fast lookup disabled');
-      this.state = { kind: 'failed', reason: 'no-workspace' };
+      this.setStatus({ kind: 'failed', reason: 'no-workspace' }, { kind: 'failed', reason: 'no-workspace' });
       return;
     }
     if (!this.binary) {
@@ -478,7 +510,7 @@ export class IndexManager {
     }
     if (!this.binary) {
       this.log.warn('[ir] sidecar binary not found and could not be downloaded or built; fast lookup disabled');
-      this.state = { kind: 'failed', reason: 'binary-missing' };
+      this.setStatus({ kind: 'failed', reason: 'binary-missing' }, { kind: 'failed', reason: 'binary-missing' });
       return;
     }
     this.log.info(`[ir] workspace=${this.workspaceRoot}`);
@@ -497,7 +529,7 @@ export class IndexManager {
           if (this.state.kind === 'ready') {
             this.state.sidecar.dispose();
           }
-          this.state = { kind: 'idle' };
+          this.setStatus({ kind: 'idle' }, { kind: 'idle' });
           this.indexedRoots = [];
           await this.rebuild();
           return;
@@ -550,21 +582,125 @@ export class IndexManager {
     }
   }
 
-  /** Register listeners: file save → debounced rebuild. */
+  /**
+   * Promote an LSP-resolved location into the sidecar's discovery cache.
+   * Best-effort: if the sidecar isn't ready or the path is outside indexed
+   * roots, the call is silently dropped. Path is canonicalized so it lines
+   * up with what the sidecar's overlay/discovery uses.
+   */
+  async addDiscovery(
+    name: string,
+    path: string,
+    line: number,
+    col: number,
+    kind?: SidecarKind,
+  ): Promise<void> {
+    if (this.state.kind !== 'ready') { return; }
+    try {
+      await this.state.sidecar.addDiscovery(
+        name,
+        canonicalFsPath(path),
+        line,
+        col,
+        kind,
+      );
+    } catch (err) {
+      this.log.warn(`[ir] addDiscovery failed: ${err}`);
+    }
+  }
+
+  /** Register listeners: change → debounced overlay update, save → debounced rebuild, close → drop overlay. */
   registerWatchers(context: vscode.ExtensionContext) {
     const onSave = vscode.workspace.onDidSaveTextDocument((doc) => {
       if (!isSupportedPath(doc.uri.fsPath)) { return; }
       if (this.workspaceRoot && !isSameOrInside(this.workspaceRoot, doc.uri.fsPath)) { return; }
       this.scheduleRebuild();
     });
-    context.subscriptions.push(onSave);
+    const onChange = vscode.workspace.onDidChangeTextDocument((event) => {
+      if (event.contentChanges.length === 0) { return; }
+      const doc = event.document;
+      if (doc.uri.scheme !== 'file') { return; }
+      if (!isSupportedPath(doc.uri.fsPath)) { return; }
+      if (this.workspaceRoot && !isSameOrInside(this.workspaceRoot, doc.uri.fsPath)) { return; }
+      this.scheduleOverlayUpdate(doc);
+    });
+    const onClose = vscode.workspace.onDidCloseTextDocument((doc) => {
+      if (doc.uri.scheme !== 'file') { return; }
+      if (!isSupportedPath(doc.uri.fsPath)) { return; }
+      this.cancelOverlayTimer(canonicalFsPath(doc.uri.fsPath));
+      // Drop overlay so subsequent lookups fall back to whatever is on disk.
+      // If the doc had unsaved edits, those are gone — base index is the
+      // accurate picture. Best-effort; ignore failures (sidecar not ready).
+      void this.clearOverlay(doc.uri.fsPath);
+    });
+    context.subscriptions.push(onSave, onChange, onClose);
   }
 
-  /** Public command: force immediate rebuild. */
-  async rebuildNow(): Promise<void> {
+  private scheduleOverlayUpdate(doc: vscode.TextDocument) {
+    const key = canonicalFsPath(doc.uri.fsPath);
+    const existing = this.overlayTimers.get(key);
+    if (existing) { clearTimeout(existing); }
+    const timer = setTimeout(() => {
+      this.overlayTimers.delete(key);
+      // Re-fetch the latest document text at flush time. If the doc was
+      // closed in the meantime, getText returns the last-known content,
+      // which is a reasonable approximation; the close handler will run
+      // its own clear shortly.
+      this.flushOverlay(key, doc.getText()).catch((err) =>
+        this.log.warn(`[ir] overlay update failed: ${err}`));
+    }, OVERLAY_DEBOUNCE_MS);
+    this.overlayTimers.set(key, timer);
+  }
+
+  private cancelOverlayTimer(canonicalPath: string) {
+    const existing = this.overlayTimers.get(canonicalPath);
+    if (existing) {
+      clearTimeout(existing);
+      this.overlayTimers.delete(canonicalPath);
+    }
+  }
+
+  private async flushOverlay(canonicalPath: string, source: string): Promise<void> {
+    if (this.state.kind !== 'ready') { return; }
+    await this.state.sidecar.updateFile(canonicalPath, source);
+  }
+
+  private async clearOverlay(fsPath: string): Promise<void> {
+    if (this.state.kind !== 'ready') { return; }
+    try {
+      await this.state.sidecar.clearFile(canonicalFsPath(fsPath));
+    } catch (err) {
+      this.log.warn(`[ir] overlay clear failed: ${err}`);
+    }
+  }
+
+  /**
+   * Force immediate rebuild. With `hard: true`, the existing index file is
+   * deleted and the sidecar torn down before rebuilding — used when the
+   * on-disk index is suspected to be corrupted or stale beyond what a normal
+   * rebuild would catch.
+   */
+  async rebuildNow(opts: { hard?: boolean } = {}): Promise<void> {
     if (this.rebuildTimer) {
       clearTimeout(this.rebuildTimer);
       this.rebuildTimer = null;
+    }
+    if (opts.hard) {
+      // Tear down sidecar first: it holds an mmap on the index file, and
+      // some filesystems (notably Windows) refuse unlink while mapped.
+      if (this.state.kind === 'ready') {
+        this.state.sidecar.dispose();
+      }
+      this.indexedRoots = [];
+      this.setStatus({ kind: 'idle' }, { kind: 'idle' });
+      if (this.indexPath && fs.existsSync(this.indexPath)) {
+        try {
+          fs.unlinkSync(this.indexPath);
+          this.log.info(`[ir] hard rebuild: removed ${this.indexPath}`);
+        } catch (err) {
+          this.log.warn(`[ir] hard rebuild: could not remove index file: ${err}`);
+        }
+      }
     }
     await this.rebuild();
   }
@@ -744,7 +880,7 @@ export class IndexManager {
     this.rebuildInFlight = true;
 
     const prevState = this.state;
-    this.state = { kind: 'building' };
+    this.setStatus({ kind: 'building' }, { kind: 'building' });
 
     try {
       const tmpPath = this.indexPath + '.tmp';
@@ -763,10 +899,13 @@ export class IndexManager {
       await this.spawnSidecar();
     } catch (err) {
       this.log.warn(`[ir] build failed: ${err}`);
-      if (prevState.kind === 'ready') {
-        this.state = prevState;
+      if (prevState.kind === 'ready' && this.lastReady) {
+        this.setStatus(
+          { kind: 'ready', files: this.lastReady.files, symbols: this.lastReady.symbols, roots: this.indexedRoots },
+          prevState,
+        );
       } else {
-        this.state = { kind: 'failed', reason: String(err) };
+        this.setStatus({ kind: 'failed', reason: String(err) }, { kind: 'failed', reason: String(err) });
       }
     } finally {
       this.rebuildInFlight = false;
@@ -848,7 +987,10 @@ export class IndexManager {
         `${info.postings} postings, ${(info.size / 1024 / 1024).toFixed(2)} MiB ` +
         `(roots: ${sources})`,
     );
-    this.state = { kind: 'ready', sidecar };
+    this.setStatus(
+      { kind: 'ready', files: info.files, symbols: info.symbols, roots: info.roots },
+      { kind: 'ready', sidecar },
+    );
     return info;
   }
 
@@ -857,10 +999,15 @@ export class IndexManager {
       clearTimeout(this.rebuildTimer);
       this.rebuildTimer = null;
     }
+    for (const timer of this.overlayTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.overlayTimers.clear();
     if (this.state.kind === 'ready') {
       this.state.sidecar.dispose();
     }
     this.state = { kind: 'idle' };
     this.indexedRoots = [];
+    this.statusEmitter.dispose();
   }
 }

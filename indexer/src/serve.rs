@@ -8,7 +8,9 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::Path;
 
+use crate::discoveries::Discoveries;
 use crate::format::{Kind, SourceTag};
+use crate::overlay::Overlay;
 use crate::query::{Hit, Index};
 
 const DEFAULT_LIMIT: usize = 50;
@@ -27,6 +29,20 @@ struct Request {
     /// set, only hits in files of that language are returned.
     #[serde(default)]
     language: Option<String>,
+    /// `update_file` / `clear_file`: absolute path of the buffer.
+    #[serde(default)]
+    path: Option<String>,
+    /// `update_file`: full buffer contents (UTF-8).
+    #[serde(default)]
+    source: Option<String>,
+    /// `add_discovery`: 1-based line/column.
+    #[serde(default)]
+    line: Option<u32>,
+    #[serde(default)]
+    col: Option<u32>,
+    /// `add_discovery`: one of class|function|method|variable|attribute|alias.
+    #[serde(default)]
+    kind: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -88,10 +104,20 @@ struct Response<'a> {
     stats: Option<StatsJson>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pong: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    symbols: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cleared: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stored: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed: Option<usize>,
 }
 
 pub fn run(index_path: &Path) -> Result<()> {
     let idx = Index::open(index_path)?;
+    let mut overlay = Overlay::new();
+    let mut discoveries = Discoveries::new();
 
     let roots_json: Vec<RootJson> = idx
         .roots()
@@ -131,14 +157,20 @@ pub fn run(index_path: &Path) -> Result<()> {
             continue;
         }
         match serde_json::from_str::<Request>(trimmed) {
-            Ok(req) => handle(&idx, &req, &mut stdout)?,
+            Ok(req) => handle(&idx, &mut overlay, &mut discoveries, &req, &mut stdout)?,
             Err(e) => emit_error(&mut stdout, 0, &format!("bad json: {}", e))?,
         }
     }
     Ok(())
 }
 
-fn handle<W: Write>(idx: &Index, req: &Request, out: &mut W) -> Result<()> {
+fn handle<W: Write>(
+    idx: &Index,
+    overlay: &mut Overlay,
+    discoveries: &mut Discoveries,
+    req: &Request,
+    out: &mut W,
+) -> Result<()> {
     let limit = req.limit.unwrap_or(DEFAULT_LIMIT).max(1);
     match req.op.as_str() {
         "ping" => {
@@ -178,9 +210,8 @@ fn handle<W: Write>(idx: &Index, req: &Request, out: &mut W) -> Result<()> {
             let Some(name) = req.name.as_deref() else {
                 return emit_error(out, req.id, "lookup requires 'name'");
             };
-            match idx.lookup(name) {
+            match merged_lookup(idx, overlay, discoveries, name, req.language.as_deref()) {
                 Ok(mut hits) => {
-                    filter_by_language(&mut hits, req.language.as_deref());
                     rank(&mut hits);
                     let total = hits.len();
                     let taken: Vec<HitJson> = hits
@@ -208,8 +239,7 @@ fn handle<W: Write>(idx: &Index, req: &Request, out: &mut W) -> Result<()> {
             let looked: Vec<(String, Vec<Hit>)> = names
                 .iter()
                 .filter_map(|n| {
-                    idx.lookup(n).ok().map(|mut h| {
-                        filter_by_language(&mut h, lang);
+                    merged_lookup(idx, overlay, discoveries, n, lang).ok().map(|mut h| {
                         rank(&mut h);
                         (n.clone(), h)
                     })
@@ -233,8 +263,140 @@ fn handle<W: Write>(idx: &Index, req: &Request, out: &mut W) -> Result<()> {
             };
             write_response(out, &resp)
         }
+        "update_file" => {
+            let Some(path) = req.path.as_deref() else {
+                return emit_error(out, req.id, "update_file requires 'path'");
+            };
+            let Some(source) = req.source.as_deref() else {
+                return emit_error(out, req.id, "update_file requires 'source'");
+            };
+            let ext = match Path::new(path)
+                .extension()
+                .and_then(|e| e.to_str())
+            {
+                Some(e) => e,
+                None => return emit_error(out, req.id, "update_file: path has no extension"),
+            };
+            match overlay.set(path, source.as_bytes(), ext, idx.roots()) {
+                Ok(n) => {
+                    // An edit on this path makes any LSP-discovered location
+                    // potentially stale (line numbers drift, the symbol may
+                    // have been renamed/deleted). Drop discoveries for it so
+                    // the next miss re-asks LSP against the new buffer.
+                    discoveries.clear_for_path(path);
+                    let resp = Response {
+                        id: req.id,
+                        ok: true,
+                        symbols: Some(n),
+                        ..Default::default()
+                    };
+                    write_response(out, &resp)
+                }
+                Err(e) => emit_error(out, req.id, &format!("{}", e)),
+            }
+        }
+        "clear_file" => {
+            let Some(path) = req.path.as_deref() else {
+                return emit_error(out, req.id, "clear_file requires 'path'");
+            };
+            let cleared = overlay.clear(path);
+            let resp = Response {
+                id: req.id,
+                ok: true,
+                cleared: Some(cleared),
+                ..Default::default()
+            };
+            write_response(out, &resp)
+        }
+        "add_discovery" => {
+            let Some(name) = req.name.as_deref() else {
+                return emit_error(out, req.id, "add_discovery requires 'name'");
+            };
+            let Some(path) = req.path.as_deref() else {
+                return emit_error(out, req.id, "add_discovery requires 'path'");
+            };
+            let Some(line) = req.line else {
+                return emit_error(out, req.id, "add_discovery requires 'line'");
+            };
+            let col = req.col.unwrap_or(1);
+            let kind = match req.kind.as_deref() {
+                Some("class") => Kind::Class,
+                Some("function") => Kind::Function,
+                Some("method") => Kind::Method,
+                Some("variable") => Kind::Variable,
+                Some("attribute") => Kind::Attribute,
+                Some("alias") => Kind::Alias,
+                Some(other) => {
+                    return emit_error(out, req.id, &format!("unknown kind: {}", other));
+                }
+                None => Kind::Class,
+            };
+            let stored = discoveries.add(name, path, line, col, kind, idx.roots());
+            let resp = Response {
+                id: req.id,
+                ok: true,
+                stored: Some(stored),
+                ..Default::default()
+            };
+            write_response(out, &resp)
+        }
+        "clear_discoveries_for_path" => {
+            let Some(path) = req.path.as_deref() else {
+                return emit_error(
+                    out,
+                    req.id,
+                    "clear_discoveries_for_path requires 'path'",
+                );
+            };
+            let removed = discoveries.clear_for_path(path);
+            let resp = Response {
+                id: req.id,
+                ok: true,
+                removed: Some(removed),
+                ..Default::default()
+            };
+            write_response(out, &resp)
+        }
         other => emit_error(out, req.id, &format!("unknown op: {}", other)),
     }
+}
+
+/// Look up a symbol against the base index, in-memory overlay, and the
+/// session-local discovery cache. Overlay shadows base by path; discovery
+/// hits are appended after dedup against (path, line, col) from the merged
+/// base+overlay set. Language filter applies uniformly.
+fn merged_lookup(
+    idx: &Index,
+    overlay: &Overlay,
+    discoveries: &Discoveries,
+    name: &str,
+    language: Option<&str>,
+) -> Result<Vec<Hit>> {
+    let mut hits = idx.lookup(name)?;
+    filter_by_language(&mut hits, language);
+    hits.retain(|h| !overlay.shadows(&h.path));
+    overlay.collect_hits(name, language, &mut hits);
+
+    let mut discovered: Vec<Hit> = Vec::new();
+    discoveries.collect_hits(name, language, &mut discovered);
+    if !discovered.is_empty() {
+        for d in discovered {
+            // Dedup: skip if a base/overlay hit already covers this exact
+            // location, or if overlay shadows the path (the buffer is the
+            // current truth — discovery would only confuse).
+            if overlay.shadows(&d.path) {
+                continue;
+            }
+            if hits
+                .iter()
+                .any(|h| h.path == d.path && h.line == d.line && h.col == d.col)
+            {
+                continue;
+            }
+            hits.push(d);
+        }
+    }
+    Ok(hits)
 }
 
 fn hit_to_json(h: &Hit) -> HitJson<'_> {

@@ -2,8 +2,8 @@ import * as vscode from 'vscode';
 import * as inspector from 'node:inspector';
 import * as path from 'node:path';
 import WebSocket from 'ws';
-import { IndexManager } from './indexManager';
-import type { SidecarHit, SidecarLanguage } from './sidecar';
+import { IndexManager, IndexStatus } from './indexManager';
+import type { SidecarHit, SidecarKind, SidecarLanguage } from './sidecar';
 
 const log = vscode.window.createOutputChannel('IntelliSense Recursion', { log: true });
 
@@ -409,6 +409,22 @@ function resolveInBackground(
         for (const pt of findTypeNames(previewCode)) { lastPreviewLocations.set(pt, previewLoc); }
         const result = { preview, location: previewLoc, defUri: def.uri, defDoc };
         defCacheSet(cacheKey, result);
+        // Promote the LSP-resolved location into the sidecar's discovery
+        // cache so future lookups for `typeName` from anywhere in the
+        // session can short-circuit the LSP path (which costs ~1.5s on
+        // pylance backpressure). Best-effort; sidecar invalidates on any
+        // edit to this file. Kind is a heuristic — type-shaped names skew
+        // class, anything else falls back to function.
+        if (indexManager && isSupportedFsPath(def.uri.fsPath)) {
+          const kind: SidecarKind = TYPE_SHAPED_NAME.test(typeName) ? 'class' : 'function';
+          void indexManager.addDiscovery(
+            typeName,
+            def.uri.fsPath,
+            def.range.start.line + 1,
+            def.range.start.character + 1,
+            kind,
+          );
+        }
         log.info(`[bg]   "${typeName}" → def ${relPath}:${startLine + 1} (${Date.now() - t0}ms)`);
         return result;
       }
@@ -594,8 +610,96 @@ function schedulePrefetch(doc: vscode.TextDocument | undefined) {
   }, PREFETCH_DEBOUNCE_MS);
 }
 
+/**
+ * Drop every in-memory hover-side cache. Called by the hard-rebuild path so a
+ * user reaching for "Rebuild (Clear Cache)" actually gets a clean slate —
+ * stale defCache / posPreviewCache entries can otherwise mask a freshly
+ * rebuilt index.
+ */
+function clearAllExtensionCaches() {
+  defCache.clear();
+  posPreviewCache.clear();
+  clickNegCache.clear();
+  prefetchedDocs.clear();
+  lastPreviewLocations.clear();
+}
+
+/**
+ * Run a rebuild with a progress notification. Soft rebuild keeps the existing
+ * index file (atomic swap on success); hard rebuild deletes it first and
+ * also wipes every per-file cache the extension owns.
+ */
+async function runRebuild(opts: { hard: boolean }) {
+  if (!indexManager) {
+    vscode.window.showWarningMessage('IR: sidecar not available');
+    return;
+  }
+  const title = opts.hard
+    ? 'IR: rebuilding symbol index (clearing cache)…'
+    : 'IR: rebuilding symbol index…';
+  await vscode.window.withProgress(
+    { location: vscode.ProgressLocation.Notification, title, cancellable: false },
+    async () => {
+      if (opts.hard) { clearAllExtensionCaches(); }
+      try {
+        await indexManager!.rebuildNow({ hard: opts.hard });
+      } catch (err) {
+        vscode.window.showErrorMessage(`IR: rebuild failed — ${err}`);
+        return;
+      }
+      const s = indexManager!.currentStatus();
+      if (s.kind === 'ready') {
+        vscode.window.setStatusBarMessage(
+          `IR: rebuilt (${s.symbols.toLocaleString()} symbols)`,
+          4_000,
+        );
+      } else if (s.kind === 'failed') {
+        vscode.window.showWarningMessage(`IR: rebuild ended in failed state — ${s.reason}`);
+      }
+    },
+  );
+}
+
+/**
+ * Status bar: reflects the index manager's lifecycle. Click invokes a soft
+ * rebuild; the (Clear Cache) variant lives only in the Command Palette to
+ * avoid foot-guns.
+ */
+function setupStatusBar(context: vscode.ExtensionContext, im: IndexManager) {
+  const item = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
+  item.command = 'intellisenseRecursion.rebuildIndex';
+
+  const render = (s: IndexStatus) => {
+    switch (s.kind) {
+      case 'idle':
+        item.text = '$(database) IR: idle';
+        item.tooltip = 'IntelliSense Recursion — idle. Click to rebuild.';
+        break;
+      case 'building':
+        item.text = '$(sync~spin) IR: building';
+        item.tooltip = 'IntelliSense Recursion — building symbol index…';
+        break;
+      case 'ready': {
+        const rootSummary = s.roots.map((r) => r.tag).join(', ') || 'project';
+        item.text = `$(database) IR: ${s.symbols.toLocaleString()}`;
+        item.tooltip = `IntelliSense Recursion — ${s.files.toLocaleString()} files, ${s.symbols.toLocaleString()} symbols (${rootSummary}). Click to rebuild.`;
+        break;
+      }
+      case 'failed':
+        item.text = '$(warning) IR: failed';
+        item.tooltip = `IntelliSense Recursion — ${s.reason}. Click to rebuild.`;
+        break;
+    }
+  };
+
+  render(im.currentStatus());
+  item.show();
+  context.subscriptions.push(item, im.onStatusChange(render));
+}
+
 export async function activate(context: vscode.ExtensionContext) {
-  log.info('Extension activating...');
+  const version = (context.extension?.packageJSON?.version as string | undefined) ?? 'unknown';
+  log.info(`IntelliSense Recursion v${version} activating...`);
 
   // Rust sidecar: non-blocking; if it fails we continue with LSP-only path.
   indexManager = new IndexManager(context.extensionPath, context.globalStorageUri.fsPath, {
@@ -604,6 +708,7 @@ export async function activate(context: vscode.ExtensionContext) {
   });
   if (indexManager.isAvailable()) {
     indexManager.registerWatchers(context);
+    setupStatusBar(context, indexManager);
     indexManager.start().catch((err) => log.warn(`[ir] start error: ${err}`));
   } else {
     log.info('[ir] sidecar unavailable; running in LSP-only mode');
@@ -617,12 +722,9 @@ export async function activate(context: vscode.ExtensionContext) {
       hoverPatchActive,
       hoverRecursionDepth,
     })),
-    vscode.commands.registerCommand('intellisenseRecursion.rebuildIndex', async () => {
-      if (!indexManager) { vscode.window.showWarningMessage('IR: sidecar not available'); return; }
-      vscode.window.showInformationMessage('IR: rebuilding symbol index...');
-      await indexManager.rebuildNow();
-      vscode.window.showInformationMessage('IR: rebuild complete');
-    }),
+    vscode.commands.registerCommand('intellisenseRecursion.rebuildIndex', () =>
+      runRebuild({ hard: true }),
+    ),
     // Invalidate caches when documents are saved (content may have changed)
     vscode.workspace.onDidSaveTextDocument(savedDoc => {
       const prefix = savedDoc.uri.fsPath + ':';
@@ -662,7 +764,7 @@ export async function activate(context: vscode.ExtensionContext) {
   // only for hover drill-down rendering, and even brief global prototype
   // hooks can be felt as VS Code UI lag if they run during normal editing.
 
-  log.info('Extension activated');
+  log.info(`IntelliSense Recursion v${version} activated`);
 }
 
 // ── V8 Inspector: extract shared ExtHostLanguageFeatures ──

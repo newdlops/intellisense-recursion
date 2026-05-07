@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "codeidx": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "/Users/lky/project/intellij-styled-search/out/codeidxMcpCli.js",
+        "stdio",
+        "--workspace",
+        "/Users/lky/project/intellisense-recursion"
+      ]
+    }
+  }
+}

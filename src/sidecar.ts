@@ -188,6 +188,58 @@ export class IndexSidecar {
     try { await this.send('ping'); return true; } catch { return false; }
   }
 
+  /**
+   * Replace the in-memory overlay for `path` with `source`. The sidecar
+   * re-parses immediately. Returns the symbol count (informational; 0 is
+   * legitimate for a file that parses to no top-level symbols, and the
+   * overlay is still recorded so base hits for this path stay shadowed).
+   */
+  async updateFile(path: string, source: string): Promise<number> {
+    const resp = await this.send<{ symbols: number }>('update_file', { path, source });
+    return resp.symbols ?? 0;
+  }
+
+  /** Drop the overlay for `path`, exposing base-index hits for it again. */
+  async clearFile(path: string): Promise<boolean> {
+    const resp = await this.send<{ cleared: boolean }>('clear_file', { path });
+    return !!resp.cleared;
+  }
+
+  /**
+   * Record a definition discovered via LSP fallback. Future lookups for
+   * `name` will receive this as a hit alongside base/overlay results,
+   * letting us short-circuit the LSP path. Returns true when the entry was
+   * stored (false when `path` falls outside every indexed root).
+   */
+  async addDiscovery(
+    name: string,
+    path: string,
+    line: number,
+    col: number,
+    kind?: SidecarKind,
+  ): Promise<boolean> {
+    const resp = await this.send<{ stored: boolean }>('add_discovery', {
+      name,
+      path,
+      line,
+      col,
+      kind,
+    });
+    return !!resp.stored;
+  }
+
+  /**
+   * Drop every discovery entry pointing at `path`. Useful when the extension
+   * detects a structural change that makes prior LSP locations stale.
+   */
+  async clearDiscoveriesForPath(path: string): Promise<number> {
+    const resp = await this.send<{ removed: number }>(
+      'clear_discoveries_for_path',
+      { path },
+    );
+    return resp.removed ?? 0;
+  }
+
   isRunning(): boolean {
     return !!this.proc && !this.proc.killed && !this.proc.stdin.destroyed;
   }
