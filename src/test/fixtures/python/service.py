@@ -1,5 +1,5 @@
 from typing import Any, Optional
-from models import User, Company, Stakeholder, BaseModel, AdminUser, AuditModel
+from models import User, Company, Stakeholder, BaseModel, AdminUser, AuditModel, LargeHoverModel
 
 
 def create_user(name: str, email: str) -> User:
@@ -17,6 +17,11 @@ def get_company_stakeholders(company: Company) -> list[Stakeholder]:
 
 def process_model(model: BaseModel) -> None:
     """Process any base model."""
+    model.save()
+
+
+def process_large(model: LargeHoverModel) -> None:
+    """Process large hover model."""
     model.save()
 
 

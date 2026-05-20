@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 'use strict';
-const cli = "/Users/lky/.vscode/extensions/newdlops.intellij-styled-search-0.1.706/out/codeidxMcpCli.js";
+const cli = "/Users/lky/.vscode/extensions/newdlops.intellij-styled-search-0.1.707/out/codeidxMcpCli.js";
 try {
   require(cli);
 } catch (err) {

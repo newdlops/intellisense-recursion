@@ -58,6 +58,7 @@ function languageOf(fsPath: string): SidecarLanguage | undefined {
 // (snake_case, starts lowercase) stay on the LSP path because the sidecar
 // doesn't index parameters or local variables.
 const TYPE_SHAPED_NAME = /^[A-Z_][A-Za-z0-9_]*$/;
+const CONSTANT_SHAPED_NAME = /^_*[A-Z][A-Z0-9_]*$/;
 
 /**
  * True when the sidecar has full-library coverage AND returns zero hits for
@@ -77,6 +78,7 @@ async function sidecarDefinitivelyMissing(
 ): Promise<boolean> {
   if (!indexManager?.hasFullCoverage()) { return false; }
   if (!TYPE_SHAPED_NAME.test(typeName)) { return false; }
+  if (CONSTANT_SHAPED_NAME.test(typeName)) { return false; }
   const language = languageOf(originFsPath);
   if (!language) { return false; }
   // Applies to Python (.venv + stdlib + typeshed covered) and TypeScript
@@ -647,7 +649,7 @@ function rememberPreviewLocations(
     uri,
     new vscode.Range(preview.definitionLine, 0, preview.endLine, 0),
   );
-  lastPreviewLocations.set(typeName, previewLoc);
+  cappedPreviewLocationSet(lastPreviewLocations, typeName, previewLoc);
 
   const seen = new Set<string>([typeName]);
   const lineTexts = preview.code.split('\n');
@@ -660,10 +662,10 @@ function rememberPreviewLocations(
         uri,
         new vscode.Range(absLine, decl.index, absLine, decl.index + decl.id.length),
       );
-      lastPreviewDeclarationLocations.set(decl.id, loc);
+      cappedPreviewLocationSet(lastPreviewDeclarationLocations, decl.id, loc);
       if (!seen.has(decl.id)) {
         seen.add(decl.id);
-        lastPreviewLocations.set(decl.id, loc);
+        cappedPreviewLocationSet(lastPreviewLocations, decl.id, loc);
       }
     }
     const ids = lineText.matchAll(/\b[A-Za-z_]\w*\b/g);
@@ -671,7 +673,8 @@ function rememberPreviewLocations(
       const id = match[0];
       if (seen.has(id) || SKIP_WORDS.has(id) || id.length <= 2 || match.index === undefined) { continue; }
       seen.add(id);
-      lastPreviewLocations.set(
+      cappedPreviewLocationSet(
+        lastPreviewLocations,
         id,
         new vscode.Location(uri, new vscode.Range(absLine, match.index, absLine, match.index + id.length)),
       );
@@ -786,11 +789,15 @@ async function buildResultFromFastHit(
   }
 }
 
+const PREVIEW_LOCATION_MAX_SIZE = 1_000;
 const lastPreviewLocations = new Map<string, vscode.Location>();
 const lastPreviewDeclarationLocations = new Map<string, vscode.Location>();
 let lastHoverDocUri = '';
 let hoverRecursionDepth = 0;
 let reinjectTimer: ReturnType<typeof setInterval> | undefined;
+let rendererReconnectTimer: ReturnType<typeof setTimeout> | undefined;
+let rendererInjectInFlight: Promise<void> | null = null;
+let extensionDeactivated = false;
 let lastClickId = '';
 let lastClickTime = 0;
 // A new click aborts an in-flight click via this controller.
@@ -799,6 +806,57 @@ let hoverPatchActive = false;
 // Current main-process CDP WebSocket, tracked so reconnect cleanup only
 // clears the listener that originally owned the socket.
 let mainWsRef: WebSocket | null = null;
+
+function cappedPreviewLocationSet(map: Map<string, vscode.Location>, key: string, value: vscode.Location) {
+  if (map.has(key)) { map.delete(key); }
+  while (map.size >= PREVIEW_LOCATION_MAX_SIZE) {
+    const first = map.keys().next().value;
+    if (first === undefined) { break; }
+    map.delete(first);
+  }
+  map.set(key, value);
+}
+
+function cappedPreviewLocationGet(map: Map<string, vscode.Location>, key: string): vscode.Location | undefined {
+  const value = map.get(key);
+  if (!value) { return undefined; }
+  map.delete(key);
+  map.set(key, value);
+  return value;
+}
+
+function clearRendererReconnectTimer() {
+  if (rendererReconnectTimer) {
+    clearTimeout(rendererReconnectTimer);
+    rendererReconnectTimer = undefined;
+  }
+}
+
+function closeMainWebSocket() {
+  const ws = mainWsRef;
+  mainWsRef = null;
+  if (!ws) { return; }
+  try { ws.removeAllListeners(); } catch {}
+  try { ws.close(); } catch {}
+}
+
+function scheduleRendererReconnect() {
+  if (extensionDeactivated || rendererReconnectTimer) { return; }
+  rendererReconnectTimer = setTimeout(() => {
+    rendererReconnectTimer = undefined;
+    if (extensionDeactivated) { return; }
+    log.info('[listen] Attempting CDP reconnect...');
+    runRendererInjection(injectRenderer).catch(err => log.error(`[listen] Reconnect failed: ${err}`));
+  }, 2000);
+}
+
+async function runRendererInjection(fn: () => Promise<void>): Promise<void> {
+  if (rendererInjectInFlight) { return rendererInjectInFlight; }
+  rendererInjectInFlight = fn().finally(() => {
+    rendererInjectInFlight = null;
+  });
+  return rendererInjectInFlight;
+}
 
 // "Page-transition" state: when set, the next $provideHover call (within
 // the time window) returns this markdown as its only content instead of
@@ -809,6 +867,7 @@ let mainWsRef: WebSocket | null = null;
 interface PendingPreviewHover {
   identifier: string;
   contents: any[];   // vscode.Hover['contents']-shaped array
+  range?: any;
   expiresAt: number;
 }
 let pendingPreviewHover: PendingPreviewHover | null = null;
@@ -837,6 +896,7 @@ interface PreviewState {
   identifier: string;
   markdown: string;          // raw drill-down body, no back link prepended
   anchor: { uri: vscode.Uri; line: number; character: number };
+  anchorRange?: vscode.Range;
 }
 const previewHistory: PreviewState[] = [];
 let currentPreviewState: PreviewState | null = null;
@@ -916,8 +976,10 @@ const HOVER_DOC_SCAN_MAX_LINES = 5_000;
 const BG_RESOLVE_DEF_TIMEOUT_MS = 1_500;
 // Hover fallback can pull docstrings over the wire; allow a bit more headroom.
 const BG_RESOLVE_HOVER_TIMEOUT_MS = 2_000;
+const IR_DIRECT_HOVER_MARKER = '<!--ir-direct-hover-->';
 
 const inflightResolves = new Map<string, Promise<DefCacheEntry['result']>>();
+let internalHoverProviderRequestDepth = 0;
 
 function withTimeout<T>(p: Thenable<T>, ms: number, label: string): Promise<T> {
   return new Promise<T>((resolve, reject) => {
@@ -1018,7 +1080,9 @@ function resolveInBackground(
         // edit to this file. Kind is a heuristic — type-shaped names skew
         // class, anything else falls back to function.
         if (indexManager && isSupportedFsPath(def.uri.fsPath)) {
-          const kind: SidecarKind = TYPE_SHAPED_NAME.test(typeName) ? 'class' : 'function';
+          const kind: SidecarKind = CONSTANT_SHAPED_NAME.test(typeName)
+            ? 'variable'
+            : TYPE_SHAPED_NAME.test(typeName) ? 'class' : 'function';
           void indexManager.addDiscovery(
             typeName,
             def.uri.fsPath,
@@ -1033,11 +1097,17 @@ function resolveInBackground(
 
       // Hover fallback
       try {
-        const hovers = await withTimeout(
-          vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', matchUri, pos),
-          BG_RESOLVE_HOVER_TIMEOUT_MS,
-          'hoverProvider',
-        );
+        let hovers: vscode.Hover[] | undefined;
+        internalHoverProviderRequestDepth++;
+        try {
+          hovers = await withTimeout(
+            vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', matchUri, pos),
+            BG_RESOLVE_HOVER_TIMEOUT_MS,
+            'hoverProvider',
+          );
+        } finally {
+          internalHoverProviderRequestDepth--;
+        }
         if (hovers?.length) {
           const hoverParts: string[] = [];
           for (const h of hovers) {
@@ -1052,8 +1122,10 @@ function resolveInBackground(
           if (hoverParts.length > 0) {
             const preview = `\`${typeName}\` — *doc*\n${hoverParts.join('\n')}`;
             const hoverLoc = new vscode.Location(matchUri, new vscode.Range(pos, pos));
-            lastPreviewLocations.set(typeName, hoverLoc);
-            for (const ht of findTypeNames(hoverParts.join('\n'))) { lastPreviewLocations.set(ht, hoverLoc); }
+            cappedPreviewLocationSet(lastPreviewLocations, typeName, hoverLoc);
+            for (const ht of findTypeNames(hoverParts.join('\n'))) {
+              cappedPreviewLocationSet(lastPreviewLocations, ht, hoverLoc);
+            }
             const result = { preview, location: hoverLoc, defUri: matchUri };
             defCacheSet(cacheKey, result);
             log.info(`[bg]   "${typeName}" → hover fallback ok (${Date.now() - t0}ms)`);
@@ -1175,6 +1247,115 @@ function extractPrefetchTokens(doc: vscode.TextDocument): Array<{ name: string; 
     .sort((a, b) => b[1].count - a[1].count)
     .slice(0, PREFETCH_MAX_TOKENS)
     .map(([name, v]) => ({ name, pos: v.pos }));
+}
+
+interface HoverWordCandidate {
+  name: string;
+  anchor: vscode.Position;
+  range: vscode.Range;
+}
+
+function isCallableHoverContext(doc: vscode.TextDocument, range: vscode.Range): boolean {
+  const line = doc.lineAt(range.start.line).text;
+  const before = line.slice(Math.max(0, range.start.character - 48), range.start.character);
+  const after = line.slice(range.end.character, Math.min(line.length, range.end.character + 32));
+  if (/(?:^|\s)(?:async\s+)?def\s+$/.test(before)) { return true; }
+  if (/(?:^|\s)(?:export\s+)?(?:async\s+)?function\s+$/.test(before)) { return true; }
+  if (/^\s*\(/.test(after)) { return true; }
+  return false;
+}
+
+function hoverWordCandidateAt(
+  doc: vscode.TextDocument | undefined,
+  position: vscode.Position,
+): HoverWordCandidate | null {
+  if (!doc) { return null; }
+  const range = doc.getWordRangeAtPosition(position, /[A-Za-z_$][\w$]*/);
+  if (!range) { return null; }
+  const name = doc.getText(range);
+  if (!name || name.length <= 2 || SKIP_WORDS.has(name)) { return null; }
+  if (TYPE_SHAPED_NAME.test(name) || CONSTANT_SHAPED_NAME.test(name)) {
+    return { name, anchor: range.start, range };
+  }
+  if (/^[a-z_$][\w$]*$/.test(name) && (name.includes('_') || isCallableHoverContext(doc, range))) {
+    return { name, anchor: range.start, range };
+  }
+  return null;
+}
+
+function fullWordRangeAt(
+  doc: vscode.TextDocument | undefined,
+  position: vscode.Position,
+): vscode.Range | undefined {
+  if (!doc) { return undefined; }
+  return doc.getWordRangeAtPosition(position, /[A-Za-z_$][\w$]*/) ?? undefined;
+}
+
+function internalRangeFromVsCode(range: vscode.Range | undefined): any | undefined {
+  if (!range) { return undefined; }
+  return {
+    startLineNumber: range.start.line + 1,
+    startColumn: range.start.character + 1,
+    endLineNumber: range.end.line + 1,
+    endColumn: range.end.character + 1,
+  };
+}
+
+function internalFullWordRangeAt(
+  doc: vscode.TextDocument | undefined,
+  position: vscode.Position,
+): any | undefined {
+  return internalRangeFromVsCode(fullWordRangeAt(doc, position));
+}
+
+function declarationLineContainsIdentifier(doc: vscode.TextDocument, line: number, identifier: string): boolean {
+  if (line < 0 || line >= doc.lineCount) { return false; }
+  return declarationIdentifiersInLine(doc.lineAt(line).text).some(decl => decl.id === identifier);
+}
+
+function shouldDirectHoverCandidate(name: string): boolean {
+  return CONSTANT_SHAPED_NAME.test(name) || !TYPE_SHAPED_NAME.test(name);
+}
+
+function markdownStringForDirectHover(preview: string): vscode.MarkdownString {
+  const md = new vscode.MarkdownString(`${IR_DIRECT_HOVER_MARKER}\n${preview}`, true);
+  md.isTrusted = true;
+  md.supportThemeIcons = true;
+  return md;
+}
+
+async function provideBroadSymbolHover(
+  doc: vscode.TextDocument,
+  position: vscode.Position,
+  token: vscode.CancellationToken,
+): Promise<vscode.Hover | null> {
+  if (internalHoverProviderRequestDepth > 0) { return null; }
+  if (!isCodeDoc(doc)) { return null; }
+  const candidate = hoverWordCandidateAt(doc, position);
+  if (!candidate || !shouldDirectHoverCandidate(candidate.name)) { return null; }
+
+  const cacheKey = defCacheKey(doc.uri, candidate.anchor, candidate.name);
+  let result: DefCacheEntry['result'] | null = null;
+
+  if (declarationLineContainsIdentifier(doc, candidate.anchor.line, candidate.name)) {
+    result = buildDefinitionPreviewResult(candidate.name, doc.uri, doc, candidate.anchor.line);
+    defCacheSet(cacheKey, result);
+    cappedPreviewLocationSet(lastPreviewLocations, candidate.name, result.location);
+  } else {
+    const cached = defCacheGet(cacheKey);
+    if (cached) {
+      result = cached.result;
+    } else {
+      result = await resolveInBackground(candidate.name, doc.uri, candidate.anchor, cacheKey, 'hover');
+    }
+  }
+
+  if (token.isCancellationRequested || !result?.preview) { return null; }
+  log.info(`[directHover] "${candidate.name}" → md=${result.preview.length}`);
+  return new vscode.Hover(
+    markdownStringForDirectHover(result.preview),
+    candidate.range,
+  );
 }
 
 function schedulePrefetch(doc: vscode.TextDocument | undefined) {
@@ -1381,7 +1562,27 @@ function setupStatusBar(context: vscode.ExtensionContext, im: IndexManager) {
   context.subscriptions.push(item, im.onStatusChange(render));
 }
 
+const BROAD_SYMBOL_HOVER_SELECTOR: vscode.DocumentSelector = [
+  { scheme: 'file', language: 'python' },
+  { scheme: 'file', language: 'typescript' },
+  { scheme: 'file', language: 'typescriptreact' },
+  { scheme: 'file', language: 'javascript' },
+  { scheme: 'file', language: 'javascriptreact' },
+  { scheme: 'file', language: 'java' },
+  { scheme: 'file', language: 'c' },
+  { scheme: 'file', language: 'cpp' },
+  { scheme: 'file', language: 'csharp' },
+  { scheme: 'file', language: 'go' },
+  { scheme: 'file', language: 'rust' },
+  { scheme: 'file', language: 'ruby' },
+  { scheme: 'file', language: 'php' },
+  { scheme: 'file', language: 'swift' },
+  { scheme: 'file', language: 'kotlin' },
+  { scheme: 'file', language: 'dart' },
+];
+
 export async function activate(context: vscode.ExtensionContext) {
+  extensionDeactivated = false;
   const version = (context.extension?.packageJSON?.version as string | undefined) ?? 'unknown';
   log.info(`IntelliSense Recursion v${version} activating...`);
 
@@ -1405,10 +1606,26 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('intellisenseRecursion.getPatchStatus', () => ({
       hoverPatchActive,
       hoverRecursionDepth,
+      currentPreviewIdentifier: currentPreviewState?.identifier ?? null,
+      currentPreviewMarkdown: currentPreviewState?.markdown ?? '',
+      pendingPreviewIdentifier: pendingPreviewHover?.identifier ?? null,
+      previewHistoryLength: previewHistory.length,
+      previewHistoryIdentifiers: previewHistory.map(state => state.identifier),
+      lastHoverFetchPosition: lastHoverFetchPosition
+        ? {
+            uri: lastHoverFetchPosition.uri.toString(),
+            line: lastHoverFetchPosition.line,
+            character: lastHoverFetchPosition.character,
+          }
+        : null,
     })),
     vscode.languages.registerDefinitionProvider(
       [{ language: 'python', scheme: 'file' }, { language: 'python', scheme: 'untitled' }],
       { provideDefinition: providePythonDefinitionFallback },
+    ),
+    vscode.languages.registerHoverProvider(
+      BROAD_SYMBOL_HOVER_SELECTOR,
+      { provideHover: provideBroadSymbolHover },
     ),
     vscode.commands.registerCommand('intellisenseRecursion.rebuildIndex', () =>
       runRebuild({ hard: true }),
@@ -1434,6 +1651,15 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
   );
 
+  if (context.extensionMode === vscode.ExtensionMode.Test) {
+    context.subscriptions.push(
+      vscode.commands.registerCommand(
+        'intellisenseRecursion.runHoverRendererHarnessForTests',
+        runHoverRendererHarnessForTests,
+      ),
+    );
+  }
+
   // Prefetch current active editor on startup
   schedulePrefetch(vscode.window.activeTextEditor?.document);
 
@@ -1452,8 +1678,10 @@ export async function activate(context: vscode.ExtensionContext) {
   if (process.env.IR_SKIP_RENDERER_INJECTION === '1') {
     log.info('[inject] Renderer injection disabled by IR_SKIP_RENDERER_INJECTION');
   } else {
-    await injectRenderer();
-    reinjectTimer = setInterval(() => { reinjectRenderer().catch(() => {}); }, 60000);
+    await runRendererInjection(injectRenderer);
+    reinjectTimer = setInterval(() => {
+      runRendererInjection(reinjectRenderer).catch(() => {});
+    }, 60000);
   }
 
   // Do not arm renderer prototype capture on activation. Capture is useful
@@ -1523,15 +1751,44 @@ function patchSharedService(service: any) {
   const original = service.$provideHover;
 
   // Helper: attach previews string to the first stringy content block.
-  function attachPreviews(res: any, previews: string): any {
+  function attachPreviews(res: any, previews: string, position: any, hoverRange?: any): any {
+    const ln = position?.lineNumber !== undefined ? position.lineNumber : (position?.line !== undefined ? position.line + 1 : 1);
+    const col = position?.column !== undefined ? position.column : (position?.character !== undefined ? position.character + 1 : 1);
+    const range = hoverRange ?? { startLineNumber: ln, startColumn: col, endLineNumber: ln, endColumn: col };
+    if (!res?.contents?.length) {
+      return {
+        contents: [{ value: previews, isTrusted: true, supportThemeIcons: true }],
+        range,
+      };
+    }
     const newContents = [...res.contents];
+    let attached = false;
     for (let ci = 0; ci < newContents.length; ci++) {
       if (newContents[ci]?.value && typeof newContents[ci].value === 'string') {
         newContents[ci] = { ...newContents[ci], value: newContents[ci].value + '\n\n---\n' + previews };
+        attached = true;
         break;
       }
     }
-    return { ...res, contents: newContents };
+    if (!attached) {
+      newContents.push({ value: previews, isTrusted: true, supportThemeIcons: true });
+    }
+    return { ...res, contents: newContents, range: hoverRange ?? res.range };
+  }
+
+  function hoverResultText(res: any): string {
+    const parts: string[] = [];
+    for (const content of (res?.contents || [])) {
+      if (typeof content === 'string') { parts.push(content); }
+      else if (content?.value && typeof content.value === 'string') { parts.push(content.value); }
+    }
+    return parts.join('\n');
+  }
+
+  function nativeHoverHasClassLikeSource(res: any, typeName: string): boolean {
+    if (!TYPE_SHAPED_NAME.test(typeName)) { return false; }
+    const text = hoverResultText(res);
+    return new RegExp(`\\b(?:class|interface|enum|struct|type)\\s+${esc(typeName)}\\b`).test(text);
   }
 
   service.$provideHover = async function (handle: number, uri: any, position: any, context: any, token: any) {
@@ -1566,9 +1823,10 @@ function patchSharedService(service: any) {
       log.info(`[hover] page-transition handle=${handle} → "${preview.identifier}"`);
       const ln = position?.lineNumber !== undefined ? position.lineNumber : (position?.line !== undefined ? position.line + 1 : 1);
       const col = position?.column !== undefined ? position.column : (position?.character !== undefined ? position.character + 1 : 1);
+      const pointRange = { startLineNumber: ln, startColumn: col, endLineNumber: ln, endColumn: col };
       return {
         contents: preview.contents,
-        range: { startLineNumber: ln, startColumn: col, endLineNumber: ln, endColumn: col },
+        range: preview.range ?? pointRange,
       };
     }
     // Suppression branch: parallel handles in the same showHover fanout
@@ -1588,25 +1846,55 @@ function patchSharedService(service: any) {
       currentPreviewState = null;
     }
 
-    const result = await original.call(this, handle, uri, position, context, token);
-    const postNativeT0 = Date.now();
-    if (!result?.contents?.length) { return result; }
-    if (hoverRecursionDepth > 1) { return result; }
-
     // Canonical position key (0-based, stable across internal vs API shapes)
     const apiLine = position?.lineNumber !== undefined ? position.lineNumber - 1 : (position?.line ?? 0);
     const apiChar = position?.column !== undefined ? position.column - 1 : (position?.character ?? 0);
     const posKey = `${uri?.path || uri}:${apiLine}:${apiChar}`;
+    const docUriStr = uri?.scheme ? `${uri.scheme}://${uri.authority || ''}${uri.path}` : String(uri);
+    const docUri = vscode.Uri.parse(docUriStr);
+    const hoverApiPos = new vscode.Position(apiLine, apiChar);
+    const hoverDocForCandidate = findOpenDoc(docUri);
+    const hoveredCandidate = hoverWordCandidateAt(hoverDocForCandidate, hoverApiPos);
+    const hoveredInternalRange = hoveredCandidate
+      ? internalRangeFromVsCode(hoveredCandidate.range)
+      : internalFullWordRangeAt(hoverDocForCandidate, hoverApiPos);
 
-    // Extract types from code fences
+    const result = await original.call(this, handle, uri, position, context, token);
+    const postNativeT0 = Date.now();
+    if (hoverResultText(result).includes(IR_DIRECT_HOVER_MARKER)) { return result; }
+    if (!result?.contents?.length && !hoveredCandidate) { return result; }
+    if (hoverRecursionDepth > 1) { return result; }
+
+    // Prefer the exact word under the cursor, then supplement with type names
+    // discovered in native hover code fences. This covers symbols where the
+    // language server has definition data but no hover text.
+    const skipDirectClassPreview = hoveredCandidate
+      ? nativeHoverHasClassLikeSource(result, hoveredCandidate.name)
+      : false;
+    const directCandidateNeedsFallback = hoveredCandidate
+      ? shouldDirectHoverCandidate(hoveredCandidate.name)
+      : false;
     const types: string[] = [];
-    for (const content of result.contents) {
+    if (hoveredCandidate && directCandidateNeedsFallback && !skipDirectClassPreview) {
+      types.push(hoveredCandidate.name);
+    }
+    for (const content of (result?.contents || [])) {
       if (!content || typeof content.value !== 'string') { continue; }
-      const fence = content.value.match(/```\w*\n?([\s\S]*?)```/);
-      if (fence) { types.push(...findTypeNames(fence[1].trim())); }
+      const fences = content.value.matchAll(/```\w*\n?([\s\S]*?)```/g);
+      for (const fence of fences) {
+        if (!fence[1]) { continue; }
+        for (const name of findTypeNames(fence[1].trim())) {
+          if (skipDirectClassPreview && hoveredCandidate?.name === name) { continue; }
+          types.push(name);
+        }
+      }
     }
     const uniqueTypes = [...new Set(types)];
-    if (uniqueTypes.length === 0) { return result; }
+    if (uniqueTypes.length === 0) {
+      return hoveredInternalRange && result?.contents?.length
+        ? { ...result, range: hoveredInternalRange }
+        : result;
+    }
 
     const hoverMs = () => `${Date.now() - hoverT0}ms`;
     const postNativeMs = () => `${Date.now() - postNativeT0}ms`;
@@ -1618,7 +1906,7 @@ function patchSharedService(service: any) {
     const cachedPreviews = posPreviewGet(posKey, typesKey);
     if (cachedPreviews) {
       log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} POS-CACHE hit (${hoverMs()})`);
-      return attachPreviews(result, cachedPreviews);
+      return attachPreviews(result, cachedPreviews, position, hoveredInternalRange);
     }
 
     // (E) In-flight preview dedup — share work with other handles called
@@ -1631,7 +1919,7 @@ function patchSharedService(service: any) {
       });
       if (computed) {
         log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} INFLIGHT attached (${hoverMs()}, post=${postNativeMs()})`);
-        return attachPreviews(result, computed.previews);
+        return attachPreviews(result, computed.previews, position, hoveredInternalRange);
       }
       log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} INFLIGHT empty (${hoverMs()}, post=${postNativeMs()})`);
       return result;
@@ -1639,13 +1927,11 @@ function patchSharedService(service: any) {
 
     log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} types=[${uniqueTypes.join(',')}] (${hoverMs()})`);
 
-    const docUriStr = uri?.scheme ? `${uri.scheme}://${uri.authority || ''}${uri.path}` : String(uri);
     lastHoverDocUri = docUriStr;
 
     // Compute previews and cache. Install promise in inflightHoverPreviews
     // BEFORE awaiting so concurrent handles can share.
     const runCompute = async (): Promise<{ typesKey: string; previews: string } | null> => {
-      const docUri = vscode.Uri.parse(docUriStr);
       const doc = findOpenDoc(docUri);
       if (!doc) {
         // Opening a document can touch disk and parse a large file; never do
@@ -1659,14 +1945,18 @@ function patchSharedService(service: any) {
 
       // (C) Smart anchor — if the word under the cursor is itself a PascalCase
       // identifier, we can skip the full docText regex scan for it.
-      const hoverApiPos = new vscode.Position(apiLine, apiChar);
       let hoveredWord = '';
       let hoveredAnchor: vscode.Position | undefined;
       try {
-        const wr = hoverDoc.getWordRangeAtPosition(hoverApiPos);
-        if (wr) {
-          hoveredWord = hoverDoc.getText(wr);
-          hoveredAnchor = wr.start;
+        if (hoveredCandidate) {
+          hoveredWord = hoveredCandidate.name;
+          hoveredAnchor = hoveredCandidate.anchor;
+        } else {
+          const wr = hoverDoc.getWordRangeAtPosition(hoverApiPos);
+          if (wr) {
+            hoveredWord = hoverDoc.getText(wr);
+            hoveredAnchor = wr.start;
+          }
         }
       } catch { /* invalid position — fall back to scan */ }
 
@@ -1694,7 +1984,7 @@ function patchSharedService(service: any) {
             const largeCacheKey = defCacheKey(docUri, fallbackPos, typeName);
             const cached = defCacheGet(largeCacheKey);
             if (cached?.result) {
-              lastPreviewLocations.set(typeName, cached.result.location);
+              cappedPreviewLocationSet(lastPreviewLocations, typeName, cached.result.location);
               if (cached.result.defDoc) {
                 resolvedDefDocs.push({ uri: cached.result.defUri, doc: cached.result.defDoc });
               }
@@ -1735,11 +2025,23 @@ function patchSharedService(service: any) {
 
         const cacheKey = defCacheKey(matchUri, pos, typeName);
 
+        if (matchUri.toString() === hoverDoc.uri.toString()
+          && declarationLineContainsIdentifier(hoverDoc, pos.line, typeName)) {
+          const direct = buildDefinitionPreviewResult(typeName, hoverDoc.uri, hoverDoc, pos.line);
+          defCacheSet(cacheKey, direct);
+          cappedPreviewLocationSet(lastPreviewLocations, typeName, direct.location);
+          if (direct.defDoc) {
+            resolvedDefDocs.push({ uri: direct.defUri, doc: direct.defDoc });
+          }
+          log.info(`[hover]   "${typeName}" → direct source declaration lines=${direct.previewLineCount ?? '?'} md=${direct.preview.length} (${Date.now() - typeT0}ms)`);
+          return direct.preview;
+        }
+
         const cached = defCacheGet(cacheKey);
         if (cached) {
           if (cached.result) {
             log.info(`[hover]   "${typeName}" → cached def lines=${cached.result.previewLineCount ?? '?'} md=${cached.result.preview.length} (${Date.now() - typeT0}ms)`);
-            lastPreviewLocations.set(typeName, cached.result.location);
+            cappedPreviewLocationSet(lastPreviewLocations, typeName, cached.result.location);
             if (cached.result.defDoc) {
               resolvedDefDocs.push({ uri: cached.result.defUri, doc: cached.result.defDoc });
             }
@@ -1781,7 +2083,7 @@ function patchSharedService(service: any) {
       if (computed) {
         posPreviewSet(posKey, computed.typesKey, computed.previews);
         log.info(`[hover] done: first-hover preview attached md=${computed.previews.length} (${hoverMs()}, post=${postNativeMs()})`);
-        return attachPreviews(result, computed.previews);
+        return attachPreviews(result, computed.previews, position, hoveredInternalRange);
       }
     } catch (err) {
       log.error(`[hover] compute error: ${err} (${hoverMs()})`);
@@ -1799,6 +2101,8 @@ function patchSharedService(service: any) {
 }
 
 // ── Renderer injection via main process CDP ──
+
+const RENDERER_PATCH_VERSION = 101;
 
 interface ProcessRow {
   pid: number;
@@ -1861,8 +2165,14 @@ function findCurrentVSCodeMainPid(): number | null {
   return null;
 }
 
+function makeRendererEvalExpression(script: string): string {
+  const patchB64 = Buffer.from(script, 'utf8').toString('base64');
+  return `(function(){var bin=atob(${JSON.stringify(patchB64)});var bytes=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++){bytes[i]=bin.charCodeAt(i);}return eval(new TextDecoder('utf-8').decode(bytes));})()`;
+}
+
 async function injectRenderer() {
   try {
+    if (extensionDeactivated) { return; }
     log.info('[inject] Starting renderer injection...');
     const mainPid = findCurrentVSCodeMainPid();
     if (!mainPid) {
@@ -1888,13 +2198,26 @@ async function injectRenderer() {
     await new Promise<void>((resolve) => {
       let msgId = 1;
       let evalMsgId = -1;
+      let done = false;
+      const finish = (keepOpen: boolean) => {
+        if (done) { return; }
+        done = true;
+        clearTimeout(timeout);
+        if (!keepOpen) {
+          try { ws.close(); } catch {}
+        }
+        resolve();
+      };
+      const timeout = setTimeout(() => {
+        log.warn('[inject] timed out waiting for renderer injection result');
+        finish(false);
+      }, 10000);
       ws.on('open', () => {
         // Enable Runtime events & add main-process binding for instant click notification
         ws.send(JSON.stringify({ id: msgId++, method: 'Runtime.enable', params: {} }));
         ws.send(JSON.stringify({ id: msgId++, method: 'Runtime.addBinding', params: { name: 'irClickNotify' } }));
 
-        const patchB64 = Buffer.from(getHoverPatchScript()).toString('base64');
-        const evalExpr = "eval(atob('" + patchB64 + "'))";
+        const evalExpr = makeRendererEvalExpression(getHoverPatchScript());
 
         const injectScript = `
           (async function() {
@@ -1904,6 +2227,48 @@ async function injectRenderer() {
             var BW = require('electron').BrowserWindow;
             var wins = BW.getAllWindows();
             var results = [];
+            function evalSummary(id, r) {
+              if (!r) { return 'skip:' + id + '(no response)'; }
+              if (r.exceptionDetails) {
+                var ex = r.exceptionDetails.exception;
+                var desc = ex && (ex.description || ex.value) || '';
+                return 'eval-exc:' + id + ':' + (r.exceptionDetails.text || '') + ':' + desc;
+              }
+              var rr = r.result || {};
+              return 'skip:' + id + '(value=' + String(rr.value) + ',type=' + String(rr.type) + ',desc=' + String(rr.description || '') + ')';
+            }
+            async function installedVersion(w) {
+              try {
+                var chk = await w.webContents.debugger.sendCommand('Runtime.evaluate', {
+                  expression: 'Number(window.__irPatchVersion)||0',
+                  returnByValue: true
+                });
+                return Number(chk && chk.result && chk.result.value) || 0;
+              } catch(eChk) { return 0; }
+            }
+            async function ensureBinding(w) {
+              try {
+                try { await w.webContents.debugger.sendCommand('Runtime.addBinding', { name: 'irGoToType' }); }
+                catch(eAdd) {
+                  if (!/already|exists|duplicate/i.test(String(eAdd && eAdd.message || eAdd))) { throw eAdd; }
+                }
+                if (!global.__irGoToTypeBridgeListeners) { global.__irGoToTypeBridgeListeners = new Map(); }
+                var prev = global.__irGoToTypeBridgeListeners.get(w.id);
+                if (prev) {
+                  try { w.webContents.debugger.removeListener('message', prev); } catch(eRm) {}
+                }
+                var bridge = function(event, method, params) {
+                  if (method === 'Runtime.bindingCalled' && params.name === 'irGoToType') {
+                    if(typeof global.irClickNotify==='function'){global.irClickNotify(params.payload)}
+                  }
+                };
+                w.webContents.debugger.on('message', bridge);
+                global.__irGoToTypeBridgeListeners.set(w.id, bridge);
+                return 'binding:' + w.id + ':ok';
+              } catch(eb) {
+                return 'binding:' + w.id + ':' + ((eb && eb.message) || eb);
+              }
+            }
             for (var i = 0; i < wins.length; i++) {
               var w = wins[i];
               try {
@@ -1914,27 +2279,23 @@ async function injectRenderer() {
                   catch(eAttach) { results.push('attach-fail:' + w.id + ':' + eAttach.message); continue; }
                 }
                 await w.webContents.debugger.sendCommand('Runtime.enable');
+                var bindingResult = await ensureBinding(w);
                 var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(evalExpr)}, includeCommandLineAPI: true, returnByValue: true });
-                if (r.result && (r.result.value === 'hover patch installed' || r.result.value === 'already patched')) {
-                  results.push('injected:' + w.id + '(' + r.result.value + ')');
-                  try {
-                    await w.webContents.debugger.sendCommand('Runtime.addBinding', { name: 'irGoToType' });
-                    if (!global.__irGoToTypeBridgeListeners) { global.__irGoToTypeBridgeListeners = new Map(); }
-                    var prev = global.__irGoToTypeBridgeListeners.get(w.id);
-                    if (prev) {
-                      try { w.webContents.debugger.removeListener('message', prev); } catch(eRm) {}
-                    }
-                    var bridge = function(event, method, params) {
-                      if (method === 'Runtime.bindingCalled' && params.name === 'irGoToType') {
-                        if(typeof global.irClickNotify==='function'){global.irClickNotify(params.payload)}
-                      }
-                    };
-                    w.webContents.debugger.on('message', bridge);
-                    global.__irGoToTypeBridgeListeners.set(w.id, bridge);
-                    results.push('binding:' + w.id + ':ok');
-                  } catch(eb) { results.push('binding:' + w.id + ':' + eb.message); }
+                var value = r && r.result && r.result.value;
+                var ok = value === 'hover patch installed' || value === 'already patched';
+                if (!ok) {
+                  var version = await installedVersion(w);
+                  if (version >= ${RENDERER_PATCH_VERSION}) {
+                    ok = true;
+                    value = 'postcheck:' + version;
+                  }
+                }
+                if (ok) {
+                  results.push('injected:' + w.id + '(' + value + ')');
+                  results.push(bindingResult);
                 } else {
-                  results.push('skip:' + w.id + '(' + (r.result ? r.result.value : 'no result') + ')');
+                  results.push(evalSummary(w.id, r));
+                  results.push(bindingResult);
                 }
               } catch(e) { results.push('err:' + w.id + ':' + e.message); }
             }
@@ -1946,21 +2307,23 @@ async function injectRenderer() {
         ws.send(JSON.stringify({ id: evalMsgId, method: 'Runtime.evaluate', params: { expression: injectScript, includeCommandLineAPI: true, returnByValue: true, awaitPromise: true } }));
       });
 
-      let done = false;
       ws.on('message', (data: string) => {
         try {
           const resp = JSON.parse(data);
           if (resp.id === evalMsgId && !done) {
-            done = true;
             const val = resp.result?.result?.value;
             if (val) { log.info(`Renderer injection: ${val}`); }
+            if (extensionDeactivated) {
+              finish(false);
+              return;
+            }
             startClickListener(ws);
-            resolve();
+            finish(true);
           }
         } catch {}
       });
-      ws.on('error', () => { resolve(); });
-      setTimeout(() => { resolve(); }, 10000);
+      ws.on('error', () => { finish(false); });
+      ws.on('close', () => { finish(false); });
     });
   } catch (err) {
     log.error(`Renderer injection error: ${err}`);
@@ -1969,6 +2332,7 @@ async function injectRenderer() {
 
 async function reinjectRenderer() {
   try {
+    if (extensionDeactivated) { return; }
     const mainPid = findCurrentVSCodeMainPid();
     if (!mainPid) { return; }
     const targetsJson = await httpGet('http://127.0.0.1:9229/json/list');
@@ -1978,25 +2342,72 @@ async function reinjectRenderer() {
     const ws = new WebSocket(targets[0].webSocketDebuggerUrl);
 
     await new Promise<void>((resolve) => {
+      let done = false;
+      const finish = () => {
+        if (done) { return; }
+        done = true;
+        clearTimeout(timeout);
+        try { ws.close(); } catch {}
+        resolve();
+      };
+      const timeout = setTimeout(() => {
+        log.warn('[inject] re-injection timed out');
+        finish();
+      }, 3000);
       ws.on('open', () => {
-        const patchB64 = Buffer.from(getHoverPatchScript()).toString('base64');
-        const evalExpr = "eval(atob('" + patchB64 + "'))";
+        const evalExpr = makeRendererEvalExpression(getHoverPatchScript());
         const injectScript = `
           (async function() {
             if (process.pid !== ${mainPid}) { return 0; }
             var BW = require('electron').BrowserWindow;
             var wins = BW.getAllWindows();
             var n = 0;
+            async function installedVersion(w) {
+              try {
+                var chk = await w.webContents.debugger.sendCommand('Runtime.evaluate', {
+                  expression: 'Number(window.__irPatchVersion)||0',
+                  returnByValue: true
+                });
+                return Number(chk && chk.result && chk.result.value) || 0;
+              } catch(eChk) { return 0; }
+            }
+            async function ensureBinding(w) {
+              try {
+                try { await w.webContents.debugger.sendCommand('Runtime.addBinding', { name: 'irGoToType' }); }
+                catch(eAdd) {
+                  if (!/already|exists|duplicate/i.test(String(eAdd && eAdd.message || eAdd))) { throw eAdd; }
+                }
+                if (!global.__irGoToTypeBridgeListeners) { global.__irGoToTypeBridgeListeners = new Map(); }
+                var prev = global.__irGoToTypeBridgeListeners.get(w.id);
+                if (prev) {
+                  try { w.webContents.debugger.removeListener('message', prev); } catch(eRm) {}
+                }
+                var bridge = function(event, method, params) {
+                  if (method === 'Runtime.bindingCalled' && params.name === 'irGoToType') {
+                    if(typeof global.irClickNotify==='function'){global.irClickNotify(params.payload)}
+                  }
+                };
+                w.webContents.debugger.on('message', bridge);
+                global.__irGoToTypeBridgeListeners.set(w.id, bridge);
+              } catch(eb) {}
+            }
             for (var i = 0; i < wins.length; i++) {
               try {
+                var w = wins[i];
                 var attached = false;
-                try { attached = wins[i].webContents.debugger.isAttached(); } catch(eIs) {}
+                try { attached = w.webContents.debugger.isAttached(); } catch(eIs) {}
                 if (!attached) {
-                  try { wins[i].webContents.debugger.attach('1.3'); } catch(eAttach) { continue; }
+                  try { w.webContents.debugger.attach('1.3'); } catch(eAttach) { continue; }
                 }
-                await wins[i].webContents.debugger.sendCommand('Runtime.enable');
-                var r = await wins[i].webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(evalExpr)}, includeCommandLineAPI: true, returnByValue: true });
-                if (r.result && r.result.value === 'hover patch installed') n++;
+                await w.webContents.debugger.sendCommand('Runtime.enable');
+                await ensureBinding(w);
+                var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(evalExpr)}, includeCommandLineAPI: true, returnByValue: true });
+                var value = r && r.result && r.result.value;
+                if (value === 'hover patch installed' || value === 'already patched') {
+                  n++;
+                } else if ((await installedVersion(w)) >= ${RENDERER_PATCH_VERSION}) {
+                  n++;
+                }
               } catch(e) {}
             }
             return n;
@@ -2010,20 +2421,25 @@ async function reinjectRenderer() {
           if (resp.id === 1) {
             const n = resp.result?.result?.value;
             if (n && n > 0) { log.info(`Re-injected into ${n} window(s)`); }
-            ws.close();
-            resolve();
+            finish();
           }
         } catch {}
       });
-      ws.on('error', () => { resolve(); });
-      setTimeout(() => { try { ws.close(); } catch {} resolve(); }, 3000);
+      ws.on('error', () => { finish(); });
+      ws.on('close', () => { finish(); });
     });
   } catch {}
 }
 
 function startClickListener(mainWs: any) {
-  log.info('[listen] Click event listener started (binding-driven)');
+  if (mainWsRef && mainWsRef !== mainWs) {
+    closeMainWebSocket();
+  }
+  clearRendererReconnectTimer();
   mainWsRef = mainWs;
+  if (mainWs.__irClickListenerStarted) { return; }
+  mainWs.__irClickListenerStarted = true;
+  log.info('[listen] Click event listener started (binding-driven)');
 
   mainWs.on('message', (data: string) => {
     try {
@@ -2062,15 +2478,303 @@ function startClickListener(mainWs: any) {
   mainWs.on('close', () => {
     log.warn('[listen] CDP WebSocket closed — click listener lost. Will attempt reconnect...');
     if (mainWsRef === mainWs) { mainWsRef = null; }
-    setTimeout(() => {
-      log.info('[listen] Attempting CDP reconnect...');
-      injectRenderer().catch(err => log.error(`[listen] Reconnect failed: ${err}`));
-    }, 2000);
+    scheduleRendererReconnect();
   });
 
   mainWs.on('error', (err: any) => {
     log.warn(`[listen] CDP WebSocket error: ${err}`);
   });
+}
+
+async function cleanupRendererInjection(reason: string): Promise<void> {
+  const ws = mainWsRef;
+  if (!ws || ws.readyState !== WebSocket.OPEN) { return; }
+
+  await new Promise<void>((resolve) => {
+    const requestId = Date.now() % 1_000_000_000;
+    let done = false;
+    const finish = () => {
+      if (done) { return; }
+      done = true;
+      clearTimeout(timeout);
+      try { ws.off('message', onMessage); } catch {}
+      resolve();
+    };
+    const timeout = setTimeout(finish, 1500);
+    const rendererExpr = `try{if(window.__irCleanup){window.__irCleanup(${JSON.stringify(reason)});'ok'}else{'missing'}}catch(e){'err:'+((e&&e.message)||e)}`;
+    const cleanupScript = `
+      (async function() {
+        var BW = require('electron').BrowserWindow;
+        var wins = BW.getAllWindows();
+        var n = 0;
+        for (var i = 0; i < wins.length; i++) {
+          try {
+            var w = wins[i];
+            var attached = false;
+            try { attached = w.webContents.debugger.isAttached(); } catch(eIs) {}
+            if (!attached) {
+              try { w.webContents.debugger.attach('1.3'); } catch(eAttach) { continue; }
+            }
+            await w.webContents.debugger.sendCommand('Runtime.evaluate', {
+              expression: ${JSON.stringify(rendererExpr)},
+              returnByValue: true
+            });
+            n++;
+          } catch(e) {}
+        }
+        return n;
+      })()
+    `.trim();
+    const onMessage = (data: string) => {
+      try {
+        const resp = JSON.parse(data);
+        if (resp.id === requestId) {
+          const n = resp.result?.result?.value;
+          if (typeof n === 'number') { log.info(`[inject] renderer cleanup sent to ${n} window(s)`); }
+          finish();
+        }
+      } catch {}
+    };
+    ws.on('message', onMessage);
+    try {
+      ws.send(JSON.stringify({
+        id: requestId,
+        method: 'Runtime.evaluate',
+        params: { expression: cleanupScript, includeCommandLineAPI: true, returnByValue: true, awaitPromise: true },
+      }));
+    } catch {
+      finish();
+    }
+  });
+}
+
+function evaluateInMainProcessForTests(expression: string, timeoutMs = 7000): Promise<any> {
+  const ws = mainWsRef;
+  if (!ws || ws.readyState !== WebSocket.OPEN) {
+    return Promise.reject(new Error('renderer test CDP socket is not open'));
+  }
+  return new Promise((resolve, reject) => {
+    const requestId = (Date.now() % 1_000_000_000) + Math.floor(Math.random() * 1000);
+    let done = false;
+    const finish = (err: Error | null, value?: any) => {
+      if (done) { return; }
+      done = true;
+      clearTimeout(timeout);
+      try { ws.off('message', onMessage); } catch {}
+      if (err) { reject(err); } else { resolve(value); }
+    };
+    const timeout = setTimeout(() => finish(new Error('renderer test eval timed out')), timeoutMs);
+    const onMessage = (data: string) => {
+      try {
+        const resp = JSON.parse(data);
+        if (resp.id !== requestId) { return; }
+        if (resp.error) {
+          finish(new Error(resp.error.message || String(resp.error)));
+          return;
+        }
+        const result = resp.result?.result;
+        if (resp.result?.exceptionDetails) {
+          finish(new Error(resp.result.exceptionDetails.text || 'renderer test eval exception'));
+          return;
+        }
+        finish(null, result?.value);
+      } catch (err) {
+        finish(err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+    ws.on('message', onMessage);
+    try {
+      ws.send(JSON.stringify({
+        id: requestId,
+        method: 'Runtime.evaluate',
+        params: {
+          expression,
+          includeCommandLineAPI: true,
+          returnByValue: true,
+          awaitPromise: true,
+        },
+      }));
+    } catch (err) {
+      finish(err instanceof Error ? err : new Error(String(err)));
+    }
+  });
+}
+
+async function runHoverRendererHarnessForTests(): Promise<any[]> {
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) {
+    await runRendererInjection(injectRenderer);
+  }
+  const rendererExpr = `
+    (async function() {
+      var hooks = window.__irTestHooks;
+      function rectObj(r) {
+        return {
+          left: r.left, top: r.top, right: r.right, bottom: r.bottom,
+          width: r.width, height: r.height
+        };
+      }
+      function handleMetrics(root) {
+        var handles = root.querySelectorAll('.scrollbar,.slider,.shadow,.sash,.monaco-sash');
+        var visible = 0;
+        var maxHeight = 0;
+        var maxWidth = 0;
+        for (var i = 0; i < handles.length; i++) {
+          var h = handles[i];
+          var cs = window.getComputedStyle(h);
+          var r = h.getBoundingClientRect();
+          maxHeight = Math.max(maxHeight, r.height || 0);
+          maxWidth = Math.max(maxWidth, r.width || 0);
+          if (cs.display !== 'none' && cs.visibility !== 'hidden' && r.width > 0 && r.height > 0) {
+            visible++;
+          }
+        }
+        return { total: handles.length, visible: visible, maxHeight: maxHeight, maxWidth: maxWidth };
+      }
+      function snap(hoverEl) {
+        var sc = hooks.primaryHoverScroller(hoverEl) || hoverEl;
+        var rect = hoverEl.getBoundingClientRect();
+        return {
+          className: String(hoverEl.className || ''),
+          textLength: (hoverEl.textContent || '').length,
+          rect: rectObj(rect),
+          sizeTier: hoverEl.classList.contains('ir-size-large') ? 'large'
+            : hoverEl.classList.contains('ir-size-medium') ? 'medium'
+            : hoverEl.classList.contains('ir-size-small') ? 'small'
+            : null,
+          isScrollable: hoverEl.classList.contains('ir-scrollable'),
+          connected: document.body.contains(hoverEl),
+          scroller: {
+            scrollTop: sc.scrollTop || 0,
+            scrollHeight: sc.scrollHeight || 0,
+            clientHeight: sc.clientHeight || 0,
+            maxTop: Math.max(0, (sc.scrollHeight || 0) - (sc.clientHeight || 0))
+          },
+          handles: handleMetrics(hoverEl)
+        };
+      }
+      function makeHover(label, lineCount) {
+        var hover = document.createElement('div');
+        hover.className = 'monaco-hover ir-e2e-hover';
+        hover.style.cssText = 'position:fixed;left:32px;top:32px;z-index:2147483647;background:Canvas;color:CanvasText;';
+        var sc = document.createElement('div');
+        sc.className = 'monaco-scrollable-element';
+        var content = document.createElement('div');
+        content.className = 'monaco-hover-content';
+        var row = document.createElement('div');
+        row.className = 'hover-row';
+        var rowContents = document.createElement('div');
+        rowContents.className = 'hover-row-contents';
+        var md = document.createElement('div');
+        md.className = 'rendered-markdown ir-applied';
+        md.style.cssText = 'font-family:Menlo,Monaco,monospace;font-size:12px;line-height:18px;';
+        for (var i = 0; i < lineCount; i++) {
+          var line = document.createElement('div');
+          var n = String(i + 1).padStart(3, '0');
+          line.textContent = label + ' field_' + n + ': str';
+          md.appendChild(line);
+        }
+        rowContents.appendChild(md);
+        row.appendChild(rowContents);
+        content.appendChild(row);
+        sc.appendChild(content);
+        var scrollbar = document.createElement('div');
+        scrollbar.className = 'scrollbar vertical';
+        scrollbar.style.cssText = 'position:absolute;right:0;top:0;width:12px;height:680px;display:block;visibility:visible;';
+        var slider = document.createElement('div');
+        slider.className = 'slider';
+        slider.style.cssText = 'width:12px;height:640px;display:block;visibility:visible;';
+        scrollbar.appendChild(slider);
+        var shadow = document.createElement('div');
+        shadow.className = 'shadow';
+        shadow.style.cssText = 'position:absolute;right:0;top:0;width:12px;height:680px;display:block;visibility:visible;';
+        var sash = document.createElement('div');
+        sash.className = 'monaco-sash';
+        sash.style.cssText = 'position:absolute;right:0;bottom:0;width:12px;height:680px;display:block;visibility:visible;';
+        sc.appendChild(scrollbar);
+        sc.appendChild(shadow);
+        hover.appendChild(sash);
+        hover.appendChild(sc);
+        document.body.appendChild(hover);
+        return hover;
+      }
+      if (!hooks || typeof hooks.makeHoverScrollable !== 'function') {
+        return { ok: false, reason: 'missing-hooks', patchVersion: Number(window.__irPatchVersion) || 0 };
+      }
+      Array.prototype.slice.call(document.querySelectorAll('.ir-e2e-hover')).forEach(function(el) {
+        try { el.parentNode && el.parentNode.removeChild(el); } catch (_) {}
+      });
+
+      var large = makeHover('LargeHoverModel', 90);
+      hooks.makeHoverScrollable(large, true, (large.textContent || '').length);
+      var largeBefore = snap(large);
+      var target = hooks.primaryHoverScroller(large) || large;
+      try {
+        target.dispatchEvent(new WheelEvent('wheel', {
+          bubbles: true,
+          cancelable: true,
+          deltaY: 360,
+          deltaMode: 0
+        }));
+      } catch (_) {}
+      await new Promise(function(resolve) {
+        requestAnimationFrame(function() { requestAnimationFrame(resolve); });
+      });
+      var largeAfterWheel = snap(large);
+
+      var small = makeHover('STATUS_ACTIVE = "active"', 1);
+      hooks.makeHoverScrollable(small, true, (small.textContent || '').length);
+      var largeConnectedAfterSmall = document.body.contains(large);
+      var smallSnap = snap(small);
+
+      try { small.parentNode && small.parentNode.removeChild(small); } catch (_) {}
+      try { large.parentNode && large.parentNode.removeChild(large); } catch (_) {}
+      return {
+        ok: true,
+        patchVersion: Number(window.__irPatchVersion) || 0,
+        viewport: { width: window.innerWidth || 0, height: window.innerHeight || 0 },
+        largeBefore: largeBefore,
+        largeAfterWheel: largeAfterWheel,
+        small: smallSnap,
+        largeConnectedAfterSmall: largeConnectedAfterSmall
+      };
+    })()
+  `.trim();
+  const mainExpr = `
+    (async function() {
+      var BW = require('electron').BrowserWindow;
+      var wins = BW.getAllWindows();
+      var out = [];
+      for (var i = 0; i < wins.length; i++) {
+        var w = wins[i];
+        try {
+          var attached = false;
+          try { attached = w.webContents.debugger.isAttached(); } catch (_) {}
+          if (!attached) {
+            try { w.webContents.debugger.attach('1.3'); } catch (eAttach) {
+              out.push({ id: w.id, attachError: String(eAttach && eAttach.message || eAttach) });
+              continue;
+            }
+          }
+          await w.webContents.debugger.sendCommand('Runtime.enable');
+          var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', {
+            expression: ${JSON.stringify(rendererExpr)},
+            includeCommandLineAPI: true,
+            returnByValue: true,
+            awaitPromise: true
+          });
+          out.push({
+            id: w.id,
+            value: r && r.result ? r.result.value : undefined,
+            exception: r && r.exceptionDetails ? (r.exceptionDetails.text || 'exception') : undefined
+          });
+        } catch (e) {
+          out.push({ id: w && w.id, error: String(e && e.message || e) });
+        }
+      }
+      return out;
+    })()
+  `.trim();
+  return evaluateInMainProcessForTests(mainExpr);
 }
 
 // ASCII-escape every non-ASCII char to \\uXXXX. The payload is base64-
@@ -2101,7 +2805,7 @@ async function previewTypeHandler(docUriStr: string, identifier: string): Promis
   // Resolve location: declaration in the current preview first (nested
   // classes/methods), then sidecar, then hover-side cache+find fallback.
   let loc: vscode.Location | null = null;
-  const declaredInPreview = lastPreviewDeclarationLocations.get(identifier);
+  const declaredInPreview = cappedPreviewLocationGet(lastPreviewDeclarationLocations, identifier);
   if (declaredInPreview) {
     loc = declaredInPreview;
     log.info(`preview:   loc from preview declaration: ${vscode.workspace.asRelativePath(loc.uri)}:${loc.range.start.line + 1}:${loc.range.start.character + 1}`);
@@ -2122,7 +2826,7 @@ async function previewTypeHandler(docUriStr: string, identifier: string): Promis
     } catch (err) { log.warn(`preview: sidecar error: ${err}`); }
   }
   if (!loc) {
-    const cached = lastPreviewLocations.get(identifier);
+    const cached = cappedPreviewLocationGet(lastPreviewLocations, identifier);
     if (cached) {
       try {
         const cacheDoc = findOpenDoc(cached.uri) ?? await vscode.workspace.openTextDocument(cached.uri);
@@ -2168,10 +2872,16 @@ async function previewTypeHandler(docUriStr: string, identifier: string): Promis
   }
 
   try {
-    if (!markdown) {
-      const hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
-        'vscode.executeHoverProvider', loc.uri, loc.range.start,
-      );
+      if (!markdown) {
+      let hovers: vscode.Hover[] | undefined;
+      internalHoverProviderRequestDepth++;
+      try {
+        hovers = await vscode.commands.executeCommand<vscode.Hover[]>(
+          'vscode.executeHoverProvider', loc.uri, loc.range.start,
+        );
+      } finally {
+        internalHoverProviderRequestDepth--;
+      }
       if (hovers?.length) {
         const parts: string[] = [];
         for (const h of hovers) {
@@ -2208,10 +2918,15 @@ async function previewTypeHandler(docUriStr: string, identifier: string): Promis
   if (currentPreviewState) {
     previewHistory.push(currentPreviewState);
   }
+  const anchorDoc = findOpenDoc(anchorPos.uri);
+  const anchorRange = anchorDoc
+    ? fullWordRangeAt(anchorDoc, new vscode.Position(anchorPos.line, anchorPos.character))
+    : undefined;
   currentPreviewState = {
     identifier,
     markdown,
-    anchor: anchorPos!,
+    anchor: anchorPos,
+    anchorRange,
   };
 
   await applyPreviewStateAsHover(currentPreviewState, ms);
@@ -2268,9 +2983,13 @@ async function previewBackHandler(): Promise<void> {
  */
 async function applyPreviewStateAsHover(state: PreviewState, ms: () => string): Promise<void> {
   const renderedMarkdown = `[$(arrow-left) Back](command:intellisenseRecursion.previewBack "Back")\n\n${state.markdown}`;
+  const anchorDoc = findOpenDoc(state.anchor.uri);
+  const pendingRange = internalRangeFromVsCode(state.anchorRange)
+    ?? internalFullWordRangeAt(anchorDoc, new vscode.Position(state.anchor.line, state.anchor.character));
   pendingPreviewHover = {
     identifier: state.identifier,
     contents: [{ value: renderedMarkdown, isTrusted: true, supportThemeIcons: true }],
+    range: pendingRange,
     expiresAt: Date.now() + 3000,
   };
   previewHoverSuppressUntil = 0;
@@ -2307,14 +3026,17 @@ function httpGet(url: string): Promise<string> {
 
 function getHoverPatchScript(): string {
   return `(function(){
-var IR_PATCH_VERSION = 89;
+var IR_PATCH_VERSION = ${RENDERER_PATCH_VERSION};
 var IR_EXISTING_PATCH_VERSION = Number(window.__irPatchVersion)||0;
-if(IR_EXISTING_PATCH_VERSION >= IR_PATCH_VERSION) return 'already patched';
+if(IR_EXISTING_PATCH_VERSION >= IR_PATCH_VERSION && window.__irTestHooks) return 'already patched';
 
 // Tear down any prior version's listeners and style so the new patch
 // has a clean slate. Each version stores its registered listeners on
 // window.__irListeners so the next install can remove them precisely.
 try {
+  if (typeof window.__irCleanup === 'function') {
+    try { window.__irCleanup('patch-upgrade'); } catch(_) {}
+  }
   if (window.__irListeners) {
     for (var n = 0; n < window.__irListeners.length; n++) {
       var L = window.__irListeners[n];
@@ -2326,7 +3048,19 @@ try {
   }
   if (window.__irScanInterval) { clearInterval(window.__irScanInterval); }
   if (window.__irScanTimer) { clearTimeout(window.__irScanTimer); }
+  if (window.__irCaptureFallbackTimer) { clearTimeout(window.__irCaptureFallbackTimer); }
+  if (window.__irCaptureGraceTimer) { clearTimeout(window.__irCaptureGraceTimer); }
+  if (window.__irTimers) {
+    for (var t = 0; t < window.__irTimers.length; t++) {
+      try { clearTimeout(window.__irTimers[t]); } catch(_) {}
+    }
+  }
   if (window.__irMarkdownObserver) { try { window.__irMarkdownObserver.disconnect(); } catch(_) {} }
+  if (window.__irObservers) {
+    for (var oi = 0; oi < window.__irObservers.length; oi++) {
+      try { window.__irObservers[oi].disconnect(); } catch(_) {}
+    }
+  }
   if (window.__irDisposeMonaco) { try { window.__irDisposeMonaco('patch-upgrade'); } catch(_) {} }
   if (window.__irMonaco) {
     try {
@@ -2352,7 +3086,13 @@ try {
   if (window.__irStopCapture) { try { window.__irStopCapture(); } catch(_) {} }
 } catch(_) {}
 window.__irListeners = [];
+window.__irObservers = [];
+window.__irTimers = [];
 window.__irPatchVersion = IR_PATCH_VERSION;
+window.__irScanLogCount = 0;
+window.__irWrapLogCount = 0;
+window.__irPointWrapLogCount = 0;
+window.__irStaleHoverLogCount = 0;
 window.__irHoverPatched = true;  // legacy compat
 
 function irLog(msg){if(typeof window.irGoToType==='function')window.irGoToType('LOG:'+msg)}
@@ -2362,6 +3102,97 @@ function track(target, type, fn, capture){
   target.addEventListener(type, fn, capture);
   window.__irListeners.push({target:target,type:type,fn:fn,capture:capture});
 }
+function irTrackObserver(obs){
+  window.__irObservers.push(obs);
+  return obs;
+}
+function irForgetTimer(timer){
+  var timers=window.__irTimers||[];
+  for(var i=timers.length-1;i>=0;i--){
+    if(timers[i]===timer)timers.splice(i,1);
+  }
+}
+function irSetTimer(fn,ms){
+  var timer=setTimeout(function(){
+    irForgetTimer(timer);
+    fn();
+  },ms);
+  window.__irTimers.push(timer);
+  return timer;
+}
+function irClearTimer(timer){
+  if(!timer)return;
+  try{clearTimeout(timer)}catch(_){}
+  irForgetTimer(timer);
+}
+function irPruneDetachedHoverState(){
+  try{
+    var body=document.body;
+    if(window.__irHistoryFor&&!body.contains(window.__irHistoryFor)){
+      window.__irHistoryFor=null;
+      window.__irHistory=[];
+      window.__irHistoryCurrent=null;
+    }
+    if(window.__irLastPreviewTarget&&!body.contains(window.__irLastPreviewTarget)){
+      window.__irLastPreviewTarget=null;
+    }
+    if(window.__irActiveHoverEl&&!body.contains(window.__irActiveHoverEl)){
+      window.__irActiveHoverEl=null;
+    }
+  }catch(_){}
+}
+window.__irCleanup=function(reason){
+  try{
+    if(window.__irListeners){
+      for(var i=0;i<window.__irListeners.length;i++){
+        var L=window.__irListeners[i];
+        try{L.target.removeEventListener(L.type,L.fn,L.capture)}catch(_){}
+      }
+    }
+    if(window.__irStyleEl&&window.__irStyleEl.parentNode){
+      try{window.__irStyleEl.parentNode.removeChild(window.__irStyleEl)}catch(_){}
+    }
+    if(window.__irScanInterval){try{clearInterval(window.__irScanInterval)}catch(_){}}
+    if(window.__irScanTimer){try{clearTimeout(window.__irScanTimer)}catch(_){}}
+    if(window.__irCaptureFallbackTimer){try{clearTimeout(window.__irCaptureFallbackTimer)}catch(_){}}
+    if(window.__irCaptureGraceTimer){try{clearTimeout(window.__irCaptureGraceTimer)}catch(_){}}
+    if(window.__irTimers){
+      for(var ti=0;ti<window.__irTimers.length;ti++){
+        try{clearTimeout(window.__irTimers[ti])}catch(_){}
+      }
+    }
+    if(window.__irMarkdownObserver){try{window.__irMarkdownObserver.disconnect()}catch(_){}}
+    if(window.__irObservers){
+      for(var oi=0;oi<window.__irObservers.length;oi++){
+        try{window.__irObservers[oi].disconnect()}catch(_){}
+      }
+    }
+    window.__irCleanupInProgress=true;
+    if(window.__irStopCapture){try{window.__irStopCapture()}catch(_){}}
+    window.__irCleanupInProgress=false;
+    if(window.__irDisposeMonaco){try{window.__irDisposeMonaco(reason||'cleanup')}catch(_){}}
+    window.__irListeners=[];
+    window.__irObservers=[];
+    window.__irTimers=[];
+    window.__irScanTimer=null;
+    window.__irCaptureFallbackTimer=null;
+    window.__irCaptureGraceTimer=null;
+    window.__irMarkdownObserver=null;
+    window.__irHistoryFor=null;
+    window.__irHistory=[];
+    window.__irHistoryCurrent=null;
+    window.__irLastPreviewTarget=null;
+    window.__irActiveHoverEl=null;
+    window.__irMonacoCaps=null;
+    window.__irMdRenderer=null;
+    window.__irTokSupports={};
+    window.__irTokenizeToString=null;
+    window.__irTestHooks=null;
+    window.__irPatchVersion=0;
+    window.__irRecaptureScheduled=false;
+    window.__irCaptureActive=false;
+  }catch(_){}
+};
 
 var style=document.createElement('style');
 style.textContent=[
@@ -2372,8 +3203,11 @@ style.textContent=[
   // styling always wins, even though our link is wrapped inside the
   // tokenizer's .mtkN span. pointer-events:auto guards against the
   // parent mtk span swallowing clicks.
+  '.monaco-hover.ir-keepalive,.monaco-hover.ir-scrollable,.monaco-editor-hover.ir-keepalive,.monaco-editor-hover.ir-scrollable{pointer-events:auto !important}',
+  '.monaco-hover.ir-keepalive *,.monaco-hover.ir-scrollable *,.monaco-editor-hover.ir-keepalive *,.monaco-editor-hover.ir-scrollable *{pointer-events:auto !important}',
   '.ir-type-link,.ir-type-link *{cursor:pointer !important;pointer-events:auto !important}',
   '.ir-type-link.ir-type-link:hover,.ir-type-link:hover,.ir-type-link:hover *{text-decoration:underline !important;color:var(--vscode-textLink-foreground) !important}',
+  '.ir-type-link.ir-point-active,.ir-type-link.ir-point-active *{text-decoration:underline !important;color:var(--vscode-textLink-foreground) !important}',
   // ── Drill-down content styling ──
   // We DON'T set color/font/etc on .ir-applied. The parent
   // .code-hover-contents / .markdown-hover already inherits the right
@@ -2419,19 +3253,47 @@ style.textContent=[
   '.monaco-hover.ir-scrollable .hover-row,.monaco-hover.ir-scrollable .hover-row-contents,.monaco-hover.ir-scrollable .hover-contents,.monaco-hover.ir-scrollable .markdown-hover,.monaco-hover.ir-scrollable .rendered-markdown,.monaco-editor-hover.ir-scrollable .hover-row,.monaco-editor-hover.ir-scrollable .hover-row-contents,.monaco-editor-hover.ir-scrollable .hover-contents,.monaco-editor-hover.ir-scrollable .markdown-hover,.monaco-editor-hover.ir-scrollable .rendered-markdown{max-height:none !important;overflow:visible !important}',
   '.monaco-hover.ir-scrollable > .monaco-scrollable-element > .scrollbar,.monaco-hover.ir-scrollable > .monaco-scrollable-element > .shadow,.monaco-editor-hover.ir-scrollable > .monaco-scrollable-element > .scrollbar,.monaco-editor-hover.ir-scrollable > .monaco-scrollable-element > .shadow{display:none !important}',
   '.monaco-hover.ir-scrollable .scrollbar,.monaco-hover.ir-scrollable .slider,.monaco-hover.ir-scrollable .shadow,.monaco-hover.ir-scrollable .sash,.monaco-hover.ir-scrollable .monaco-sash,.monaco-editor-hover.ir-scrollable .scrollbar,.monaco-editor-hover.ir-scrollable .slider,.monaco-editor-hover.ir-scrollable .shadow,.monaco-editor-hover.ir-scrollable .sash,.monaco-editor-hover.ir-scrollable .monaco-sash{display:none !important;visibility:hidden !important;pointer-events:none !important}',
+  '.ir-native-hover-handle-hidden{display:none !important;visibility:hidden !important;pointer-events:none !important;opacity:0 !important;width:0 !important;height:0 !important;min-width:0 !important;min-height:0 !important;max-width:0 !important;max-height:0 !important}',
+  '.ir-stale-hover{display:none !important;visibility:hidden !important;pointer-events:none !important}',
 ].join('');
 document.head.appendChild(style);
 window.__irStyleEl = style;
 irLog('renderer: CSS injected');
 
+function irEventElement(target){
+  return target&&(target.nodeType===1?target:target.parentElement);
+}
+function irClosestTypeLink(target){
+  var el=irEventElement(target);
+  return el&&el.closest?el.closest('.ir-type-link'):null;
+}
+function irClosestHover(target){
+  var el=irEventElement(target);
+  return el&&el.closest?el.closest('.monaco-hover, .monaco-editor-hover'):null;
+}
+function irEnsureHoverPointer(hoverEl){
+  if(!hoverEl)return;
+  try{hoverEl.style.pointerEvents='auto'}catch(_){}
+  try{
+    var sc=irPrimaryHoverScroller(hoverEl);
+    if(sc)sc.style.pointerEvents='auto';
+  }catch(_){}
+}
+
 // Eat mousedown on type-links so VS Code's selection / focus-change
 // logic can't fire before our click handler — some hover widgets
 // dismiss on mousedown outside the editor.
-track(document,'mousedown',function(e){
-  var t=e.target;
-  if(!t||!t.classList||!t.classList.contains('ir-type-link'))return;
-  e.preventDefault();e.stopPropagation();
-},true);
+function irTypeLinkPointerDown(e){
+  var link=irClosestTypeLink(e.target)||irWrapWordAtPoint(e);
+  if(!link)return;
+  irMarkHoverManaged(irClosestHover(link),true);
+  e.preventDefault();
+  e.stopImmediatePropagation();
+}
+track(window,'pointerdown',irTypeLinkPointerDown,true);
+track(window,'mousedown',irTypeLinkPointerDown,true);
+track(document,'pointerdown',irTypeLinkPointerDown,true);
+track(document,'mousedown',irTypeLinkPointerDown,true);
 
 // Drill-down dismissal control with two layers:
 //  1) Mouse INSIDE the drill-down hover → block VS Code\\'s capture-phase
@@ -2455,8 +3317,8 @@ function irArmHoverSticky(hoverEl, ms){
   if(!hoverEl||!hoverEl.classList)return;
   hoverEl.classList.add('ir-sticky');
   hoverEl.__irStickyUntil=Date.now()+ms;
-  if(hoverEl.__irStickyTimer)try{clearTimeout(hoverEl.__irStickyTimer)}catch(_){}
-  hoverEl.__irStickyTimer=setTimeout(function(){
+  if(hoverEl.__irStickyTimer)try{irClearTimer(hoverEl.__irStickyTimer)}catch(_){}
+  hoverEl.__irStickyTimer=irSetTimer(function(){
     try{
       if((hoverEl.__irStickyUntil||0)<=Date.now()){
         hoverEl.classList.remove('ir-sticky');
@@ -2467,6 +3329,7 @@ function irArmHoverSticky(hoverEl, ms){
 function irMarkHoverManaged(hoverEl, sticky){
   if(!hoverEl||!hoverEl.classList)return;
   hoverEl.classList.add('ir-keepalive');
+  irEnsureHoverPointer(hoverEl);
   if(sticky){
     irArmHoverSticky(hoverEl,IR_HOVER_INITIAL_STICKY_MS);
   }
@@ -2480,10 +3343,12 @@ function irIsPointerNearHover(hoverEl,e){
   }catch(_){return false}
 }
 function irHoverGuard(e){
-  var t=e.target;
-  if(!t||!t.closest)return;
-  var insideHv=t.closest('.monaco-hover, .monaco-editor-hover');
-  if(insideHv && irHoverHasManagedContent(insideHv)){
+  var insideHv=irClosestHover(e.target);
+  if(insideHv){
+    var pointLink=null;
+    try{pointLink=irWrapWordAtPoint(e)}catch(_){}
+    if(!pointLink&&!irHoverHasManagedContent(insideHv))return;
+    irEnsureHoverPointer(insideHv);
     insideHv.__irLastInsideAt=Date.now();
     irArmHoverSticky(insideHv,IR_HOVER_EXIT_GRACE_MS);
     e.stopImmediatePropagation();
@@ -2500,7 +3365,20 @@ function irHoverGuard(e){
     e.stopImmediatePropagation();
   }
 }
+track(window,'pointermove',irHoverGuard,true);
+track(window,'pointerover',irHoverGuard,true);
+track(window,'pointerout',irHoverGuard,true);
+track(window,'pointerleave',irHoverGuard,true);
+track(window,'mousemove',irHoverGuard,true);
+track(window,'mouseover',irHoverGuard,true);
+track(window,'mouseout',irHoverGuard,true);
+track(window,'mouseleave',irHoverGuard,true);
+track(document,'pointermove',irHoverGuard,true);
+track(document,'pointerover',irHoverGuard,true);
+track(document,'pointerout',irHoverGuard,true);
+track(document,'pointerleave',irHoverGuard,true);
 track(document,'mousemove',irHoverGuard,true);
+track(document,'mouseover',irHoverGuard,true);
 track(document,'mouseout',irHoverGuard,true);
 track(document,'mouseleave',irHoverGuard,true);
 function irPrimaryHoverScroller(hoverEl){
@@ -2540,23 +3418,132 @@ function irFlattenNestedScrollLayers(hoverEl){
     }
   }
 }
+var IR_HOVER_NATIVE_HANDLE_SELECTOR='.scrollbar,.slider,.shadow,.sash,.monaco-sash';
+function irQuarantineHoverNativeHandle(handle,remove){
+  if(!handle)return;
+  try{
+    if(remove&&handle.parentNode){
+      handle.parentNode.removeChild(handle);
+      return;
+    }
+  }catch(_){}
+  try{
+    if(handle.classList)handle.classList.add('ir-native-hover-handle-hidden');
+    handle.setAttribute('aria-hidden','true');
+    var props={
+      display:'none',
+      visibility:'hidden',
+      pointerEvents:'none',
+      opacity:'0',
+      width:'0px',
+      height:'0px',
+      minWidth:'0px',
+      minHeight:'0px',
+      maxWidth:'0px',
+      maxHeight:'0px',
+      transform:'none'
+    };
+    for(var k in props){
+      if(Object.prototype.hasOwnProperty.call(props,k)){
+        handle.style.setProperty(k.replace(/[A-Z]/g,function(ch){return '-'+ch.toLowerCase()}),props[k],'important');
+      }
+    }
+  }catch(_){}
+}
+function irHideHoverNativeHandles(hoverEl,remove){
+  if(!hoverEl||!hoverEl.querySelectorAll)return;
+  try{
+    var handles=hoverEl.querySelectorAll(IR_HOVER_NATIVE_HANDLE_SELECTOR);
+    for(var hi=0;hi<handles.length;hi++)irQuarantineHoverNativeHandle(handles[hi],!!remove);
+  }catch(_){}
+}
+function irDisposeStaleHover(hoverEl,reason){
+  if(!hoverEl||!hoverEl.classList)return;
+  try{if(hoverEl.__irStickyTimer)irClearTimer(hoverEl.__irStickyTimer)}catch(_){}
+  try{if(hoverEl.__irFitFrame)cancelAnimationFrame(hoverEl.__irFitFrame)}catch(_){}
+  try{irResetHoverViewportShift(hoverEl)}catch(_){}
+  try{irHideHoverNativeHandles(hoverEl,true)}catch(_){}
+  try{
+    hoverEl.classList.remove('ir-scrollable','ir-sticky','ir-size-small','ir-size-medium','ir-size-large','ir-keepalive');
+    hoverEl.classList.add('ir-stale-hover');
+    hoverEl.style.pointerEvents='none';
+    hoverEl.style.display='none';
+  }catch(_){}
+  try{
+    if(window.__irActiveHoverEl===hoverEl)window.__irActiveHoverEl=null;
+    if(window.__irHistoryFor===hoverEl){
+      window.__irHistoryFor=null;
+      window.__irHistory=[];
+      window.__irHistoryCurrent=null;
+    }
+  }catch(_){}
+  try{
+    if(hoverEl.parentNode)hoverEl.parentNode.removeChild(hoverEl);
+  }catch(_){}
+  if(window.__irStaleHoverLogCount<20){
+    window.__irStaleHoverLogCount++;
+    irLog('renderer: stale hover removed '+(reason||''));
+  }
+}
 function irSetActiveHoverLayer(hoverEl){
   if(!hoverEl)return;
   window.__irActiveHoverEl=hoverEl;
-  try{hoverEl.style.pointerEvents='auto'}catch(_){}
+  irEnsureHoverPointer(hoverEl);
   var hovers=document.querySelectorAll('.monaco-hover, .monaco-editor-hover');
   for(var i=0;i<hovers.length;i++){
     var h=hovers[i];
     if(h===hoverEl)continue;
     var managed=irHoverHasManagedContent(h)||(h.classList&&h.classList.contains('ir-scrollable'));
-    h.classList.remove('ir-scrollable','ir-sticky','ir-size-small','ir-size-medium','ir-size-large');
-    if(managed)try{h.style.pointerEvents='none'}catch(_){}
-    if(h.__irStickyTimer)try{clearTimeout(h.__irStickyTimer)}catch(_){}
-    try{irResetHoverViewportShift(h)}catch(_){}
+    if(managed){
+      irDisposeStaleHover(h,'active-switch');
+    }else{
+      h.classList.remove('ir-scrollable','ir-sticky','ir-size-small','ir-size-medium','ir-size-large');
+      if(h.__irStickyTimer)try{irClearTimer(h.__irStickyTimer)}catch(_){}
+      try{irResetHoverViewportShift(h)}catch(_){}
+    }
   }
 }
 function irHoverScrollElement(hoverEl,t){
-  return irPrimaryHoverScroller(hoverEl);
+  return irBestHoverScroller(hoverEl,t);
+}
+function irScrollRange(el){
+  if(!el)return {x:0,y:0};
+  return {
+    x:Math.max(0,(el.scrollWidth||0)-(el.clientWidth||0)),
+    y:Math.max(0,(el.scrollHeight||0)-(el.clientHeight||0))
+  };
+}
+function irAddScrollCandidate(out,seen,el){
+  if(!el||seen.indexOf(el)>=0)return;
+  seen.push(el);
+  out.push(el);
+}
+function irBestHoverScroller(hoverEl,t){
+  if(!hoverEl)return null;
+  var out=[],seen=[];
+  try{
+    var targetEl=irWheelTargetElement(t);
+    if(targetEl&&targetEl.closest){
+      irAddScrollCandidate(out,seen,targetEl.closest('.monaco-scrollable-element'));
+      irAddScrollCandidate(out,seen,targetEl.closest('.hover-row, .hover-row-contents, .hover-contents, .markdown-hover, .rendered-markdown'));
+    }
+  }catch(_){}
+  irAddScrollCandidate(out,seen,irPrimaryHoverScroller(hoverEl));
+  irAddScrollCandidate(out,seen,hoverEl);
+  try{
+    var all=hoverEl.querySelectorAll('.monaco-scrollable-element,.monaco-hover-content,.hover-row,.hover-row-contents,.hover-contents,.markdown-hover,.rendered-markdown');
+    for(var i=0;i<all.length;i++)irAddScrollCandidate(out,seen,all[i]);
+  }catch(_){}
+  var best=null,bestScore=-1;
+  for(var ci=0;ci<out.length;ci++){
+    var el=out[ci];
+    try{
+      var r=irScrollRange(el);
+      var score=r.y*2+r.x;
+      if(score>bestScore){best=el;bestScore=score}
+    }catch(_){}
+  }
+  return best||irPrimaryHoverScroller(hoverEl);
 }
 function irWheelDelta(e,axisClientSize){
   var factor=e.deltaMode===1?18:(e.deltaMode===2?Math.max(120,axisClientSize||600):1);
@@ -2589,62 +3576,232 @@ track(document,'wheel',function(e){
     var d=irWheelDelta(e,sc?sc.clientHeight:0);
     var dx=d.x,dy=d.y;
     if(e.shiftKey&&Math.abs(dx)<1&&Math.abs(dy)>0){dx=dy;dy=0}
+    var didScroll=false;
     if(sc){
       var maxTop=Math.max(0,(sc.scrollHeight||0)-(sc.clientHeight||0));
       var maxLeft=Math.max(0,(sc.scrollWidth||0)-(sc.clientWidth||0));
-      if(maxTop>0&&dy){sc.scrollTop=irClamp(sc.scrollTop+dy,0,maxTop)}
-      if(maxLeft>0&&dx){sc.scrollLeft=irClamp(sc.scrollLeft+dx,0,maxLeft)}
-      insideHv.__irLastInsideAt=Date.now();
-      irArmHoverSticky(insideHv,IR_HOVER_EXIT_GRACE_MS);
+      if(maxTop>0&&dy){
+        var oldTop=sc.scrollTop||0;
+        var newTop=irClamp(oldTop+dy,0,maxTop);
+        if(newTop!==oldTop){sc.scrollTop=newTop;didScroll=(sc.scrollTop||0)!==oldTop}
+      }
+      if(maxLeft>0&&dx){
+        var oldLeft=sc.scrollLeft||0;
+        var newLeft=irClamp(oldLeft+dx,0,maxLeft);
+        if(newLeft!==oldLeft){sc.scrollLeft=newLeft;didScroll=didScroll||((sc.scrollLeft||0)!==oldLeft)}
+      }
+      if(didScroll){
+        insideHv.__irLastInsideAt=Date.now();
+        irArmHoverSticky(insideHv,IR_HOVER_EXIT_GRACE_MS);
+      }
+    }
+    if(!didScroll){
+      // Do not consume wheel when our selected element has no scroll range
+      // or is already at the boundary. Otherwise the hover becomes a wheel
+      // event sink and neither native hover scrolling nor editor scrolling
+      // can proceed.
+      return;
     }
     e.preventDefault();
     e.stopImmediatePropagation();
   }
 },true);
 
-function irTypeShapedName(w){return /^[A-Z_][A-Za-z0-9_]*$/.test(w)}
+var IR_HOVER_LINK_SKIP={'class':1,'def':1,'if':1,'else':1,'elif':1,'for':1,'while':1,'return':1,'import':1,'from':1,'as':1,'with':1,'try':1,'except':1,'finally':1,'raise':1,'pass':1,'break':1,'continue':1,'and':1,'or':1,'not':1,'is':1,'in':1,'lambda':1,'yield':1,'async':1,'await':1,'var':1,'let':1,'const':1,'function':1,'new':1,'delete':1,'typeof':1,'instanceof':1,'void':1,'this':1,'switch':1,'case':1,'default':1,'throw':1,'catch':1,'export':1,'extends':1,'implements':1,'interface':1,'enum':1,'abstract':1,'static':1,'public':1,'private':1,'protected':1,'readonly':1,'override':1,'struct':1,'union':1,'typedef':1,'extern':1,'register':1,'signed':1,'unsigned':1,'auto':1,'goto':1,'include':1,'define':1,'ifdef':1,'endif':1,'pragma':1,'namespace':1,'using':1,'template':1,'virtual':1,'inline':1,'constexpr':1,'nullptr':1,'the':1,'The':1,'that':1,'will':1,'are':1,'was':1,'has':1,'have':1,'can':1,'should':1,'may':1,'must':1,'been':1,'being':1,'does':1,'did':1,'its':1,'also':1,'than':1,'then':1,'when':1,'where':1,'which':1,'what':1,'how':1,'who':1,'all':1,'each':1,'every':1,'some':1,'any':1,'Returns':1,'Raises':1,'Args':1,'Parameters':1,'Note':1,'Example':1,'param':1,'throws':1,'since':1,'see':1,'deprecated':1,'alias':1,'overload':1,'module':1,'variable':1,'Any':1,'None':1,'Optional':1,'Union':1,'Callable':1,'Type':1,'Self':1,'List':1,'Dict':1,'Set':1,'Tuple':1,'Iterable':1,'Iterator':1,'Sequence':1,'Mapping':1,'True':1,'False':1,'Cannot':1,'Could':1,'Would':1,'Should':1,'This':1,'That':1,'These':1,'Those':1,'Here':1,'There':1,'Warning':1,'Warnings':1,'See':1,'Also':1,'More':1,'Given':1,'Available':1,'Required':1,'Reference':1,'Examples':1};
+var IR_HOVER_LINK_MAX_TYPES=240;
+var IR_HOVER_LINK_MAX_LOWER_DECLS=100;
+var IR_HOVER_LINK_MAX_CONSTANTS=80;
+function irTypeShapedName(w){return /^[A-Z][A-Za-z0-9_]*$/.test(w)||/^_[A-Z][A-Z0-9_]*$/.test(w)}
+function irConstantHoverLinkName(w){return /^_*[A-Z][A-Z0-9_]*$/.test(w)}
+function irPrimaryHoverLinkName(w){return /[a-z]/.test(w)}
+function irLowerCallableName(w){return /^[a-z_$][A-Za-z0-9_$]*$/.test(w)}
 function irAddHoverLinkName(types,seen,skip,w,allowLower){
   if(!w||w.length<=2||skip[w]||seen[w])return;
   if(!allowLower&&!irTypeShapedName(w))return;
   seen[w]=1;
   types.push(w);
 }
+function irTextNodeInAnchor(node,block){
+  var anc=node&&node.parentNode;
+  while(anc&&anc!==block){
+    if(anc.nodeName==='A'||(anc.classList&&anc.classList.contains('ir-type-link')))return true;
+    anc=anc.parentNode;
+  }
+  return false;
+}
+function irWordAtOffset(text,offset){
+  var s=String(text||'');
+  if(!s)return null;
+  var wc=/[A-Za-z0-9_]/;
+  var idx=Math.max(0,Math.min(offset,s.length-1));
+  if(!wc.test(s.charAt(idx))&&idx>0&&wc.test(s.charAt(idx-1)))idx--;
+  if(!wc.test(s.charAt(idx)))return null;
+  var start=idx,end=idx+1;
+  while(start>0&&wc.test(s.charAt(start-1)))start--;
+  while(end<s.length&&wc.test(s.charAt(end)))end++;
+  return {word:s.slice(start,end),start:start,end:end};
+}
+function irPointRange(e){
+  if(!e||typeof e.clientX!=='number'||typeof e.clientY!=='number')return null;
+  try{
+    if(document.caretRangeFromPoint)return document.caretRangeFromPoint(e.clientX,e.clientY);
+    if(document.caretPositionFromPoint){
+      var pos=document.caretPositionFromPoint(e.clientX,e.clientY);
+      if(pos){
+        var r=document.createRange();
+        r.setStart(pos.offsetNode,pos.offset);
+        r.collapse(true);
+        return r;
+      }
+    }
+  }catch(_){}
+  return null;
+}
+function irPointAllowsLowerCallable(node,info){
+  if(!node||!info||!irLowerCallableName(info.word))return false;
+  var text=String(node.nodeValue||'');
+  var before=text.slice(Math.max(0,info.start-48),info.start);
+  var after=text.slice(info.end,Math.min(text.length,info.end+16));
+  if(/(?:^|\\s)(?:async\\s+)?def\\s+$/.test(before))return true;
+  if(/(?:^|\\s)(?:async\\s+)?function\\s+$/.test(before))return true;
+  if(/^\\s*\\(/.test(after))return true;
+  return false;
+}
+function irSetPointActiveLink(link){
+  try{
+    var prev=window.__irPointActiveLink;
+    if(prev&&prev!==link&&prev.classList)prev.classList.remove('ir-point-active');
+    window.__irPointActiveLink=link||null;
+    if(link&&link.classList)link.classList.add('ir-point-active');
+  }catch(_){}
+}
+function irWrapTextNodeWord(node,info){
+  if(!node||!node.parentNode||!info||info.start<0||info.end<=info.start||info.end>(node.nodeValue||'').length)return null;
+  var after=node.splitText(info.start);
+  var rest=after.splitText(info.end-info.start);
+  var parent=after.parentNode;
+  if(!parent)return null;
+  var span=document.createElement('span');
+  span.className='ir-type-link';
+  span.setAttribute('data-type',info.word);
+  parent.insertBefore(span,after);
+  span.appendChild(after);
+  return span;
+}
+function irWrapWordAtPoint(e){
+  var hover=irClosestHover(e&&e.target);
+  if(!hover){irSetPointActiveLink(null);return null}
+  var range=irPointRange(e);
+  var node=range&&range.startContainer;
+  if(!node||node.nodeType!==3||!node.parentNode){irSetPointActiveLink(null);return null}
+  var parentEl=node.parentNode.nodeType===1?node.parentNode:node.parentNode.parentElement;
+  var block=parentEl&&parentEl.closest?parentEl.closest('.rendered-markdown'):null;
+  if(!block||!hover.contains(block)||irTextNodeInAnchor(node,block)){irSetPointActiveLink(null);return null}
+  var info=irWordAtOffset(node.nodeValue||'',range.startOffset||0);
+  var allowLower=irPointAllowsLowerCallable(node,info);
+  if(!info||IR_HOVER_LINK_SKIP[info.word]||info.word.length<=2||(!irTypeShapedName(info.word)&&!allowLower)){irSetPointActiveLink(null);return null}
+  var span=irWrapTextNodeWord(node,info);
+  if(span){
+    irSetPointActiveLink(span);
+    irMarkHoverManaged(hover,true);
+    if(window.__irPointWrapLogCount<20){
+      window.__irPointWrapLogCount++;
+      irLog('renderer: point-wrap "'+info.word+'"');
+    }
+  }
+  return span;
+}
 function irDeclarationNamesInLine(line){
   var out=[];
   var trimmed=(line||'').trim();
   if(!trimmed||trimmed.indexOf('#')===0||trimmed.indexOf('//')===0)return out;
   var patterns=[
-    /^(?:export\s+)?(?:abstract\s+)?(?:class|interface|enum|struct)\s+([A-Za-z_$][\w$]*)\b/,
-    /^(?:export\s+)?type\s+([A-Za-z_$][\w$]*)\b/,
-    /^(?:async\s+)?def\s+([A-Za-z_]\w*)\b/,
-    /^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\b/,
-    /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\b/
+    /^(?:export\\s+)?(?:abstract\\s+)?(?:class|interface|enum|struct)\\s+([A-Za-z_$][\\w$]*)\\b/,
+    /^(?:export\\s+)?type\\s+([A-Za-z_$][\\w$]*)\\b/,
+    /^(?:async\\s+)?def\\s+([A-Za-z_]\\w*)\\b/,
+    /^(?:export\\s+)?(?:async\\s+)?function\\s+([A-Za-z_$][\\w$]*)\\b/,
+    /^(?:export\\s+)?(?:const|let|var)\\s+([A-Za-z_$][\\w$]*)\\b/,
+    /^([A-Z_][A-Z0-9_]*)\\s*(?::[^=]+)?=/
   ];
   for(var pi=0;pi<patterns.length;pi++){
     var pm=patterns[pi].exec(trimmed);
     if(pm&&pm[1]){out.push(pm[1]);return out}
   }
-  if(/^(?:if|elif|else|for|while|switch|case|return|throw|raise|yield|await|with|try|except|finally|from|import|new)\b/.test(trimmed))return out;
-  var mm=/^(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>\n]*>)?\s*\([^=;{}]*\)\s*(?::|=>|\{|$)/.exec(trimmed);
+  if(/^(?:if|elif|else|for|while|switch|case|return|throw|raise|yield|await|with|try|except|finally|from|import|new)\\b/.test(trimmed))return out;
+  var mm=/^(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set)\\s+)*([A-Za-z_$][\\w$]*)\\s*(?:<[^>\\n]*>)?\\s*\\([^=;{}]*\\)\\s*(?::|=>|\\{|$)/.exec(trimmed);
   if(mm&&mm[1])out.push(mm[1]);
   return out;
 }
+function irCollectTypeShapedCandidates(text,skip,types,seen,maxChars,maxLines){
+  var src=String(text||'');
+  var lines=src.split(/\\n/);
+  var used=0;
+  var re=/\\b[A-Z_][A-Za-z0-9_]{2,}\\b/g;
+  var constants=[],constantSeen={},deferred=[],deferredSeen={};
+  var reserve=Math.min(IR_HOVER_LINK_MAX_CONSTANTS,Math.max(0,IR_HOVER_LINK_MAX_TYPES-types.length));
+  var primaryLimit=Math.max(0,IR_HOVER_LINK_MAX_TYPES-reserve);
+  for(var li=0;li<lines.length&&li<maxLines&&used<maxChars;li++){
+    var line=lines[li]||'';
+    used+=line.length+1;
+    re.lastIndex=0;
+    var m;
+    while((m=re.exec(line))!==null){
+      var w=m[0];
+      if(irPrimaryHoverLinkName(w)){
+        if(types.length<primaryLimit){
+          irAddHoverLinkName(types,seen,skip,w,false);
+        }else if(!deferredSeen[w]){
+          deferredSeen[w]=1;
+          deferred.push(w);
+        }
+      }else if(irConstantHoverLinkName(w)){
+        if(!constantSeen[w]){
+          constantSeen[w]=1;
+          constants.push(w);
+        }
+      }else if(!deferredSeen[w]){
+        deferredSeen[w]=1;
+        deferred.push(w);
+      }
+    }
+  }
+  for(var ci=0;ci<constants.length&&ci<IR_HOVER_LINK_MAX_CONSTANTS;ci++){
+    irAddHoverLinkName(types,seen,skip,constants[ci],false);
+    if(types.length>=IR_HOVER_LINK_MAX_TYPES)return;
+  }
+  for(var di=0;di<deferred.length;di++){
+    irAddHoverLinkName(types,seen,skip,deferred[di],false);
+    if(types.length>=IR_HOVER_LINK_MAX_TYPES)return;
+  }
+}
 function irCollectHoverLinkNames(text,skip){
+  var src=String(text||'');
   var types=[],seen={};
-  var lines=(text||'').split(/\\n/);
+  var lowerDecls=[];
+  var lines=src.split(/\\n/);
   for(var li=0;li<lines.length;li++){
     var decls=irDeclarationNamesInLine(lines[li]);
     for(var di=0;di<decls.length;di++){
-      irAddHoverLinkName(types,seen,skip,decls[di],true);
-      if(types.length>=120)return types;
+      if(irTypeShapedName(decls[di])){
+        irAddHoverLinkName(types,seen,skip,decls[di],false);
+      }else{
+        lowerDecls.push(decls[di]);
+      }
+      if(types.length>=IR_HOVER_LINK_MAX_TYPES)return types;
     }
   }
-  if((text||'').length>24000)return types;
-  var re=/([a-zA-Z_][a-zA-Z0-9_]{2,})/g;
-  var m;
-  while(m=re.exec(text||'')){
-    irAddHoverLinkName(types,seen,skip,m[1],false);
-    if(types.length>=120)break;
+  for(var ld=0;ld<lowerDecls.length&&ld<IR_HOVER_LINK_MAX_LOWER_DECLS;ld++){
+    irAddHoverLinkName(types,seen,skip,lowerDecls[ld],true);
+    if(types.length>=IR_HOVER_LINK_MAX_TYPES)return types;
+  }
+  // Large definition previews can be tens of KB. Earlier patches returned
+  // after declaration scanning, so type annotations like "owner: User" were
+  // never wrapped in hover links. Keep the scan bounded but always inspect
+  // the visible/front-loaded code for type-shaped names.
+  irCollectTypeShapedCandidates(src,skip,types,seen,src.length>24000?100000:src.length+1,src.length>24000?2200:lines.length);
+  for(var d=IR_HOVER_LINK_MAX_LOWER_DECLS;d<lowerDecls.length;d++){
+    irAddHoverLinkName(types,seen,skip,lowerDecls[d],true);
+    if(types.length>=IR_HOVER_LINK_MAX_TYPES)break;
   }
   return types;
 }
@@ -2680,15 +3837,6 @@ function irPickHoverSizeTier(hoverEl,fallbackTextLength){
   }
   IR_HOVER_SIZE_TIERS[2].measure=m;
   return IR_HOVER_SIZE_TIERS[2];
-}
-function irHideHoverNativeHandles(hoverEl){
-  if(!hoverEl||!hoverEl.querySelectorAll)return;
-  var handles=hoverEl.querySelectorAll('.scrollbar,.slider,.shadow,.sash,.monaco-sash');
-  for(var hi=0;hi<handles.length;hi++){
-    handles[hi].style.display='none';
-    handles[hi].style.visibility='hidden';
-    handles[hi].style.pointerEvents='none';
-  }
 }
 function irResetHoverViewportShift(hoverEl){
   if(!hoverEl)return;
@@ -2784,22 +3932,25 @@ function irApplyHoverSizeTier(hoverEl,fallbackTextLength,resetScroll){
   return tier;
 }
 
-track(document,'click',function(e){
-  var t=e.target;
-  if(!t||!t.classList||!t.classList.contains('ir-type-link'))return;
-  var typeName=t.getAttribute('data-type');
+function irTypeLinkClick(e){
+  var link=irClosestTypeLink(e.target)||irWrapWordAtPoint(e);
+  if(!link)return;
+  var typeName=link.getAttribute('data-type');
   if(!typeName)return;
-  e.preventDefault();e.stopPropagation();
+  irMarkHoverManaged(irClosestHover(link),true);
+  e.preventDefault();e.stopImmediatePropagation();
   if(e.metaKey||e.ctrlKey){
     irLog('renderer: cmd-click on "'+typeName+'"');
     if(typeof window.irGoToType==='function'){window.irGoToType(typeName)}
   }else{
-    var anc=t.closest('.rendered-markdown');
+    var anc=link.closest('.rendered-markdown');
     window.__irLastPreviewTarget=anc;
     irLog('renderer: plain-click on "'+typeName+'"');
     if(typeof window.irGoToType==='function'){window.irGoToType('PREVIEW:'+typeName)}
   }
-},true);
+}
+track(window,'click',irTypeLinkClick,true);
+track(document,'click',irTypeLinkClick,true);
 
 function irMakeHoverScrollable(hoverEl, resetScroll, fallbackTextLength){
   if(!hoverEl)return;
@@ -2828,6 +3979,13 @@ function irMakeHoverScrollable(hoverEl, resetScroll, fallbackTextLength){
     try { window.dispatchEvent(new Event('resize')); } catch(_) {}
   }catch(_){}
 }
+window.__irTestHooks={
+  primaryHoverScroller:irPrimaryHoverScroller,
+  makeHoverScrollable:irMakeHoverScrollable,
+  setActiveHoverLayer:irSetActiveHoverLayer,
+  applyHoverSizeTier:irApplyHoverSizeTier,
+  disposeStaleHover:irDisposeStaleHover
+};
 
 // ── Markdown → DOM (TrustedHTML-safe) ─────────────────────────────────
 // We never set innerHTML or use DOMParser.parseFromString — both are
@@ -3141,6 +4299,7 @@ function irDecodeContent(s){
 
 window.irApplyPreview=function(typeName,md,fromBack){
   irLog('renderer: irApplyPreview "'+typeName+'" md='+md.length+'B'+(fromBack?' [back]':''));
+  irPruneDetachedHoverState();
   var target=window.__irLastPreviewTarget;
   var src='stored';
   if(!target||!document.body.contains(target)){
@@ -3165,6 +4324,7 @@ window.irApplyPreview=function(typeName,md,fromBack){
     if(window.__irHistoryCurrent){
       window.__irHistory=window.__irHistory||[];
       window.__irHistory.push(window.__irHistoryCurrent);
+      while(window.__irHistory.length>20) window.__irHistory.shift();
     }
   }
   window.__irHistoryCurrent={ typeName:typeName, md:md };
@@ -3315,13 +4475,18 @@ window.irApplyPreview=function(typeName,md,fromBack){
 var irLastContainerCount=0;
 
 function irScanRenderedMarkdown(){
+  irPruneDetachedHoverState();
   var containers=document.querySelectorAll('.monaco-hover .rendered-markdown, .monaco-editor-hover .rendered-markdown, .ij-find-hover-tooltip .rendered-markdown');
   if(containers.length!==irLastContainerCount) irLastContainerCount=containers.length;
   for(var j=0;j<containers.length;j++){var block=containers[j];
     var text=block.textContent||'';
     var hoverHost=block.closest('.monaco-hover, .monaco-editor-hover');
-    if(block.__irLastScanText===text){
-      if(block.querySelector('.ir-type-link')||text.length>4000) irMakeHoverScrollable(hoverHost, false, text.length);
+    irEnsureHoverPointer(hoverHost);
+    // VS Code can replace a hover row with the same text while removing our
+    // spans. Same text is only a skip when the clickable links still exist.
+    var hasTypeLinks=!!block.querySelector('.ir-type-link');
+    if(block.__irLastScanText===text&&hasTypeLinks){
+      if(text.length>4000||hasTypeLinks) irMakeHoverScrollable(hoverHost, false, text.length);
       continue;
     }
     if(text.length>4000) irMakeHoverScrollable(hoverHost, false, text.length);
@@ -3333,13 +4498,23 @@ function irScanRenderedMarkdown(){
       irMakeHoverScrollable(hoverHost, false, text.length);
     }
     if(text.length<3)continue;
-    var skip={'class':1,'def':1,'if':1,'else':1,'elif':1,'for':1,'while':1,'return':1,'import':1,'from':1,'as':1,'with':1,'try':1,'except':1,'finally':1,'raise':1,'pass':1,'break':1,'continue':1,'and':1,'or':1,'not':1,'is':1,'in':1,'lambda':1,'yield':1,'async':1,'await':1,'var':1,'let':1,'const':1,'function':1,'new':1,'delete':1,'typeof':1,'instanceof':1,'void':1,'this':1,'switch':1,'case':1,'default':1,'throw':1,'catch':1,'export':1,'extends':1,'implements':1,'interface':1,'enum':1,'abstract':1,'static':1,'public':1,'private':1,'protected':1,'readonly':1,'override':1,'struct':1,'union':1,'typedef':1,'extern':1,'register':1,'signed':1,'unsigned':1,'auto':1,'goto':1,'include':1,'define':1,'ifdef':1,'endif':1,'pragma':1,'namespace':1,'using':1,'template':1,'virtual':1,'inline':1,'constexpr':1,'nullptr':1,'the':1,'The':1,'that':1,'will':1,'are':1,'was':1,'has':1,'have':1,'can':1,'should':1,'may':1,'must':1,'been':1,'being':1,'does':1,'did':1,'its':1,'also':1,'than':1,'then':1,'when':1,'where':1,'which':1,'what':1,'how':1,'who':1,'all':1,'each':1,'every':1,'some':1,'any':1,'Returns':1,'Raises':1,'Args':1,'Parameters':1,'Note':1,'Example':1,'param':1,'throws':1,'since':1,'see':1,'deprecated':1,'alias':1,'overload':1,'module':1,'variable':1,'Any':1,'None':1,'Optional':1,'Union':1,'Callable':1,'Type':1,'Self':1,'List':1,'Dict':1,'Set':1,'Tuple':1,'Iterable':1,'Iterator':1,'Sequence':1,'Mapping':1};
+    var skip=IR_HOVER_LINK_SKIP;
     var types=irCollectHoverLinkNames(text,skip);
     block.__irLastScanText=text;
+    var existingLinks=block.querySelectorAll?block.querySelectorAll('.ir-type-link').length:0;
+    if(window.__irScanLogCount<20&&(text.length>800||types.length||existingLinks)){
+      window.__irScanLogCount++;
+      irLog('renderer: scan text='+text.length+' types='+types.length+' existing='+existingLinks+' sample='+types.slice(0,10).join(','));
+    }
     if(!types.length)continue;
     var walker=document.createTreeWalker(block,NodeFilter.SHOW_TEXT);
-    var node,replacements=[];
-    while(node=walker.nextNode()){
+    var node,textNodes=[];
+    while(node=walker.nextNode()){textNodes.push(node)}
+    var wrappedCount=0;
+    var wc=/[a-zA-Z0-9_]/;
+    for(var tn=0;tn<textNodes.length;tn++){
+      node=textNodes[tn];
+      if(!node||!node.parentNode)continue;
       // Skip text inside <a> elements (e.g. our [← Back](command:...) link
       // or any markdown link). Wrapping them as ir-type-link would let the
       // capture-phase click handler intercept and treat the label as a
@@ -3351,33 +4526,56 @@ function irScanRenderedMarkdown(){
       }
       if(inAnchor)continue;
       var nv=node.nodeValue||'';
+      var matches=[];
       for(var k=0;k<types.length;k++){
-        var idx=nv.indexOf(types[k]);
-        if(idx>=0){
-          var wc=/[a-zA-Z0-9_]/;
+        var typeName=types[k];
+        if(!typeName)continue;
+        var searchFrom=0;
+        while(searchFrom<nv.length){
+          var idx=nv.indexOf(typeName,searchFrom);
+          if(idx<0)break;
           var before=idx>0?nv[idx-1]:'';
-          var afterC=nv[idx+types[k].length]||'';
+          var afterC=nv[idx+typeName.length]||'';
           if(!afterC&&node.nextSibling){var ns=node.nextSibling.textContent||'';afterC=ns[0]||''}
           if(!before&&node.previousSibling){var ps=node.previousSibling.textContent||'';before=ps[ps.length-1]||''}
-          if(!wc.test(before)&&!wc.test(afterC)){replacements.push({node:node,type:types[k],idx:idx})}
+          if(!wc.test(before)&&!wc.test(afterC)){matches.push({type:typeName,idx:idx})}
+          searchFrom=idx+Math.max(1,typeName.length);
         }
       }
+      if(!matches.length)continue;
+      matches.sort(function(a,b){return a.idx-b.idx||b.type.length-a.type.length});
+      var filtered=[],claimedUntil=-1;
+      for(var mi=0;mi<matches.length;mi++){
+        var mt=matches[mi];
+        var mtEnd=mt.idx+mt.type.length;
+        if(mt.idx<claimedUntil)continue;
+        filtered.push(mt);
+        claimedUntil=mtEnd;
+      }
+      for(var r2=filtered.length-1;r2>=0;r2--){
+        var rep=filtered[r2];
+        try{
+          if(!node.parentNode||rep.idx>node.nodeValue.length)continue;
+          var after=node.splitText(rep.idx);
+          var rest=after.splitText(rep.type.length);
+          var parent=after.parentNode;
+          if(!parent)continue;
+          var span=document.createElement('span');
+          span.className='ir-type-link';
+          span.setAttribute('data-type',rep.type);
+          parent.insertBefore(span,after);
+          span.appendChild(after);
+          wrappedCount++;
+        }catch(e2){irLog('renderer: wrap error "'+rep.type+'": '+e2.message)}
+      }
     }
-    for(var r2=replacements.length-1;r2>=0;r2--){
-      var rep=replacements[r2];
-      try{
-        var after=rep.node.splitText(rep.idx);
-        var rest=after.splitText(rep.type.length);
-        var span=document.createElement('span');
-        span.className='ir-type-link';
-        span.setAttribute('data-type',rep.type);
-        after.parentNode.insertBefore(span,after);
-        span.appendChild(after);
-      }catch(e2){irLog('renderer: wrap error "'+rep.type+'": '+e2.message)}
-    }
-    if(replacements.length>0){
+    if(wrappedCount>0){
       irMarkHoverManaged(hoverHost,true);
       irMakeHoverScrollable(hoverHost, false, text.length);
+    }
+    if(window.__irWrapLogCount<20&&(wrappedCount>0||types.length>0)){
+      window.__irWrapLogCount++;
+      irLog('renderer: wrap text='+text.length+' types='+types.length+' wrapped='+wrappedCount+' sample='+types.slice(0,10).join(','));
     }
     if(text.length>4000) irMakeHoverScrollable(hoverHost, false, text.length);
   }
@@ -3385,15 +4583,23 @@ function irScanRenderedMarkdown(){
 
 function irScheduleScan(){
   if(window.__irScanTimer)return;
-  window.__irScanTimer=setTimeout(function(){
+  window.__irScanTimer=irSetTimer(function(){
     window.__irScanTimer=null;
     try{irScanRenderedMarkdown()}catch(eScan){irLog('renderer: scan err '+(eScan&&eScan.message))}
   },50);
 }
 
-window.__irMarkdownObserver=new MutationObserver(function(muts){
+window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
+  irPruneDetachedHoverState();
   for(var mi=0;mi<muts.length;mi++){
-    var nodes=muts[mi].addedNodes||[];
+    var mut=muts[mi];
+    var target=mut.target;
+    var targetEl=target&&(target.nodeType===1?target:target.parentElement);
+    if(targetEl&&targetEl.closest&&targetEl.closest('.rendered-markdown,.monaco-hover,.monaco-editor-hover,.ij-find-hover-tooltip')){
+      irScheduleScan();
+      return;
+    }
+    var nodes=mut.addedNodes||[];
     for(var ni=0;ni<nodes.length;ni++){
       var n=nodes[ni];
       if(!n||n.nodeType!==1)continue;
@@ -3404,7 +4610,7 @@ window.__irMarkdownObserver=new MutationObserver(function(muts){
       }
     }
   }
-});
+}));
 window.__irMarkdownObserver.observe(document.body,{childList:true,subtree:true});
 irScheduleScan();
 
@@ -3509,7 +4715,9 @@ window.__irSnapshotHover = function(hoverEl){
 // creates the hover container first then populates content async — so
 // we observe the container itself for content additions, and snapshot
 // only once meaningful content (.rendered-markdown with children) is
-// present. Limited to first 3 successful snapshots.
+// present. Limited to first 3 successful snapshots. Disabled by default:
+// the observer is diagnostic-only and can be noisy on mutation-heavy windows.
+if(window.__irEnableHoverDiagnostics){
 (function(){
   var snapshotted = new WeakSet();
   var snapshotCount = 0;
@@ -3541,14 +4749,14 @@ window.__irSnapshotHover = function(hoverEl){
     // Try immediately in case content already arrived.
     if (trySnapshot(el)) return;
     // Otherwise watch for content additions inside it.
-    var inner = new MutationObserver(function(){
+    var inner = irTrackObserver(new MutationObserver(function(){
       if (trySnapshot(el)) {
         try { inner.disconnect(); } catch(_) {}
       }
-    });
+    }));
     try { inner.observe(el, { childList: true, subtree: true, attributes: true, attributeFilter: ['class'] }); } catch(_) {}
     // Safety fallback — give up after 3s
-    setTimeout(function(){
+    irSetTimer(function(){
       try { inner.disconnect(); } catch(_) {}
       // One more try in case mutation observer missed it.
       if (!snapshotted.has(el)) {
@@ -3567,7 +4775,8 @@ window.__irSnapshotHover = function(hoverEl){
       }
     }, 3000);
   }
-  var outer = new MutationObserver(function(muts){
+  var outer = irTrackObserver(new MutationObserver(function(muts){
+    if(snapshotCount>=3){try{outer.disconnect()}catch(_){};return;}
     for (var i = 0; i < muts.length; i++) {
       var added = muts[i].addedNodes;
       for (var j = 0; j < added.length; j++) {
@@ -3578,16 +4787,19 @@ window.__irSnapshotHover = function(hoverEl){
         if (hovers) for (var h = 0; h < hovers.length; h++) watchHover(hovers[h]);
       }
     }
-  });
+  }));
   outer.observe(document.body, { childList: true, subtree: true });
   irLog('hover-observer installed (waits for content)');
 })();
+}else{
+  irLog('hover diagnostics disabled');
+}
 
-// Watches for any .monaco-tokenized-source landing in the DOM (which
-// happens whenever VS Code's MarkdownRenderer renders a hover with a
-// code fence). For the first 3, dumps ancestor private-keys so we can
-// see which DI-managed object owns the rendering pipeline. Helps locate
-// the actual renderer reference we need to call from drill-down.
+// Watches for tokenized hover DOM and can trigger Monaco capture. This is
+// disabled by default because capture briefly hooks Map/WeakMap/Set prototypes,
+// which is too expensive for normal editing sessions. Set the flag manually
+// from devtools only when diagnosing renderer/tokenization internals.
+if(window.__irEnableTokenCapture){
 (function(){
   var reported = 0;
   var seenEl = new WeakSet();
@@ -3646,15 +4858,20 @@ window.__irSnapshotHover = function(hoverEl){
       } catch(eRC) { irLog('monaco recatch start err: '+(eRC&&eRC.message)); }
     }
   }
-  var obs = new MutationObserver(function(muts){
+  var obs = irTrackObserver(new MutationObserver(function(muts){
     for (var i = 0; i < muts.length && reported < 3; i++) {
       var added = muts[i].addedNodes;
       for (var j = 0; j < added.length; j++) visit(added[j]);
     }
-  });
+    if(reported>=3){try{obs.disconnect()}catch(_){}}
+  }));
   obs.observe(document.body, { childList: true, subtree: true });
+  irSetTimer(function(){try{obs.disconnect()}catch(_){}},15000);
   irLog('token-observer installed');
 })();
+}else{
+  irLog('token capture disabled');
+}
 
 // ── Monaco capture (host-driven, brief activation) ────────────────────
 // Modern VS Code hides the monaco namespace and AMD loader. To get
@@ -3685,8 +4902,12 @@ window.__irStartCapture = function(reason){
   var capturing = true;
   var graceScheduled = false;
   if (window.__irCaptureFallbackTimer) {
-    try { clearTimeout(window.__irCaptureFallbackTimer); } catch(_) {}
+    try { irClearTimer(window.__irCaptureFallbackTimer); } catch(_) {}
     window.__irCaptureFallbackTimer = null;
+  }
+  if (window.__irCaptureGraceTimer) {
+    try { irClearTimer(window.__irCaptureGraceTimer); } catch(_) {}
+    window.__irCaptureGraceTimer = null;
   }
   // After the first real CodeEditorWidget (one with a model whose URI
   // is set) flows through our hooks, schedule auto-stop after a short
@@ -3698,7 +4919,7 @@ window.__irStartCapture = function(reason){
   function scheduleGraceStop(){
     if (graceScheduled) return;
     graceScheduled = true;
-    setTimeout(function(){
+    window.__irCaptureGraceTimer=irSetTimer(function(){
       try {
         if (window.__irCaptureActive && window.__irCaptureSessionId === mySessionId) {
           window.__irStopCapture();
@@ -3763,13 +4984,21 @@ window.__irStartCapture = function(reason){
     if (!capturing) return 'already-stopped';
     capturing = false;
     if (window.__irCaptureFallbackTimer) {
-      try { clearTimeout(window.__irCaptureFallbackTimer); } catch(_) {}
+      try { irClearTimer(window.__irCaptureFallbackTimer); } catch(_) {}
       window.__irCaptureFallbackTimer = null;
+    }
+    if (window.__irCaptureGraceTimer) {
+      try { irClearTimer(window.__irCaptureGraceTimer); } catch(_) {}
+      window.__irCaptureGraceTimer = null;
     }
     try { Map.prototype.set = oM; } catch(_) {}
     try { WeakMap.prototype.set = oW; } catch(_) {}
     try { Set.prototype.add = oS; } catch(_) {}
     window.__irCaptureActive = false;
+    if(window.__irCleanupInProgress){
+      irReleaseCaptureCaps('cleanup');
+      return 'stopped-cleanup';
+    }
     var kinds = {};
     for (var i = 0; i < caps.services.length; i++) { kinds[caps.services[i].kind] = (kinds[caps.services[i].kind]||0)+1; }
     irLog('capture stopped: widgets='+caps.widgets.length+' ctors='+caps.widgetCtors.length+' svcs='+JSON.stringify(kinds)+' rendererCtors='+caps.rendererCtors.length+' rendererInst='+caps.rendererInstances.length);
@@ -4040,6 +5269,7 @@ window.__irStartCapture = function(reason){
     try {
       var mz = window.__irMaterializeMonaco ? window.__irMaterializeMonaco() : 'no-fn';
       irLog('materialize: '+mz);
+      irReleaseCaptureCaps('after-materialize:'+mz);
     } catch(eMz) { irLog('materialize threw: '+(eMz&&eMz.message)); }
     window.__irRecaptureScheduled = false;
     return 'stopped';
@@ -4051,7 +5281,7 @@ window.__irStartCapture = function(reason){
   if (typeof window.__irCaptureSessionId !== 'number') window.__irCaptureSessionId = 0;
   window.__irCaptureSessionId++;
   var mySessionId = window.__irCaptureSessionId;
-  window.__irCaptureFallbackTimer=setTimeout(function(){
+  window.__irCaptureFallbackTimer=irSetTimer(function(){
     try {
       if (window.__irCaptureActive && window.__irCaptureSessionId === mySessionId) {
         window.__irStopCapture();
@@ -4168,6 +5398,20 @@ function irMonacoValidationError(m){
   return '';
 }
 window.__irMonacoValidationError = irMonacoValidationError;
+
+function irReleaseCaptureCaps(reason){
+  try{
+    var caps=window.__irMonacoCaps;
+    if(!caps)return;
+    if(caps.widgets)caps.widgets.length=0;
+    if(caps.services)caps.services.length=0;
+    if(caps.widgetCtors)caps.widgetCtors.length=0;
+    if(caps.rendererCtors)caps.rendererCtors.length=0;
+    if(caps.rendererInstances)caps.rendererInstances.length=0;
+    window.__irMonacoCaps=null;
+    irLog('capture caps released: '+(reason||'unknown'));
+  }catch(_){}
+}
 
 function irDisposeMonaco(reason){
   var m = window.__irMonaco;
@@ -4589,8 +5833,7 @@ window.__irFindTokenSupport = function(langId){
   else if (langId === 'typescriptreact') family = ['typescriptreact','typescript','javascriptreact','javascript'];
   else if (langId === 'javascript') family = ['javascript','javascriptreact','typescript','typescriptreact'];
   else if (langId === 'javascriptreact') family = ['javascriptreact','javascript','typescriptreact','typescript'];
-  var caps = window.__irMonacoCaps || window.__irCaptures;
-  if (!caps) { irLog('tokSupport: no caps'); return null; }
+  var caps = window.__irMonacoCaps || window.__irCaptures || {};
   // Probe: tokenize a known mixed-content string. If it produces only
   // one foreground color, the grammar isn't loaded for that model.
   function probe(sup){
@@ -5113,6 +6356,7 @@ function declarationIdentifiersInLine(line: string): Array<{ id: string; index: 
     /^(?:async\s+)?def\s+([A-Za-z_]\w*)\b/,
     /^(?:export\s+)?(?:async\s+)?function\s+([A-Za-z_$][\w$]*)\b/,
     /^(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\b/,
+    /^([A-Z_][A-Z0-9_]*)\s*(?::[^=]+)?=/,
   ];
 
   for (const pattern of declarationPatterns) {
@@ -5160,6 +6404,11 @@ function throwIfAborted(signal?: AbortSignal): void {
 }
 
 async function goToTypeHandler(docUriStr: string, identifier: string) {
+  if (identifier.startsWith('PREVIEW:')) {
+    const previewIdentifier = identifier.substring('PREVIEW:'.length);
+    await previewTypeHandler(docUriStr, previewIdentifier);
+    return;
+  }
   if (identifier.length <= 2) {
     log.info(`goToType: "${identifier}" skipped (too short)`);
     return;
@@ -5465,7 +6714,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string, signa
   const regex = new RegExp(regexSource, 'g');
 
   // ── Collect all searchable docs ──
-  const previewLoc = lastPreviewLocations.get(identifier);
+  const previewLoc = cappedPreviewLocationGet(lastPreviewLocations, identifier);
   const priorityUris: string[] = [];
   if (previewLoc?.uri) { priorityUris.push(previewLoc.uri.toString()); }
   if (lastHoverDocUri) { priorityUris.push(lastHoverDocUri); }
@@ -5503,7 +6752,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string, signa
   });
   log.info(`  docs: [${allDocs.map(d => vscode.workspace.asRelativePath(d.uri)).join(', ')}] (${ms()})`);
 
-  const previewDeclarationLoc = lastPreviewDeclarationLocations.get(identifier);
+  const previewDeclarationLoc = cappedPreviewLocationGet(lastPreviewDeclarationLocations, identifier);
   if (previewDeclarationLoc) {
     throwIfAborted(signal);
     const defDoc = findOpenDoc(previewDeclarationLoc.uri) ?? await vscode.workspace.openTextDocument(previewDeclarationLoc.uri);
@@ -5892,8 +7141,25 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string, signa
 
 function esc(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
-export function deactivate() {
-  if (reinjectTimer) { clearInterval(reinjectTimer); }
+export async function deactivate() {
+  extensionDeactivated = true;
+  if (reinjectTimer) {
+    clearInterval(reinjectTimer);
+    reinjectTimer = undefined;
+  }
+  clearRendererReconnectTimer();
+  if (prefetchDebounce) {
+    clearTimeout(prefetchDebounce);
+    prefetchDebounce = undefined;
+  }
+  prefetchQueue.length = 0;
+  if (currentClickController && !currentClickController.signal.aborted) {
+    currentClickController.abort();
+  }
+  currentClickController = null;
+  await cleanupRendererInjection('deactivate');
+  closeMainWebSocket();
+  clearAllExtensionCaches();
   indexManager?.dispose();
   indexManager = null;
   log.info('Extension deactivated');

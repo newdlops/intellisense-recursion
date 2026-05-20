@@ -1,0 +1,1263 @@
+{
+  "summary": {
+    "root": "/Users/lky/project/captain",
+    "seed": "exhaustive-20260520",
+    "requestedSampleSize": 200000,
+    "allCandidateCount": 126961,
+    "tested": 126961,
+    "ok": 126961,
+    "failed": 0,
+    "warned": 46,
+    "capped": 1,
+    "maxLines": 10000,
+    "maxChars": 628526,
+    "byExt": {
+      ".tsx": {
+        "total": 37454,
+        "ok": 37454,
+        "failed": 0,
+        "warned": 1
+      },
+      ".py": {
+        "total": 56832,
+        "ok": 56832,
+        "failed": 0,
+        "warned": 0
+      },
+      ".ts": {
+        "total": 28464,
+        "ok": 28464,
+        "failed": 0,
+        "warned": 45
+      },
+      ".pyi": {
+        "total": 1976,
+        "ok": 1976,
+        "failed": 0,
+        "warned": 0
+      },
+      ".js": {
+        "total": 2235,
+        "ok": 2235,
+        "failed": 0,
+        "warned": 0
+      }
+    },
+    "byKind": {
+      "var": {
+        "total": 44712,
+        "ok": 44712,
+        "failed": 0,
+        "warned": 46
+      },
+      "type": {
+        "total": 22722,
+        "ok": 22722,
+        "failed": 0,
+        "warned": 0
+      },
+      "def": {
+        "total": 32244,
+        "ok": 32244,
+        "failed": 0,
+        "warned": 0
+      },
+      "class": {
+        "total": 26612,
+        "ok": 26612,
+        "failed": 0,
+        "warned": 0
+      },
+      "function": {
+        "total": 533,
+        "ok": 533,
+        "failed": 0,
+        "warned": 0
+      },
+      "async def": {
+        "total": 87,
+        "ok": 87,
+        "failed": 0,
+        "warned": 0
+      },
+      "enum": {
+        "total": 19,
+        "ok": 19,
+        "failed": 0,
+        "warned": 0
+      },
+      "interface": {
+        "total": 32,
+        "ok": 32,
+        "failed": 0,
+        "warned": 0
+      }
+    },
+    "failureReasons": {},
+    "warningReasons": {
+      "brace-end-unverified-fallback": 46
+    }
+  },
+  "largest": [
+    {
+      "file": "/Users/lky/project/captain/zuzu/db/migrations/0001_initial.py",
+      "line": 21,
+      "text": "class Migration(migrations.Migration):",
+      "kind": "class",
+      "name": "Migration",
+      "previewStartLine": 21,
+      "endLine": 10020,
+      "uncappedEndLine": 12573,
+      "lineCount": 10000,
+      "charCount": 391540,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class Migration(migrations.Migration):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/db/migrations/0600_zuzutaxadvice_squashed_0700_slackchannels_zuzu_ib_notifications.py",
+      "line": 594,
+      "text": "class Migration(migrations.Migration):",
+      "kind": "class",
+      "name": "Migration",
+      "previewStartLine": 594,
+      "endLine": 5405,
+      "uncappedEndLine": 5405,
+      "lineCount": 4812,
+      "charCount": 187030,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class Migration(migrations.Migration):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/db/migrations/1221_remove_hrmannualleaveconfigbase_annual_leave_and_more.py",
+      "line": 15,
+      "text": "class Migration(migrations.Migration):",
+      "kind": "class",
+      "name": "Migration",
+      "previewStartLine": 15,
+      "endLine": 3149,
+      "uncappedEndLine": 3149,
+      "lineCount": 3135,
+      "charCount": 111167,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class Migration(migrations.Migration):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/db/migrations/1008_alter_agendaauthorizedshareschange_options_and_more.py",
+      "line": 7,
+      "text": "class Migration(migrations.Migration):",
+      "kind": "class",
+      "name": "Migration",
+      "previewStartLine": 7,
+      "endLine": 2950,
+      "uncappedEndLine": 2950,
+      "lineCount": 2944,
+      "charCount": 88627,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class Migration(migrations.Migration):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/common/ui/constants.tsx",
+      "line": 2,
+      "text": "export const constants = {",
+      "kind": "var",
+      "name": "constants",
+      "previewStartLine": 2,
+      "endLine": 2757,
+      "uncappedEndLine": 2757,
+      "lineCount": 2756,
+      "charCount": 83900,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "export const constants = {"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/packages/investment_simulation/tests/test_investment_simulation_query.py",
+      "line": 25,
+      "text": "class InvestmentSimulationQueryTestCase(InvestmentSimulationTestCase):",
+      "kind": "class",
+      "name": "InvestmentSimulationQueryTestCase",
+      "previewStartLine": 24,
+      "endLine": 2666,
+      "uncappedEndLine": 2666,
+      "lineCount": 2643,
+      "charCount": 130434,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class InvestmentSimulationQueryTestCase(InvestmentSimulationTestCase):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/packages/company/meeting/services/meeting_execution_service/tests/test_meeting_execution_service.py",
+      "line": 128,
+      "text": "class MeetingExecutionServiceTestCase(TestCase):",
+      "kind": "class",
+      "name": "MeetingExecutionServiceTestCase",
+      "previewStartLine": 127,
+      "endLine": 2520,
+      "uncappedEndLine": 2520,
+      "lineCount": 2394,
+      "charCount": 97026,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class MeetingExecutionServiceTestCase(TestCase):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/db/models/meeting/meeting.py",
+      "line": 637,
+      "text": "class Meeting(Purchasable, SoftDeletableModel):  # type: ignore[misc]",
+      "kind": "class",
+      "name": "Meeting",
+      "previewStartLine": 637,
+      "endLine": 2418,
+      "uncappedEndLine": 2418,
+      "lineCount": 1782,
+      "charCount": 61667,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class Meeting(Purchasable, SoftDeletableModel):  # type: ignore[misc]"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/vcm/migrations/0032_vcmpdfevent_vcmcompanyfeed_vcmircuration_and_more.py",
+      "line": 16,
+      "text": "class Migration(migrations.Migration):",
+      "kind": "class",
+      "name": "Migration",
+      "previewStartLine": 16,
+      "endLine": 1749,
+      "uncappedEndLine": 1749,
+      "lineCount": 1734,
+      "charCount": 65340,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class Migration(migrations.Migration):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/db/models/company/company.py",
+      "line": 242,
+      "text": "class Company(  # type: ignore[django-manager-missing]",
+      "kind": "class",
+      "name": "Company",
+      "previewStartLine": 242,
+      "endLine": 1898,
+      "uncappedEndLine": 1898,
+      "lineCount": 1657,
+      "charCount": 58923,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class Company(  # type: ignore[django-manager-missing]"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/legal/pages.types.ts",
+      "line": 3,
+      "text": "export type TPageParams = {",
+      "kind": "type",
+      "name": "TPageParams",
+      "previewStartLine": 3,
+      "endLine": 1615,
+      "uncappedEndLine": 1615,
+      "lineCount": 1613,
+      "charCount": 59918,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "export type TPageParams = {"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/app/graphql/types/company_type.py",
+      "line": 199,
+      "text": "class CompanyType(DjangoObjectType):",
+      "kind": "class",
+      "name": "CompanyType",
+      "previewStartLine": 199,
+      "endLine": 1674,
+      "uncappedEndLine": 1674,
+      "lineCount": 1476,
+      "charCount": 52904,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class CompanyType(DjangoObjectType):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/public/pdfjs/web/viewer.js",
+      "line": 184,
+      "text": "const PDFViewerApplication = {",
+      "kind": "var",
+      "name": "PDFViewerApplication",
+      "previewStartLine": 184,
+      "endLine": 1658,
+      "uncappedEndLine": 1658,
+      "lineCount": 1475,
+      "charCount": 52684,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "const PDFViewerApplication = {"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/public/pdfjs/web/viewer.js",
+      "line": 8676,
+      "text": "class PDFViewer {",
+      "kind": "class",
+      "name": "PDFViewer",
+      "previewStartLine": 8676,
+      "endLine": 10122,
+      "uncappedEndLine": 10122,
+      "lineCount": 1447,
+      "charCount": 48296,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class PDFViewer {"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/legal/graphql-codegen/graphql.ts",
+      "line": 19131,
+      "text": "export type TMUTATION = {",
+      "kind": "type",
+      "name": "TMUTATION",
+      "previewStartLine": 19131,
+      "endLine": 20412,
+      "uncappedEndLine": 20412,
+      "lineCount": 1282,
+      "charCount": 79433,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "export type TMUTATION = {"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/packages/corporate_registration/auto_updater/tests/test_director_events_extractor.py",
+      "line": 61,
+      "text": "class CorporateRegistrationAutoUpdatorTest(TestCase):",
+      "kind": "class",
+      "name": "CorporateRegistrationAutoUpdatorTest",
+      "previewStartLine": 60,
+      "endLine": 1295,
+      "uncappedEndLine": 1295,
+      "lineCount": 1236,
+      "charCount": 51292,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class CorporateRegistrationAutoUpdatorTest(TestCase):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/packages/subscription/tests/services/standard/test_subscription_payment_calculate_service.py",
+      "line": 21,
+      "text": "class TestCalculateSubscriptionAmount(TestCase):",
+      "kind": "class",
+      "name": "TestCalculateSubscriptionAmount",
+      "previewStartLine": 20,
+      "endLine": 1252,
+      "uncappedEndLine": 1252,
+      "lineCount": 1233,
+      "charCount": 44909,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class TestCalculateSubscriptionAmount(TestCase):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/db/models/company/company_query_set.py",
+      "line": 42,
+      "text": "class CompanyQuerySet(",
+      "kind": "class",
+      "name": "CompanyQuerySet",
+      "previewStartLine": 42,
+      "endLine": 1194,
+      "uncappedEndLine": 1194,
+      "lineCount": 1153,
+      "charCount": 43388,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class CompanyQuerySet("
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/app/services/demo_company_service.py",
+      "line": 182,
+      "text": "class DemoCompanyService(Service):",
+      "kind": "class",
+      "name": "DemoCompanyService",
+      "previewStartLine": 182,
+      "endLine": 1309,
+      "uncappedEndLine": 1309,
+      "lineCount": 1128,
+      "charCount": 48762,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class DemoCompanyService(Service):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/tests/meeting/test_meeting_service.py",
+      "line": 64,
+      "text": "class MeetingServiceTestCase(TestCase):",
+      "kind": "class",
+      "name": "MeetingServiceTestCase",
+      "previewStartLine": 63,
+      "endLine": 1173,
+      "uncappedEndLine": 1173,
+      "lineCount": 1111,
+      "charCount": 44540,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class MeetingServiceTestCase(TestCase):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/app/services/demo_company_service.py",
+      "line": 209,
+      "text": "    def create_demo_company(self) -> Company:",
+      "kind": "def",
+      "name": "create_demo_company",
+      "previewStartLine": 209,
+      "endLine": 1309,
+      "uncappedEndLine": 1309,
+      "lineCount": 1101,
+      "charCount": 48039,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "def create_demo_company(self) -> Company:"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/tests/meeting/test_meeting_edit.py",
+      "line": 67,
+      "text": "class MeetingEditTestCase(GraphQLTestCase):",
+      "kind": "class",
+      "name": "MeetingEditTestCase",
+      "previewStartLine": 65,
+      "endLine": 1148,
+      "uncappedEndLine": 1148,
+      "lineCount": 1084,
+      "charCount": 50053,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class MeetingEditTestCase(GraphQLTestCase):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/db/migrations/1146_migrate_hrm.py",
+      "line": 12,
+      "text": "class Migration(migrations.Migration):",
+      "kind": "class",
+      "name": "Migration",
+      "previewStartLine": 12,
+      "endLine": 1072,
+      "uncappedEndLine": 1072,
+      "lineCount": 1061,
+      "charCount": 40629,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class Migration(migrations.Migration):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/tests/payment/test_payment_meeting.py",
+      "line": 44,
+      "text": "class PaymentTest(GraphQLTestCase):",
+      "kind": "class",
+      "name": "PaymentTest",
+      "previewStartLine": 43,
+      "endLine": 1082,
+      "uncappedEndLine": 1082,
+      "lineCount": 1040,
+      "charCount": 39108,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class PaymentTest(GraphQLTestCase):"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/tests/payment/test_payment_incorporation.py",
+      "line": 40,
+      "text": "class PaymentTest(GraphQLTestCase):",
+      "kind": "class",
+      "name": "PaymentTest",
+      "previewStartLine": 39,
+      "endLine": 1061,
+      "uncappedEndLine": 1061,
+      "lineCount": 1023,
+      "charCount": 39856,
+      "failures": [],
+      "warnings": [],
+      "firstLine": "class PaymentTest(GraphQLTestCase):"
+    }
+  ],
+  "failures": [],
+  "warnings": [
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 22,
+      "text": "  const styled: typeof import('styled-components')['default']",
+      "kind": "var",
+      "name": "styled",
+      "previewStartLine": 22,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 30,
+      "charCount": 1867,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const styled: typeof import('styled-components')['default']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 37,
+      "text": "  const useNavigate: typeof import('react-router-dom')['useNavigate']",
+      "kind": "var",
+      "name": "useNavigate",
+      "previewStartLine": 37,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 15,
+      "charCount": 887,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useNavigate: typeof import('react-router-dom')['useNavigate']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 30,
+      "text": "  const useImperativeHandle: typeof import('react')['useImperativeHandle']",
+      "kind": "var",
+      "name": "useImperativeHandle",
+      "previewStartLine": 30,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 22,
+      "charCount": 1393,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useImperativeHandle: typeof import('react')['useImperativeHandle']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 38,
+      "text": "  const useNavigationType: typeof import('react-router-dom')['useNavigationType']",
+      "kind": "var",
+      "name": "useNavigationType",
+      "previewStartLine": 38,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 14,
+      "charCount": 817,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useNavigationType: typeof import('react-router-dom')['useNavigationType']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/common/packages/legacy-ag-grid-table/internal/hooks/use-search-front-mode.ts",
+      "line": 36,
+      "text": "    const regex = /\"([^\"]+)\"|(\\S+)/g;",
+      "kind": "var",
+      "name": "regex",
+      "previewStartLine": 36,
+      "endLine": 116,
+      "uncappedEndLine": 116,
+      "lineCount": 81,
+      "charCount": 2020,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const regex = /\"([^\"]+)\"|(\\S+)/g;"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 20,
+      "text": "  const memo: typeof import('react')['memo']",
+      "kind": "var",
+      "name": "memo",
+      "previewStartLine": 20,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 32,
+      "charCount": 1979,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const memo: typeof import('react')['memo']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/legal/survey/utils.ts",
+      "line": 143,
+      "text": "    const cleanStr = answerStr",
+      "kind": "var",
+      "name": "cleanStr",
+      "previewStartLine": 143,
+      "endLine": 257,
+      "uncappedEndLine": 257,
+      "lineCount": 115,
+      "charCount": 3350,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const cleanStr = answerStr"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 45,
+      "text": "  const useRoutes: typeof import('react-router-dom')['useRoutes']",
+      "kind": "var",
+      "name": "useRoutes",
+      "previewStartLine": 45,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 7,
+      "charCount": 339,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useRoutes: typeof import('react-router-dom')['useRoutes']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 23,
+      "text": "  const useCallback: typeof import('react')['useCallback']",
+      "kind": "var",
+      "name": "useCallback",
+      "previewStartLine": 23,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 29,
+      "charCount": 1805,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useCallback: typeof import('react')['useCallback']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/common/services/utils.ts",
+      "line": 108,
+      "text": "  const result = String(str)",
+      "kind": "var",
+      "name": "result",
+      "previewStartLine": 108,
+      "endLine": 127,
+      "uncappedEndLine": 127,
+      "lineCount": 20,
+      "charCount": 413,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const result = String(str)"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 43,
+      "text": "  const useRef: typeof import('react')['useRef']",
+      "kind": "var",
+      "name": "useRef",
+      "previewStartLine": 43,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 9,
+      "charCount": 466,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useRef: typeof import('react')['useRef']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 24,
+      "text": "  const useContext: typeof import('react')['useContext']",
+      "kind": "var",
+      "name": "useContext",
+      "previewStartLine": 24,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 28,
+      "charCount": 1746,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useContext: typeof import('react')['useContext']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 36,
+      "text": "  const useMemo: typeof import('react')['useMemo']",
+      "kind": "var",
+      "name": "useMemo",
+      "previewStartLine": 36,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 16,
+      "charCount": 938,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useMemo: typeof import('react')['useMemo']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 11,
+      "text": "  const Navigate: typeof import('react-router-dom')['Navigate']",
+      "kind": "var",
+      "name": "Navigate",
+      "previewStartLine": 11,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 41,
+      "charCount": 2500,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const Navigate: typeof import('react-router-dom')['Navigate']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 19,
+      "text": "  const lazy: typeof import('react')['lazy']",
+      "kind": "var",
+      "name": "lazy",
+      "previewStartLine": 19,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 33,
+      "charCount": 2024,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const lazy: typeof import('react')['lazy']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 27,
+      "text": "  const useEffect: typeof import('react')['useEffect']",
+      "kind": "var",
+      "name": "useEffect",
+      "previewStartLine": 27,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 25,
+      "charCount": 1557,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useEffect: typeof import('react')['useEffect']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 13,
+      "text": "  const Route: typeof import('react-router-dom')['Route']",
+      "kind": "var",
+      "name": "Route",
+      "previewStartLine": 13,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 39,
+      "charCount": 2376,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const Route: typeof import('react-router-dom')['Route']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 10,
+      "text": "  const NavLink: typeof import('react-router-dom')['NavLink']",
+      "kind": "var",
+      "name": "NavLink",
+      "previewStartLine": 10,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 42,
+      "charCount": 2562,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const NavLink: typeof import('react-router-dom')['NavLink']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 9,
+      "text": "  const Link: typeof import('react-router-dom')['Link']",
+      "kind": "var",
+      "name": "Link",
+      "previewStartLine": 9,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 43,
+      "charCount": 2618,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const Link: typeof import('react-router-dom')['Link']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 14,
+      "text": "  const Routes: typeof import('react-router-dom')['Routes']",
+      "kind": "var",
+      "name": "Routes",
+      "previewStartLine": 14,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 38,
+      "charCount": 2318,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const Routes: typeof import('react-router-dom')['Routes']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 47,
+      "text": "  const useState: typeof import('react')['useState']",
+      "kind": "var",
+      "name": "useState",
+      "previewStartLine": 47,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 5,
+      "charCount": 195,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useState: typeof import('react')['useState']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 33,
+      "text": "  const useLayoutEffect: typeof import('react')['useLayoutEffect']",
+      "kind": "var",
+      "name": "useLayoutEffect",
+      "previewStartLine": 33,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 19,
+      "charCount": 1161,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useLayoutEffect: typeof import('react')['useLayoutEffect']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 42,
+      "text": "  const useReducer: typeof import('react')['useReducer']",
+      "kind": "var",
+      "name": "useReducer",
+      "previewStartLine": 42,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 10,
+      "charCount": 523,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useReducer: typeof import('react')['useReducer']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 49,
+      "text": "  const useTransition: typeof import('react')['useTransition']",
+      "kind": "var",
+      "name": "useTransition",
+      "previewStartLine": 49,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 3,
+      "charCount": 65,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useTransition: typeof import('react')['useTransition']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 12,
+      "text": "  const Outlet: typeof import('react-router-dom')['Outlet']",
+      "kind": "var",
+      "name": "Outlet",
+      "previewStartLine": 12,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 40,
+      "charCount": 2436,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const Outlet: typeof import('react-router-dom')['Outlet']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 40,
+      "text": "  const useOutletContext: typeof import('react-router-dom')['useOutletContext']",
+      "kind": "var",
+      "name": "useOutletContext",
+      "previewStartLine": 40,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 12,
+      "charCount": 669,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useOutletContext: typeof import('react-router-dom')['useOutletContext']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 15,
+      "text": "  const createRef: typeof import('react')['createRef']",
+      "kind": "var",
+      "name": "createRef",
+      "previewStartLine": 15,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 37,
+      "charCount": 2258,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const createRef: typeof import('react')['createRef']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 44,
+      "text": "  const useResolvedPath: typeof import('react-router-dom')['useResolvedPath']",
+      "kind": "var",
+      "name": "useResolvedPath",
+      "previewStartLine": 44,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 8,
+      "charCount": 417,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useResolvedPath: typeof import('react-router-dom')['useResolvedPath']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 16,
+      "text": "  const css: typeof import('styled-components')['css']",
+      "kind": "var",
+      "name": "css",
+      "previewStartLine": 16,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 36,
+      "charCount": 2203,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const css: typeof import('styled-components')['css']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 21,
+      "text": "  const startTransition: typeof import('react')['startTransition']",
+      "kind": "var",
+      "name": "startTransition",
+      "previewStartLine": 21,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 31,
+      "charCount": 1934,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const startTransition: typeof import('react')['startTransition']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 29,
+      "text": "  const useId: typeof import('react')['useId']",
+      "kind": "var",
+      "name": "useId",
+      "previewStartLine": 29,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 23,
+      "charCount": 1440,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useId: typeof import('react')['useId']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 32,
+      "text": "  const useInsertionEffect: typeof import('react')['useInsertionEffect']",
+      "kind": "var",
+      "name": "useInsertionEffect",
+      "previewStartLine": 32,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 20,
+      "charCount": 1234,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useInsertionEffect: typeof import('react')['useInsertionEffect']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 41,
+      "text": "  const useParams: typeof import('react-router-dom')['useParams']",
+      "kind": "var",
+      "name": "useParams",
+      "previewStartLine": 41,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 11,
+      "charCount": 589,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useParams: typeof import('react-router-dom')['useParams']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 35,
+      "text": "  const useLocation: typeof import('react-router-dom')['useLocation']",
+      "kind": "var",
+      "name": "useLocation",
+      "previewStartLine": 35,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 17,
+      "charCount": 1008,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useLocation: typeof import('react-router-dom')['useLocation']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 18,
+      "text": "  const keyframes: typeof import('styled-components')['keyframes']",
+      "kind": "var",
+      "name": "keyframes",
+      "previewStartLine": 18,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 34,
+      "charCount": 2091,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const keyframes: typeof import('styled-components')['keyframes']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 26,
+      "text": "  const useDeferredValue: typeof import('react')['useDeferredValue']",
+      "kind": "var",
+      "name": "useDeferredValue",
+      "previewStartLine": 26,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 26,
+      "charCount": 1626,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useDeferredValue: typeof import('react')['useDeferredValue']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 28,
+      "text": "  const useHref: typeof import('react-router-dom')['useHref']",
+      "kind": "var",
+      "name": "useHref",
+      "previewStartLine": 28,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 24,
+      "charCount": 1502,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useHref: typeof import('react-router-dom')['useHref']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 34,
+      "text": "  const useLinkClickHandler: typeof import('react-router-dom')['useLinkClickHandler']",
+      "kind": "var",
+      "name": "useLinkClickHandler",
+      "previewStartLine": 34,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 18,
+      "charCount": 1094,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useLinkClickHandler: typeof import('react-router-dom')['useLinkClickHandler']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 31,
+      "text": "  const useInRouterContext: typeof import('react-router-dom')['useInRouterContext']",
+      "kind": "var",
+      "name": "useInRouterContext",
+      "previewStartLine": 31,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 21,
+      "charCount": 1318,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useInRouterContext: typeof import('react-router-dom')['useInRouterContext']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 39,
+      "text": "  const useOutlet: typeof import('react-router-dom')['useOutlet']",
+      "kind": "var",
+      "name": "useOutlet",
+      "previewStartLine": 39,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 13,
+      "charCount": 735,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useOutlet: typeof import('react-router-dom')['useOutlet']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 48,
+      "text": "  const useSyncExternalStore: typeof import('react')['useSyncExternalStore']",
+      "kind": "var",
+      "name": "useSyncExternalStore",
+      "previewStartLine": 48,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 4,
+      "charCount": 142,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useSyncExternalStore: typeof import('react')['useSyncExternalStore']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 25,
+      "text": "  const useDebugValue: typeof import('react')['useDebugValue']",
+      "kind": "var",
+      "name": "useDebugValue",
+      "previewStartLine": 25,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 27,
+      "charCount": 1689,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useDebugValue: typeof import('react')['useDebugValue']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/staff/help/company-question/pages/question-page/components/ai-reasoning-side-area.tsx",
+      "line": 327,
+      "text": "  let match = result.match(/content='((?:[^'\\\\]|\\\\.)*)'/);",
+      "kind": "var",
+      "name": "match",
+      "previewStartLine": 327,
+      "endLine": 417,
+      "uncappedEndLine": 417,
+      "lineCount": 91,
+      "charCount": 2238,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "let match = result.match(/content='((?:[^'\\\\]|\\\\.)*)'/);"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/legal/hrm/attendance/pages/hrm-attendance-item-list-page/components/export-attendance-pdf.ts",
+      "line": 421,
+      "text": "const escapeCssString = (value: string) =>",
+      "kind": "var",
+      "name": "escapeCssString",
+      "previewStartLine": 421,
+      "endLine": 496,
+      "uncappedEndLine": 496,
+      "lineCount": 76,
+      "charCount": 1996,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const escapeCssString = (value: string) =>"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 17,
+      "text": "  const forwardRef: typeof import('react')['forwardRef']",
+      "kind": "var",
+      "name": "forwardRef",
+      "previewStartLine": 17,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 35,
+      "charCount": 2148,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const forwardRef: typeof import('react')['forwardRef']"
+    },
+    {
+      "file": "/Users/lky/project/captain/zuzu/client/src/auto-imports.d.ts",
+      "line": 46,
+      "text": "  const useSearchParams: typeof import('react-router-dom')['useSearchParams']",
+      "kind": "var",
+      "name": "useSearchParams",
+      "previewStartLine": 46,
+      "endLine": 51,
+      "uncappedEndLine": 51,
+      "lineCount": 6,
+      "charCount": 273,
+      "failures": [],
+      "warnings": [
+        "brace-end-unverified-fallback"
+      ],
+      "firstLine": "const useSearchParams: typeof import('react-router-dom')['useSearchParams']"
+    }
+  ]
+}
