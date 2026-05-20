@@ -20,6 +20,9 @@ async function main() {
     await runTests({
       extensionDevelopmentPath,
       extensionTestsPath,
+      extensionTestsEnv: {
+        IR_SKIP_RENDERER_INJECTION: '1',
+      },
       launchArgs: [
         testWorkspace,
         `--extensions-dir=${userExtensionsDir}`,

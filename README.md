@@ -7,7 +7,7 @@ VS Code's hover tooltips show type information but the text is static. This exte
 ## Features
 
 - **Cmd+Click in hover**: Hold Cmd and hover over a type name in the tooltip — it underlines. Click to jump to its definition.
-- **Definition preview**: Hover tooltips are enriched with source code previews of referenced types.
+- **Definition preview**: Hover tooltips are enriched with scrollable source previews of referenced definitions.
 - **Language-agnostic**: Works with any language that has a VS Code language server (Python, TypeScript, JavaScript, Java, C/C++, Go, Rust, etc.)
 - **Recursive navigation**: Types in the definition preview are also clickable — keep drilling down.
 

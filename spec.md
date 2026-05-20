@@ -102,12 +102,13 @@ class TypeName(ParentClass):
     """Docstring."""
     field_a: str
     field_b: int
-    ... (up to 15 lines)
+    ... (full definition block)
 ```
 ```
 
 Rules:
-- Maximum 15 lines from definition start
+- Full syntactic definition block is shown when it can be detected
+- Fallback previews show 120 lines; detected blocks have a 10,000-line safety cap
 - File path shown as workspace-relative
 - Language ID from document (python, typescript, go, etc.)
 - Preview code itself contains type names → those are also clickable
