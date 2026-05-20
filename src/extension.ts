@@ -796,8 +796,6 @@ let lastClickTime = 0;
 // A new click aborts an in-flight click via this controller.
 let currentClickController: AbortController | null = null;
 let hoverPatchActive = false;
-let lastPreviewKey = '';
-let lastPreviewTime = 0;
 // Current main-process CDP WebSocket, tracked so reconnect cleanup only
 // clears the listener that originally owned the socket.
 let mainWsRef: WebSocket | null = null;
@@ -906,13 +904,12 @@ function clickNegSet(identifier: string) {
   clickNegCache.set(identifier, Date.now());
 }
 
-// ── Hover budget + background resolve ──
-// Goal: hover overhead ≤ 10ms. On cache miss, race a resolve against a tight
-// budget; if it doesn't finish in time, return preview-less hover and let the
-// resolve finish in the background to populate cache for the next hover.
-const HOVER_BUDGET_MS = 5;
+// ── Hover definition resolve ──
+// First hover must include the definition preview when a definition can be
+// resolved. Slow language-server calls are still bounded inside
+// resolveInBackground(), but we no longer return a symbol-only hover just
+// because the fast path missed a tiny UI budget.
 const HOVER_DOC_SCAN_MAX_LINES = 5_000;
-const HOVER_BG_WARMUP_DELAY_MS = 1_000;
 // defProvider is the hot path — Pylance/Jedi commonly stalls up to several
 // seconds on cold symbols. 1500ms keeps the ceiling low without dropping most
 // successful resolves (observed p95 ~1300ms).
@@ -1130,8 +1127,6 @@ function posPreviewSet(posKey: string, typesKey: string, previews: string) {
 // When VS Code calls $provideHover for multiple handles at the same position,
 // the first handle computes and later handles await the same promise.
 const inflightHoverPreviews = new Map<string, Promise<{ typesKey: string; previews: string } | null>>();
-const nativeOnlyHoverUntil = new Map<string, number>();
-const NATIVE_ONLY_STABILITY_MS = 1_000;
 
 // ── (B) Document-open prefetch infrastructure ──
 const prefetchedDocs = new Set<string>();  // uri.fsPath → already scheduled
@@ -1232,7 +1227,6 @@ function schedulePrefetch(doc: vscode.TextDocument | undefined) {
 function clearAllExtensionCaches() {
   defCache.clear();
   posPreviewCache.clear();
-  nativeOnlyHoverUntil.clear();
   rawDefFileCache.clear();
   clickNegCache.clear();
   prefetchedDocs.clear();
@@ -1428,9 +1422,6 @@ export async function activate(context: vscode.ExtensionContext) {
       for (const key of posPreviewCache.keys()) {
         if (key.startsWith(prefix)) { posPreviewCache.delete(key); }
       }
-      for (const key of nativeOnlyHoverUntil.keys()) {
-        if (key.startsWith(prefix)) { nativeOnlyHoverUntil.delete(key); }
-      }
       rawDefFileCache.delete(savedDoc.uri.fsPath);
       // Any new save may have added a definition the prior scan missed.
       clickNegCache.clear();
@@ -1606,13 +1597,6 @@ function patchSharedService(service: any) {
     const apiLine = position?.lineNumber !== undefined ? position.lineNumber - 1 : (position?.line ?? 0);
     const apiChar = position?.column !== undefined ? position.column - 1 : (position?.character ?? 0);
     const posKey = `${uri?.path || uri}:${apiLine}:${apiChar}`;
-    const now = Date.now();
-
-    // Legacy 200ms dedup — protects against recursive re-entrancy and recent
-    // successful handles re-emitting previews on the same result object.
-    if (posKey === lastPreviewKey && now - lastPreviewTime < 200) {
-      return result;
-    }
 
     // Extract types from code fences
     const types: string[] = [];
@@ -1628,21 +1612,12 @@ function patchSharedService(service: any) {
     const postNativeMs = () => `${Date.now() - postNativeT0}ms`;
     const typesKey = uniqueTypes.slice(0, 3).sort().join(',');
     const inflightKey = `${posKey}:${typesKey}`;
-    const nativeOnlyUntil = nativeOnlyHoverUntil.get(inflightKey);
-    if (nativeOnlyUntil !== undefined) {
-      if (Date.now() < nativeOnlyUntil) {
-        return result;
-      }
-      nativeOnlyHoverUntil.delete(inflightKey);
-    }
 
     // (A) Position-level preview cache — short-circuits everything below for
     // repeated hovers at the same point with the same extracted types.
     const cachedPreviews = posPreviewGet(posKey, typesKey);
     if (cachedPreviews) {
       log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} POS-CACHE hit (${hoverMs()})`);
-      lastPreviewKey = posKey;
-      lastPreviewTime = now;
       return attachPreviews(result, cachedPreviews);
     }
 
@@ -1650,7 +1625,15 @@ function patchSharedService(service: any) {
     // for the same hover event at the same position with the same types.
     const existingInflight = inflightHoverPreviews.get(inflightKey);
     if (existingInflight) {
-      log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} INFLIGHT bg-only (${hoverMs()}, post=${postNativeMs()})`);
+      const computed = await existingInflight.catch(err => {
+        log.error(`[hover] inflight compute error: ${err} (${hoverMs()})`);
+        return null;
+      });
+      if (computed) {
+        log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} INFLIGHT attached (${hoverMs()}, post=${postNativeMs()})`);
+        return attachPreviews(result, computed.previews);
+      }
+      log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} INFLIGHT empty (${hoverMs()}, post=${postNativeMs()})`);
       return result;
     }
 
@@ -1719,11 +1702,16 @@ function patchSharedService(service: any) {
               return cached.result.preview;
             }
             if (!cached) {
-              const warmupMode = typeName === hoveredWord && !!hoveredAnchor ? 'hover' : 'prefetch';
-              const warmup = resolveInBackground(typeName, docUri, fallbackPos, largeCacheKey, warmupMode);
-              warmup.catch(() => {});
+              const resolved = await resolveInBackground(typeName, docUri, fallbackPos, largeCacheKey, 'hover');
+              if (resolved) {
+                if (resolved.defDoc) {
+                  resolvedDefDocs.push({ uri: resolved.defUri, doc: resolved.defDoc });
+                }
+                log.info(`[hover]   "${typeName}" → large-doc resolved for first hover lines=${resolved.previewLineCount ?? '?'} md=${resolved.preview.length} (${Date.now() - typeT0}ms)`);
+                return resolved.preview;
+              }
             }
-            log.info(`[hover]   "${typeName}" → large-doc scan skipped (${Date.now() - typeT0}ms)`);
+            log.info(`[hover]   "${typeName}" → large-doc unresolved (${Date.now() - typeT0}ms)`);
             return null;
           }
           // (D) Cached compiled regex, scan hovered doc first
@@ -1761,23 +1749,12 @@ function patchSharedService(service: any) {
           return null;
         }
 
-        const warmupMode = typeName === hoveredWord && !!hoveredAnchor ? 'hover' : 'prefetch';
-        const bgPromise = resolveInBackground(typeName, matchUri, pos, cacheKey, warmupMode);
-        bgPromise.catch(() => {});
-        const BUDGET = Symbol('budget-exceeded');
-        const raced = await Promise.race<DefCacheEntry['result'] | typeof BUDGET>([
-          bgPromise,
-          new Promise(r => setTimeout(() => r(BUDGET), HOVER_BUDGET_MS)),
-        ]);
-        if (raced === BUDGET) {
-          log.info(`[hover]   "${typeName}" → budget ${HOVER_BUDGET_MS}ms exceeded, bg running (${Date.now() - typeT0}ms)`);
-          return null;
-        }
+        const raced = await resolveInBackground(typeName, matchUri, pos, cacheKey, 'hover');
         if (raced) {
           if (raced.defDoc) {
             resolvedDefDocs.push({ uri: raced.defUri, doc: raced.defDoc });
           }
-          log.info(`[hover]   "${typeName}" → resolved in budget (${Date.now() - typeT0}ms)`);
+          log.info(`[hover]   "${typeName}" → resolved for first hover (${Date.now() - typeT0}ms)`);
           return raced.preview;
         }
         return null;
@@ -1796,29 +1773,24 @@ function patchSharedService(service: any) {
       return { typesKey, previews };
     };
 
-    const computePromise = new Promise<{ typesKey: string; previews: string } | null>((resolve, reject) => {
-      setTimeout(() => {
-        runCompute().then(resolve, reject);
-      }, HOVER_BG_WARMUP_DELAY_MS);
-    });
-
+    const computePromise = runCompute();
     inflightHoverPreviews.set(inflightKey, computePromise);
     hoverRecursionDepth++;
-    computePromise
-      .then(computed => {
-        if (computed) { posPreviewSet(posKey, computed.typesKey, computed.previews); }
-      })
-      .catch(err => log.error(`[hover] bg compute error: ${err} (${hoverMs()})`))
-      .finally(() => {
-        hoverRecursionDepth--;
-        inflightHoverPreviews.delete(inflightKey);
-      });
-    nativeOnlyHoverUntil.set(inflightKey, Date.now() + NATIVE_ONLY_STABILITY_MS);
-    if (nativeOnlyHoverUntil.size > POS_PREVIEW_MAX) {
-      const firstNativeOnly = nativeOnlyHoverUntil.keys().next().value;
-      if (firstNativeOnly !== undefined) { nativeOnlyHoverUntil.delete(firstNativeOnly); }
+    try {
+      const computed = await computePromise;
+      if (computed) {
+        posPreviewSet(posKey, computed.typesKey, computed.previews);
+        log.info(`[hover] done: first-hover preview attached md=${computed.previews.length} (${hoverMs()}, post=${postNativeMs()})`);
+        return attachPreviews(result, computed.previews);
+      }
+    } catch (err) {
+      log.error(`[hover] compute error: ${err} (${hoverMs()})`);
+    } finally {
+      hoverRecursionDepth--;
+      inflightHoverPreviews.delete(inflightKey);
     }
-    log.info(`[hover] done: cache miss returned native hover; preview warming in bg (${hoverMs()}, post=${postNativeMs()})`);
+
+    log.info(`[hover] done: no definition preview resolved; returning native hover (${hoverMs()}, post=${postNativeMs()})`);
     return result;
   };
 
