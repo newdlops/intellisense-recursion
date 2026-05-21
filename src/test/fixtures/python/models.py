@@ -1,3 +1,20 @@
+CAN_EXERCISE = "can_exercise"
+
+
+def model_annotation(target):
+    return target
+
+
+def method_annotation(func):
+    return func
+
+
+def decorator_factory(label: str):
+    def decorator(func):
+        return func
+    return decorator
+
+
 class BaseModel:
     """Base model with common fields."""
     id: int
@@ -25,6 +42,7 @@ class User(TimestampedModel):
         return self.name
 
 
+@model_annotation
 class Company(TimestampedModel):
     """Company entity."""
     STATUS_ACTIVE = "active"
@@ -32,8 +50,23 @@ class Company(TimestampedModel):
     owner: User
     address: str
 
+    @method_annotation
     def get_owner(self) -> User:
         return self.owner
+
+    @property
+    def owner_display_name(self) -> str:
+        return self.owner.get_display_name()
+
+    @classmethod
+    @decorator_factory("empty")
+    def create_empty(cls):
+        return cls()
+
+    @staticmethod
+    @decorator_factory("title")
+    def normalize_title(title: str) -> str:
+        return title.strip()
 
 
 class Stakeholder(BaseModel):

@@ -47,3 +47,4 @@ bin/**
 .zoek-rs
 .lh
 .vscode*
+log.txt

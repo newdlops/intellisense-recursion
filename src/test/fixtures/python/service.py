@@ -1,5 +1,5 @@
 from typing import Any, Optional
-from models import User, Company, Stakeholder, BaseModel, AdminUser, AuditModel, LargeHoverModel
+from models import User, Company, Stakeholder, BaseModel, AdminUser, AuditModel, LargeHoverModel, CAN_EXERCISE
 
 
 def create_user(name: str, email: str) -> User:
@@ -23,6 +23,9 @@ def process_model(model: BaseModel) -> None:
 def process_large(model: LargeHoverModel) -> None:
     """Process large hover model."""
     model.save()
+
+
+exercise_flag = CAN_EXERCISE,
 
 
 def find_entity(data: Any) -> Optional[BaseModel]:

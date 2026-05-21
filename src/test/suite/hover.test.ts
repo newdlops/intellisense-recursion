@@ -85,6 +85,15 @@ function extractPreviews(text: string): string[] {
   return parts.slice(1); // everything after the first --- separator is a preview
 }
 
+function normalizeHoverContent(text: string): string {
+  return text
+    .replace(/<!--ir-direct-hover-->/g, '')
+    .replace(/\r\n?/g, '\n')
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 // Helper: find position of identifier in document
 function findIdentifier(doc: vscode.TextDocument, identifier: string, occurrence = 0): vscode.Position | null {
   const text = doc.getText();
@@ -96,6 +105,28 @@ function findIdentifier(doc: vscode.TextDocument, identifier: string, occurrence
       return doc.positionAt(match.index);
     }
     count++;
+  }
+  return null;
+}
+
+function findIdentifierOnLine(
+  doc: vscode.TextDocument,
+  lineFragment: string,
+  identifier: string,
+  occurrence = 0,
+): vscode.Position | null {
+  for (let line = 0; line < doc.lineCount; line++) {
+    const text = doc.lineAt(line).text;
+    if (!text.includes(lineFragment)) { continue; }
+    const regex = new RegExp(`\\b${identifier}\\b`, 'g');
+    let match: RegExpExecArray | null;
+    let count = 0;
+    while ((match = regex.exec(text)) !== null) {
+      if (count === occurrence) {
+        return new vscode.Position(line, match.index);
+      }
+      count++;
+    }
   }
   return null;
 }
@@ -121,6 +152,54 @@ interface PatchStatus {
   lastHoverFetchPosition: { uri: string; line: number; character: number } | null;
 }
 
+interface HoverDomState {
+  ok: boolean;
+  reason: string;
+  patchVersion: number;
+  hoverCount: number;
+  populatedHoverCount: number;
+  emptyHoverCount: number;
+  activeTextLength: number;
+  activeText: string;
+  activeRect: { left: number; top: number; width: number; height: number } | null;
+  linkTypes: string[];
+  expectedTypes: string[];
+  missingExpectedTypes: string[];
+  tokenizedSourceCount: number;
+  fallbackTokenizedSourceCount: number;
+  mtkSpanCount: number;
+  mtkClassCount: number;
+  irTkSpanCount: number;
+  irTkClassCount: number;
+  nativeTokenizedSource: boolean;
+  typeLinksInTokenizedSource: number;
+  tokenizedLinkTypes: string[];
+  tokenizedText: string;
+  tokenizedInlineStyle: string;
+  tokenizedFontFamily: string;
+  tokenizedFontSize: string;
+  tokenizedLineHeight: string;
+  tokenizedLetterSpacing: string;
+  tokenizedBackgroundColor: string;
+  hoverBackgroundColor: string;
+  hoverForegroundColor: string;
+  tokenizedColorCount: number;
+  tokenizedColorSamples: string[];
+  manualTokenThemeRuleCount: number;
+  tokenizedThemeApplied: boolean;
+  layoutMaxRightOverflow: number;
+  layoutMaxBottomOverflow: number;
+  layoutWideBlockCount: number;
+  layoutMaxBlockWidth: number;
+  scrollTop: number;
+  scrollHeight: number;
+  scrollClientHeight: number;
+  scrollMaxTop: number;
+  backButtonCount: number;
+  backButtonVisibleCount: number;
+  syntaxHighlighted: boolean;
+}
+
 async function getPatchStatus(): Promise<PatchStatus> {
   return vscode.commands.executeCommand<PatchStatus>('intellisenseRecursion.getPatchStatus');
 }
@@ -136,6 +215,260 @@ async function waitForPreviewState(identifier: string | null, historyLength: num
     await new Promise(resolve => setTimeout(resolve, 100));
   }
   assert.fail(`Timed out waiting for preview=${identifier}, history=${historyLength}. Last status: ${JSON.stringify(last)}`);
+}
+
+function hoverDomStateMatches(
+  state: HoverDomState | undefined,
+  expectedLinks: string[],
+  expectedTextFragments: string[],
+  requireSyntaxHighlight: boolean,
+  absentTextFragments: string[] = [],
+) {
+  if (!state?.ok) { return false; }
+  if (!expectedLinks.every(link => state.linkTypes.includes(link))) { return false; }
+  if (!expectedTextFragments.every(fragment => state.activeText.includes(fragment))) { return false; }
+  if (absentTextFragments.some(fragment => state.activeText.includes(fragment))) { return false; }
+  return !requireSyntaxHighlight || !!state.syntaxHighlighted;
+}
+
+function bestHoverDomState(
+  rows: any[] | undefined,
+  expectedLinks: string[] = [],
+  expectedTextFragments: string[] = [],
+  requireSyntaxHighlight = false,
+  absentTextFragments: string[] = [],
+): HoverDomState | undefined {
+  const values = (rows || [])
+    .map(row => row?.value)
+    .filter(Boolean) as HoverDomState[];
+  return values.find(value => hoverDomStateMatches(
+    value,
+    expectedLinks,
+    expectedTextFragments,
+    requireSyntaxHighlight,
+    absentTextFragments,
+  ))
+    || values.find(value => value.ok)
+    || values.sort((a, b) => (b.activeTextLength || 0) - (a.activeTextLength || 0))[0];
+}
+
+function compactHoverDomState(state: HoverDomState | undefined) {
+  if (!state) { return state; }
+  return {
+    ok: state.ok,
+    reason: state.reason,
+    patchVersion: state.patchVersion,
+    hoverCount: state.hoverCount,
+    populatedHoverCount: state.populatedHoverCount,
+    emptyHoverCount: state.emptyHoverCount,
+    activeTextLength: state.activeTextLength,
+    activeText: (state.activeText || '').slice(0, 500),
+    linkTypes: (state.linkTypes || []).slice(0, 40),
+    missingExpectedTypes: state.missingExpectedTypes,
+    tokenizedSourceCount: state.tokenizedSourceCount,
+    fallbackTokenizedSourceCount: state.fallbackTokenizedSourceCount,
+    mtkSpanCount: state.mtkSpanCount,
+    mtkClassCount: state.mtkClassCount,
+    irTkSpanCount: state.irTkSpanCount,
+    irTkClassCount: state.irTkClassCount,
+    nativeTokenizedSource: state.nativeTokenizedSource,
+    typeLinksInTokenizedSource: state.typeLinksInTokenizedSource,
+    tokenizedLinkTypes: (state.tokenizedLinkTypes || []).slice(0, 40),
+    tokenizedText: (state.tokenizedText || '').slice(0, 500),
+    tokenizedInlineStyle: state.tokenizedInlineStyle,
+    tokenizedFontFamily: state.tokenizedFontFamily,
+    tokenizedFontSize: state.tokenizedFontSize,
+    tokenizedLineHeight: state.tokenizedLineHeight,
+    tokenizedLetterSpacing: state.tokenizedLetterSpacing,
+    tokenizedColorCount: state.tokenizedColorCount,
+    tokenizedColorSamples: state.tokenizedColorSamples?.slice(0, 8),
+    manualTokenThemeRuleCount: state.manualTokenThemeRuleCount,
+    tokenizedThemeApplied: state.tokenizedThemeApplied,
+    hoverBackgroundColor: state.hoverBackgroundColor,
+    hoverForegroundColor: state.hoverForegroundColor,
+    layoutMaxRightOverflow: state.layoutMaxRightOverflow,
+    layoutMaxBottomOverflow: state.layoutMaxBottomOverflow,
+    layoutWideBlockCount: state.layoutWideBlockCount,
+    layoutMaxBlockWidth: state.layoutMaxBlockWidth,
+    scrollTop: state.scrollTop,
+    scrollHeight: state.scrollHeight,
+    scrollClientHeight: state.scrollClientHeight,
+    scrollMaxTop: state.scrollMaxTop,
+    backButtonCount: state.backButtonCount,
+    backButtonVisibleCount: state.backButtonVisibleCount,
+    syntaxHighlighted: state.syntaxHighlighted,
+  };
+}
+
+async function waitForHoverDomState(
+  expectedLinks: string[] = [],
+  expectedTextFragments: string[] = [],
+  timeoutMs = 10000,
+  requireSyntaxHighlight = false,
+  includeStyleAndLayout = true,
+  absentTextFragments: string[] = [],
+): Promise<HoverDomState> {
+  const start = Date.now();
+  let lastRows: any[] | undefined;
+  let lastState: HoverDomState | undefined;
+  while (Date.now() - start < timeoutMs) {
+    lastRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverDomStateHarnessForTests',
+      expectedLinks,
+      includeStyleAndLayout,
+    );
+    lastState = bestHoverDomState(lastRows, expectedLinks, expectedTextFragments, requireSyntaxHighlight, absentTextFragments);
+    if (hoverDomStateMatches(lastState, expectedLinks, expectedTextFragments, requireSyntaxHighlight, absentTextFragments)) {
+      return lastState!;
+    }
+    await new Promise(resolve => setTimeout(resolve, 120));
+  }
+  assert.fail(`Timed out waiting for hover DOM links=${expectedLinks.join(',')} text=${expectedTextFragments.join(',')} absent=${absentTextFragments.join(',')} syntax=${requireSyntaxHighlight}. `
+    + `Last state=${JSON.stringify(compactHoverDomState(lastState))} rowCount=${lastRows?.length ?? 0}`);
+}
+
+async function waitForHoverScrollTopNear(
+  expectedScrollTop: number,
+  tolerance = 4,
+  expectedLinks: string[] = [],
+  expectedTextFragments: string[] = [],
+  timeoutMs = 10000,
+): Promise<HoverDomState> {
+  const start = Date.now();
+  let lastState: HoverDomState | undefined;
+  while (Date.now() - start < timeoutMs) {
+    const rows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverDomStateHarnessForTests',
+      expectedLinks,
+      true,
+    );
+    lastState = bestHoverDomState(rows, expectedLinks, expectedTextFragments, true);
+    if (lastState?.ok && Math.abs((lastState.scrollTop || 0) - expectedScrollTop) <= tolerance) {
+      return lastState;
+    }
+    await new Promise(resolve => setTimeout(resolve, 120));
+  }
+  assert.fail(`Timed out waiting for hover scrollTop≈${expectedScrollTop}. Last state=${JSON.stringify(compactHoverDomState(lastState))}`);
+}
+
+function assertHoverDoesNotContain(state: HoverDomState, fragments: string[], context: string) {
+  for (const fragment of fragments) {
+    assert.ok(!state.activeText.includes(fragment),
+      `${context} should not include previous page fragment "${fragment}". ${JSON.stringify(state)}`);
+  }
+}
+
+function assertHoverThemeStable(baseline: HoverDomState, state: HoverDomState, context: string) {
+  assertStrictNativeTokenTheme(state, context);
+  assertStrictNativeTokenTheme(baseline, `${context} baseline`);
+  assert.ok(state.tokenizedColorSamples.length >= Math.min(3, baseline.tokenizedColorSamples.length),
+    `${context} should keep a comparable set of computed token colors. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.ok(state.tokenizedThemeApplied,
+    `${context} should have computed token theme colors. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.ok(state.tokenizedColorCount > 1,
+    `${context} should render more than one computed token color. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.strictEqual(state.manualTokenThemeRuleCount, 0,
+    `${context} should not use manual ir-tk token color rules`);
+  assert.ok(state.mtkClassCount > 1,
+    `${context} should use VS Code mtk theme classes, not only fallback semantic classes. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.ok(state.nativeTokenizedSource,
+    `${context} should use VS Code native tokenized source, not the fallback regex tokenizer. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.strictEqual(state.irTkSpanCount, 0,
+    `${context} should not contain fallback ir-tk token spans. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.strictEqual(state.tokenizedFontSize, baseline.tokenizedFontSize,
+    `${context} should preserve token font size`);
+  assert.strictEqual(state.tokenizedLineHeight, baseline.tokenizedLineHeight,
+    `${context} should preserve token line height`);
+  assert.strictEqual(state.tokenizedLetterSpacing, baseline.tokenizedLetterSpacing,
+    `${context} should preserve token letter spacing`);
+  assert.strictEqual(state.tokenizedInlineStyle, baseline.tokenizedInlineStyle,
+    `${context} should preserve native monaco-tokenized-source inline style`);
+  assert.strictEqual(state.hoverBackgroundColor, baseline.hoverBackgroundColor,
+    `${context} should preserve hover background color`);
+  assert.strictEqual(state.hoverForegroundColor, baseline.hoverForegroundColor,
+    `${context} should preserve hover foreground color`);
+}
+
+function assertNoFallbackTokenization(state: HoverDomState, context: string) {
+  assert.strictEqual(state.fallbackTokenizedSourceCount, 0,
+    `${context} should be rendered by VS Code native tokenization, not the renderer fallback tokenizer. `
+    + `${JSON.stringify(compactHoverDomState(state))}`);
+}
+
+function assertStrictNativeTokenTheme(
+  state: HoverDomState,
+  context: string,
+  requiredTokenLinks: string[] = [],
+  requiredTokenText: string[] = [],
+) {
+  assert.ok(state.syntaxHighlighted,
+    `${context} should be syntax-highlighted. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.ok(state.tokenizedThemeApplied,
+    `${context} should have native token theme applied. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.ok(state.nativeTokenizedSource,
+    `${context} should use monaco-tokenized-source with native mtk classes. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.ok(state.tokenizedSourceCount >= 1,
+    `${context} should render a tokenized source block. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.ok(state.mtkSpanCount >= 4,
+    `${context} should contain multiple mtk token spans. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.ok(state.mtkClassCount >= 3,
+    `${context} should contain several distinct mtk token classes. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.ok(state.tokenizedColorCount >= 3,
+    `${context} should compute several token colors from the active theme. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.strictEqual(state.irTkSpanCount, 0,
+    `${context} should not render fallback ir-tk spans. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.strictEqual(state.irTkClassCount, 0,
+    `${context} should not render fallback ir-tk classes. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.strictEqual(state.manualTokenThemeRuleCount, 0,
+    `${context} should not define manual token color CSS rules. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.ok(state.tokenizedInlineStyle.includes('--vscode-editor-font-family'),
+    `${context} should inherit the VS Code editor font family. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.ok(state.tokenizedInlineStyle.includes('white-space: pre'),
+    `${context} should preserve monaco tokenized whitespace style. ${JSON.stringify(compactHoverDomState(state))}`);
+  for (const link of requiredTokenLinks) {
+    assert.ok(state.tokenizedLinkTypes.includes(link),
+      `${context} should expose "${link}" as a clickable link inside tokenized source. ${JSON.stringify(compactHoverDomState(state))}`);
+  }
+  for (const fragment of requiredTokenText) {
+    assert.ok(state.tokenizedText.includes(fragment),
+      `${context} tokenized source should include "${fragment}". ${JSON.stringify(compactHoverDomState(state))}`);
+  }
+}
+
+function assertHoverHasNoWideTrace(state: HoverDomState, context: string) {
+  assert.ok((state.layoutMaxRightOverflow || 0) <= 2,
+    `${context} has a block protruding beyond the active hover width. ${JSON.stringify(compactHoverDomState(state))}`);
+  assert.strictEqual(state.layoutWideBlockCount || 0, 0,
+    `${context} has wide block descendants that look like stale large-hover traces. ${JSON.stringify(compactHoverDomState(state))}`);
+}
+
+function assertMarkdownDoesNotContain(markdown: string, fragments: string[], context: string) {
+  for (const fragment of fragments) {
+    assert.ok(!markdown.includes(fragment),
+      `${context} markdown should not include previous page fragment "${fragment}"`);
+  }
+}
+
+function countArrayValue(values: string[], target: string): number {
+  return values.filter(value => value === target).length;
+}
+
+function assertTokenizedLinkCounts(
+  state: HoverDomState,
+  expectedCounts: Record<string, number>,
+  context: string,
+) {
+  for (const [link, count] of Object.entries(expectedCounts)) {
+    assert.strictEqual(countArrayValue(state.tokenizedLinkTypes, link), count,
+      `${context} should expose exactly ${count} tokenized "${link}" link(s). `
+      + `${JSON.stringify(compactHoverDomState(state))}`);
+  }
+}
+
+function assertPreviewHeaderMatches(state: PatchStatus, pattern: RegExp, context: string) {
+  const firstLine = state.currentPreviewMarkdown.split(/\r?\n/, 1)[0] || '';
+  assert.ok(pattern.test(firstLine),
+    `${context} should resolve to the expected definition header. First line=${firstLine}`);
 }
 
 function hoverRangeCovers(hovers: vscode.Hover[], expected: vscode.Range): boolean {
@@ -406,6 +739,9 @@ suite('Hover Preview E2E', () => {
 
     const lengths = results.map(r => r.length);
     console.log(`  5 hovers: lengths [${lengths.join(', ')}]`);
+    for (let i = 0; i < results.length; i++) {
+      assert.ok(results[i].length > 0, `Hover #${i + 1} returned empty content`);
+    }
 
     // Key check: repeated hovers may warm the definition preview cache, but
     // each individual response must stay bounded and must not duplicate the
@@ -435,11 +771,29 @@ suite('Hover Preview E2E', () => {
 
     // Collect all preview blocks from all hover objects
     const allPreviews: string[] = [];
+    const fullHoverTexts: string[] = [];
+    let emptyHoverCount = 0;
     for (const hover of hovers) {
       const text = hoverToText(hover);
+      const normalizedText = normalizeHoverContent(text);
+      if (normalizedText) {
+        fullHoverTexts.push(normalizedText);
+      } else {
+        emptyHoverCount++;
+      }
       const previews = extractPreviews(text);
       allPreviews.push(...previews);
     }
+    assert.strictEqual(emptyHoverCount, 0,
+      `Hover providers should not return empty hover objects when content is available`);
+
+    const fullSeen = new Map<string, number>();
+    for (const text of fullHoverTexts) {
+      fullSeen.set(text, (fullSeen.get(text) || 0) + 1);
+    }
+    const fullDuplicates = [...fullSeen.entries()].filter(([, count]) => count > 1);
+    assert.strictEqual(fullDuplicates.length, 0,
+      `Found exact duplicate hover content across providers: ${fullDuplicates.map(([, c]) => c).join(', ')}`);
 
     if (allPreviews.length === 0) {
       console.log(`  no preview blocks found (extension may not be active)`);
@@ -510,6 +864,154 @@ suite('Hover Preview E2E', () => {
 suite('Hover Drill-Down E2E', () => {
   const lang = getFixtureLang();
 
+  test(`[${lang}] hover panel symbol clicks support several drill-down hops`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(60000);
+
+    const folders = vscode.workspace.workspaceFolders!;
+    const serviceFile = vscode.Uri.file(path.join(folders[0].uri.fsPath, 'service.py'));
+    const doc = await vscode.workspace.openTextDocument(serviceFile);
+
+    const anchor = findIdentifier(doc, 'Company', 1);
+    assert.ok(anchor, 'Could not find Company annotation in service.py');
+    await vscode.window.showTextDocument(doc, { selection: new vscode.Range(anchor!, anchor!) });
+    await waitForLanguageServer(doc, 'Company');
+    const hoverText = await getHoverText(doc.uri, anchor!);
+    assert.ok(hoverText.length > 0, 'Initial hover on Company returned empty content');
+
+    await vscode.commands.executeCommand('intellisenseRecursion.goToType', doc.uri.toString(), 'PREVIEW:Company');
+    const initialCompanyState = await waitForPreviewState('Company', 0);
+    assert.ok(initialCompanyState.currentPreviewMarkdown.includes('class Company'),
+      'Initial preview for Company should contain its class definition');
+    const seedRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverSeedPreviewHarnessForTests',
+      'Company',
+      initialCompanyState.currentPreviewMarkdown,
+    );
+    const seeded = (seedRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(seeded, `Could not seed initial hover panel for drill-down test. Rows=${JSON.stringify(seedRows)}`);
+    const initialDom = await waitForHoverDomState(['get_owner'], ['Company'], 10000, true);
+    assert.ok(initialDom.backButtonVisibleCount > 0,
+      `Initial drill-down preview should expose a back button. ${JSON.stringify(compactHoverDomState(initialDom))}`);
+    assertHoverThemeStable(initialDom, initialDom, 'Initial Company hover DOM');
+    assertStrictNativeTokenTheme(initialDom, 'Initial Company hover DOM',
+      ['get_owner', 'User'],
+      ['class Company', 'def get_owner']);
+    assertHoverHasNoWideTrace(initialDom, 'Initial Company hover DOM');
+
+    const steps: Array<{ identifier: string; history: string[]; contains: string[]; nextLinks: string[]; absent: string[] }> = [
+      {
+        identifier: 'get_owner',
+        history: ['Company'],
+        contains: ['def get_owner', 'return self.owner'],
+        nextLinks: ['User'],
+        absent: ['class Company', 'STATUS_ACTIVE = "active"', 'title: str'],
+      },
+      {
+        identifier: 'User',
+        history: ['Company', 'get_owner'],
+        contains: ['class User', 'TimestampedModel'],
+        nextLinks: ['TimestampedModel'],
+        absent: ['class Company', 'STATUS_ACTIVE = "active"', 'def get_owner', 'return self.owner'],
+      },
+      {
+        identifier: 'TimestampedModel',
+        history: ['Company', 'get_owner', 'User'],
+        contains: ['class TimestampedModel', 'BaseModel'],
+        nextLinks: ['BaseModel'],
+        absent: ['class Company', 'STATUS_ACTIVE = "active"', 'def get_owner', 'class User', 'email: str'],
+      },
+    ];
+
+    let state: PatchStatus | null = null;
+    for (const step of steps) {
+      console.log(`  preparing hover panel click → ${step.identifier}`);
+      const beforeDom = await waitForHoverDomState([step.identifier], [], 10000, false, false);
+      assert.strictEqual(beforeDom.hoverCount, 1,
+        `Expected exactly one real hover before clicking ${step.identifier}. ${JSON.stringify(beforeDom)}`);
+      assert.ok(beforeDom.activeTextLength > 0,
+        `Actual hover DOM is empty before clicking ${step.identifier}. ${JSON.stringify(beforeDom)}`);
+
+      console.log(`  firing hover panel click → ${step.identifier}`);
+      const rows = await vscode.commands.executeCommand<any[]>(
+        'intellisenseRecursion.runHoverLinkClickHarnessForTests',
+        step.identifier,
+      );
+      const result = (rows || []).map(row => row?.value).find(value => value?.ok);
+      assert.ok(result, `Renderer did not click a ${step.identifier} hover link. Rows=${JSON.stringify(rows)}`);
+      assert.strictEqual(result.syntheticHover, false,
+        `Drill-down click test must use the real hover DOM, not a synthetic hover. ${JSON.stringify(result)}`);
+
+      console.log(`  waiting hover panel render → ${step.identifier}`);
+      state = await waitForPreviewState(step.identifier, step.history.length);
+      console.log(`  preview state ready → ${step.identifier}`);
+      assert.deepStrictEqual(state.previewHistoryIdentifiers, step.history,
+        `Unexpected history after hover-panel click into ${step.identifier}`);
+      for (const fragment of step.contains) {
+        assert.ok(state.currentPreviewMarkdown.includes(fragment),
+          `Preview for ${step.identifier} should contain "${fragment}"`);
+      }
+      assertMarkdownDoesNotContain(state.currentPreviewMarkdown, step.absent,
+        `Preview for ${step.identifier}`);
+      const includeDetailedDomMetrics = step.identifier === 'get_owner';
+      const afterDom = await waitForHoverDomState(
+        step.nextLinks,
+        [step.identifier],
+        10000,
+        true,
+        includeDetailedDomMetrics,
+        step.absent,
+      );
+      assert.strictEqual(afterDom.hoverCount, 1,
+        `Drill-down into ${step.identifier} left stale hover panels. ${JSON.stringify(afterDom)}`);
+      assert.strictEqual(afterDom.emptyHoverCount, 0,
+        `Drill-down into ${step.identifier} left empty hover roots. ${JSON.stringify(afterDom)}`);
+      assert.ok(afterDom.activeTextLength > 0,
+        `Drill-down into ${step.identifier} rendered an empty hover DOM. ${JSON.stringify(afterDom)}`);
+      assertHoverDoesNotContain(afterDom, step.absent,
+        `Hover DOM after drilling into ${step.identifier}`);
+      if (includeDetailedDomMetrics) {
+        assertHoverThemeStable(initialDom, afterDom,
+          `Hover DOM after drilling into ${step.identifier}`);
+        assertStrictNativeTokenTheme(afterDom,
+          `Hover DOM after drilling into ${step.identifier}`,
+          step.nextLinks,
+          step.contains);
+        assertHoverHasNoWideTrace(afterDom,
+          `Hover DOM after drilling into ${step.identifier}`);
+      }
+      assert.ok(afterDom.backButtonVisibleCount > 0,
+        `Drill-down into ${step.identifier} should keep a visible back button. ${JSON.stringify(compactHoverDomState(afterDom))}`);
+      if (step.identifier === 'get_owner' && initialDom.activeRect && afterDom.activeRect) {
+        assert.ok(afterDom.activeRect.width <= initialDom.activeRect.width,
+          `Shrinking from Company to get_owner should not keep a wider hover box. `
+          + `initial=${JSON.stringify(initialDom.activeRect)} after=${JSON.stringify(afterDom.activeRect)}`);
+      }
+      assert.ok(afterDom.tokenizedText.includes(step.identifier),
+        `Tokenized drill-down code should include ${step.identifier}. ${JSON.stringify(afterDom)}`);
+      assert.ok(afterDom.typeLinksInTokenizedSource > 0,
+        `Drill-down symbols should remain clickable inside highlighted code. ${JSON.stringify(afterDom)}`);
+      console.log(`  hover panel click → ${state.currentPreviewIdentifier}, history=[${state.previewHistoryIdentifiers.join(' > ')}]`);
+    }
+
+    const backRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverBackButtonClickHarnessForTests',
+    );
+    const backResult = (backRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(backResult, `Renderer did not click the hover back button. Rows=${JSON.stringify(backRows)}`);
+    const backState = await waitForPreviewState('User', 2);
+    assert.deepStrictEqual(backState.previewHistoryIdentifiers, ['Company', 'get_owner'],
+      'Hover back button should pop the extension-host preview history');
+    const backDom = await waitForHoverDomState(['TimestampedModel'], ['User'], 10000, true, false);
+    assert.ok(backDom.backButtonVisibleCount > 0,
+      `Back result should still expose a back button while history remains. ${JSON.stringify(compactHoverDomState(backDom))}`);
+    assertHoverDoesNotContain(backDom, ['class TimestampedModel', 'class Company', 'def get_owner'],
+      'Hover DOM after clicking the back button');
+
+    await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+    await waitForPreviewState(null, 0);
+  });
+
   test(`[${lang}] preview click path supports several drill-down hops`, async function () {
     if (lang !== 'python') { this.skip(); return; }
     this.timeout(60000);
@@ -521,6 +1023,7 @@ suite('Hover Drill-Down E2E', () => {
     const anchor = findIdentifier(doc, 'Company', 1);
     assert.ok(anchor, 'Could not find Company annotation in service.py');
     await vscode.window.showTextDocument(doc, { selection: new vscode.Range(anchor!, anchor!) });
+    await waitForLanguageServer(doc, 'Company');
 
     const hoverText = await getHoverText(doc.uri, anchor!);
     assert.ok(hoverText.length > 0, 'Initial hover on Company returned empty content');
@@ -529,7 +1032,7 @@ suite('Hover Drill-Down E2E', () => {
     assert.ok(initial.hoverPatchActive, 'Hover patch must be active for drill-down preview E2E');
     assert.ok(initial.lastHoverFetchPosition, 'Initial hover did not record an anchor position');
 
-    await vscode.commands.executeCommand('intellisenseRecursion.goToType', doc.uri.toString(), 'PREVIEW:Company');
+    await vscode.commands.executeCommand('intellisenseRecursion.goToType', 'PREVIEW:Company');
     const companyState = await waitForPreviewState('Company', 0);
     assert.ok(companyState.currentPreviewMarkdown.includes('class Company'),
       'Preview for Company should contain its class definition');
@@ -537,7 +1040,7 @@ suite('Hover Drill-Down E2E', () => {
       'Preview for Company should expose assignment-style constants as candidates');
     console.log(`  drill-down → Company, history=[${companyState.previewHistoryIdentifiers.join(' > ')}]`);
 
-    await vscode.commands.executeCommand('intellisenseRecursion.goToType', doc.uri.toString(), 'PREVIEW:STATUS_ACTIVE');
+    await vscode.commands.executeCommand('intellisenseRecursion.previewType', 'STATUS_ACTIVE');
     const constantState = await waitForPreviewState('STATUS_ACTIVE', 1);
     assert.deepStrictEqual(constantState.previewHistoryIdentifiers, ['Company'],
       'Constant drill-down should keep Company in preview history');
@@ -549,15 +1052,42 @@ suite('Hover Drill-Down E2E', () => {
     const restoredCompany = await waitForPreviewState('Company', 0);
     assert.deepStrictEqual(restoredCompany.previewHistoryIdentifiers, []);
 
-    const steps: Array<{ identifier: string; history: string[]; contains: string[] }> = [
-      { identifier: 'get_owner', history: ['Company'], contains: ['def get_owner', 'return self.owner'] },
-      { identifier: 'User', history: ['Company', 'get_owner'], contains: ['class User', 'TimestampedModel'] },
-      { identifier: 'TimestampedModel', history: ['Company', 'get_owner', 'User'], contains: ['class TimestampedModel', 'BaseModel'] },
-      { identifier: 'BaseModel', history: ['Company', 'get_owner', 'User', 'TimestampedModel'], contains: ['class BaseModel', 'def save'] },
+    const steps: Array<{ identifier: string; history: string[]; contains: string[]; absent: string[] }> = [
+      {
+        identifier: 'get_owner',
+        history: ['Company'],
+        contains: ['def get_owner', 'return self.owner'],
+        absent: ['class Company', 'STATUS_ACTIVE = "active"', 'title: str'],
+      },
+      {
+        identifier: 'User',
+        history: ['Company', 'get_owner'],
+        contains: ['class User', 'TimestampedModel'],
+        absent: ['class Company', 'STATUS_ACTIVE = "active"', 'def get_owner', 'return self.owner'],
+      },
+      {
+        identifier: 'TimestampedModel',
+        history: ['Company', 'get_owner', 'User'],
+        contains: ['class TimestampedModel', 'BaseModel'],
+        absent: ['class Company', 'STATUS_ACTIVE = "active"', 'def get_owner', 'class User', 'email: str'],
+      },
+      {
+        identifier: 'BaseModel',
+        history: ['Company', 'get_owner', 'User', 'TimestampedModel'],
+        contains: ['class BaseModel', 'def save'],
+        absent: ['class Company', 'STATUS_ACTIVE = "active"', 'def get_owner', 'class User', 'class TimestampedModel'],
+      },
     ];
 
     for (const step of steps) {
-      await vscode.commands.executeCommand('intellisenseRecursion.goToType', doc.uri.toString(), `PREVIEW:${step.identifier}`);
+      if (step.identifier === 'get_owner') {
+        await vscode.commands.executeCommand('intellisenseRecursion.drillDown', {
+          docUri: doc.uri.toString(),
+          identifier: step.identifier,
+        });
+      } else {
+        await vscode.commands.executeCommand('intellisenseRecursion.goToType', doc.uri.toString(), `PREVIEW:${step.identifier}`);
+      }
       const state = await waitForPreviewState(step.identifier, step.history.length);
       assert.deepStrictEqual(state.previewHistoryIdentifiers, step.history,
         `Unexpected history after drilling into ${step.identifier}`);
@@ -565,6 +1095,8 @@ suite('Hover Drill-Down E2E', () => {
         assert.ok(state.currentPreviewMarkdown.includes(fragment),
           `Preview for ${step.identifier} should contain "${fragment}"`);
       }
+      assertMarkdownDoesNotContain(state.currentPreviewMarkdown, step.absent,
+        `Command preview for ${step.identifier}`);
       console.log(`  drill-down → ${step.identifier}, history=[${state.previewHistoryIdentifiers.join(' > ')}]`);
     }
 
@@ -576,7 +1108,643 @@ suite('Hover Drill-Down E2E', () => {
     const backTwo = await waitForPreviewState('User', 2);
     assert.deepStrictEqual(backTwo.previewHistoryIdentifiers, ['Company', 'get_owner']);
 
+    await vscode.commands.executeCommand('editor.action.hideHover');
+    await new Promise(resolve => setTimeout(resolve, 120));
+    const reopenedHoverText = await getHoverText(doc.uri, anchor!);
+    assert.ok(reopenedHoverText.length > 0,
+      'Hover should reopen with content after drill-down is closed');
+
     console.log(`  back stack → ${backTwo.currentPreviewIdentifier}, history=[${backTwo.previewHistoryIdentifiers.join(' > ')}]`);
+  });
+
+  test(`[${lang}] hover back restores the previous preview scroll position`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(60000);
+
+    const folders = vscode.workspace.workspaceFolders!;
+    const serviceFile = vscode.Uri.file(path.join(folders[0].uri.fsPath, 'service.py'));
+    const doc = await vscode.workspace.openTextDocument(serviceFile);
+    const anchor = findIdentifier(doc, 'LargeHoverModel', 1);
+    assert.ok(anchor, 'Could not find LargeHoverModel annotation in service.py');
+    await vscode.commands.executeCommand('editor.action.hideHover');
+    await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+    await waitForPreviewState(null, 0);
+    await vscode.window.showTextDocument(doc, { selection: new vscode.Range(anchor!, anchor!) });
+    await waitForLanguageServer(doc, 'LargeHoverModel');
+    await getHoverText(doc.uri, anchor!);
+
+    await vscode.commands.executeCommand('intellisenseRecursion.goToType', doc.uri.toString(), 'PREVIEW:LargeHoverModel');
+    const largeState = await waitForPreviewState('LargeHoverModel', 0);
+    assert.ok(largeState.currentPreviewMarkdown.includes('field_070'),
+      'LargeHoverModel preview should be large enough to scroll');
+    const seedRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverSeedPreviewHarnessForTests',
+      'LargeHoverModel',
+      largeState.currentPreviewMarkdown,
+    );
+    const seeded = (seedRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(seeded, `Could not seed LargeHoverModel hover panel. Rows=${JSON.stringify(seedRows)}`);
+    const largeDom = await waitForHoverDomState(
+      ['BaseModel'],
+      ['LargeHoverModel', 'field_070'],
+      10000,
+      true,
+    );
+    assert.ok(largeDom.scrollMaxTop > 80,
+      `LargeHoverModel hover should have enough scroll range. ${JSON.stringify(compactHoverDomState(largeDom))}`);
+
+    const targetScrollTop = Math.min(largeDom.scrollMaxTop, 260);
+    const scrollRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverScrollHarnessForTests',
+      targetScrollTop,
+    );
+    const scrolled = (scrollRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(scrolled,
+      `Could not scroll LargeHoverModel hover. Rows=${JSON.stringify(scrollRows)}`);
+    assert.ok(Math.abs(scrolled.after.scrollTop - targetScrollTop) <= 4,
+      `LargeHoverModel hover should scroll to the requested position. ${JSON.stringify(scrolled)}`);
+
+    await vscode.commands.executeCommand('intellisenseRecursion.previewType', doc.uri.toString(), 'BaseModel');
+    const baseState = await waitForPreviewState('BaseModel', 1);
+    assert.deepStrictEqual(baseState.previewHistoryIdentifiers, ['LargeHoverModel'],
+      'BaseModel drill-down should keep LargeHoverModel in preview history');
+    await waitForHoverDomState(['save'], ['class BaseModel'], 10000, true);
+
+    const backRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverBackButtonClickHarnessForTests',
+    );
+    const backClick = (backRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(backClick, `Back button should be clickable. Rows=${JSON.stringify(backRows)}`);
+    const restoredState = await waitForPreviewState('LargeHoverModel', 0);
+    assert.ok(restoredState.currentPreviewMarkdown.includes('field_070'),
+      'Back should restore LargeHoverModel preview markdown');
+    const restoredDom = await waitForHoverScrollTopNear(
+      scrolled.after.scrollTop,
+      4,
+      ['BaseModel'],
+      ['LargeHoverModel', 'field_070'],
+      10000,
+    );
+    assertHoverHasNoWideTrace(restoredDom, 'LargeHoverModel back restore hover');
+  });
+
+  test(`[${lang}] hover panel annotation symbols are drill-down links`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(60000);
+
+    const folders = vscode.workspace.workspaceFolders!;
+    const serviceFile = vscode.Uri.file(path.join(folders[0].uri.fsPath, 'service.py'));
+    const doc = await vscode.workspace.openTextDocument(serviceFile);
+    const anchor = findIdentifier(doc, 'find_entity');
+    assert.ok(anchor, 'Could not find find_entity in service.py');
+    await vscode.window.showTextDocument(doc, { selection: new vscode.Range(anchor!, anchor!) });
+    await waitForLanguageServer(doc, 'find_entity');
+
+    const hoverText = await getHoverText(doc.uri, anchor!);
+    assert.ok(hoverText.includes('Any') && hoverText.includes('Optional') && hoverText.includes('BaseModel'),
+      `find_entity hover should include annotation symbols. Got: ${hoverText.slice(0, 500)}`);
+
+    async function seedFindEntityHover() {
+      await vscode.commands.executeCommand('editor.action.hideHover');
+      await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+      await waitForPreviewState(null, 0);
+      await vscode.window.showTextDocument(doc, { selection: new vscode.Range(anchor!, anchor!) });
+      await getHoverText(doc.uri, anchor!);
+      await vscode.commands.executeCommand('intellisenseRecursion.goToType', doc.uri.toString(), 'PREVIEW:find_entity');
+      const state = await waitForPreviewState('find_entity', 0);
+      assert.ok(state.currentPreviewMarkdown.includes('def find_entity'),
+        'Preview for find_entity should contain its function definition');
+      const seedRows = await vscode.commands.executeCommand<any[]>(
+        'intellisenseRecursion.runHoverSeedPreviewHarnessForTests',
+        'find_entity',
+        state.currentPreviewMarkdown,
+      );
+      const seeded = (seedRows || []).map(row => row?.value).find(value => value?.ok);
+      assert.ok(seeded, `Could not seed find_entity hover panel. Rows=${JSON.stringify(seedRows)}`);
+      return waitForHoverDomState(
+        ['Any', 'Optional', 'BaseModel'],
+        ['find_entity'],
+        10000,
+        true,
+      );
+    }
+
+    const dom = await seedFindEntityHover();
+    assertStrictNativeTokenTheme(dom, 'Annotation preview',
+      ['Any', 'Optional', 'BaseModel'],
+      ['def find_entity', 'Optional', 'BaseModel']);
+    assertTokenizedLinkCounts(dom, { Any: 1, Optional: 1, BaseModel: 1 },
+      'Annotation preview');
+
+    const annotationDirectCases = [
+      {
+        identifier: 'Optional',
+        includes: ['Optional'],
+        headerPattern: /^`Optional` — \*.*typing.*:\d+\*$/,
+      },
+      {
+        identifier: 'BaseModel',
+        includes: ['class BaseModel', 'def save'],
+        headerPattern: /^`BaseModel` — \*models\.py:18\*$/,
+      },
+    ];
+    for (const annotationCase of annotationDirectCases) {
+      await seedFindEntityHover();
+      await vscode.commands.executeCommand(
+        'intellisenseRecursion.previewType',
+        doc.uri.toString(),
+        annotationCase.identifier,
+      );
+      const directState = await waitForPreviewState(annotationCase.identifier, 1);
+      assert.deepStrictEqual(directState.previewHistoryIdentifiers, ['find_entity'],
+        `${annotationCase.identifier} direct annotation drill-down should keep find_entity in preview history`);
+      assertPreviewHeaderMatches(directState, annotationCase.headerPattern,
+        `${annotationCase.identifier} direct annotation drill-down`);
+      for (const fragment of annotationCase.includes) {
+        assert.ok(directState.currentPreviewMarkdown.includes(fragment),
+          `${annotationCase.identifier} direct annotation drill-down should include ${fragment}`);
+      }
+      assertMarkdownDoesNotContain(directState.currentPreviewMarkdown, ['def find_entity(data: Any)'],
+        `${annotationCase.identifier} direct annotation drill-down`);
+      const directDom = await waitForHoverDomState(
+        [],
+        annotationCase.includes,
+        10000,
+        true,
+        true,
+        ['def find_entity(data: Any)'],
+      );
+      assertHoverDoesNotContain(directDom, ['def find_entity(data: Any)'],
+        `${annotationCase.identifier} direct annotation drill-down hover`);
+      assertHoverHasNoWideTrace(directDom, `${annotationCase.identifier} direct annotation drill-down hover`);
+    }
+
+    await seedFindEntityHover();
+    const rows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverLinkClickHarnessForTests',
+      'Optional',
+    );
+    const result = (rows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(result, `Renderer did not click Optional annotation link. Rows=${JSON.stringify(rows)}`);
+    const optionalState = await waitForPreviewState('Optional', 1);
+    assert.deepStrictEqual(optionalState.previewHistoryIdentifiers, ['find_entity'],
+      'Optional annotation drill-down should keep find_entity in preview history');
+
+    await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+    await waitForPreviewState(null, 0);
+
+    await seedFindEntityHover();
+    const baseRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverLinkClickHarnessForTests',
+      'BaseModel',
+    );
+    const baseResult = (baseRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(baseResult, `Renderer did not click BaseModel annotation link. Rows=${JSON.stringify(baseRows)}`);
+    const baseState = await waitForPreviewState('BaseModel', 1);
+    assert.deepStrictEqual(baseState.previewHistoryIdentifiers, ['find_entity'],
+      'Project annotation drill-down should keep find_entity in preview history');
+    assert.ok(baseState.currentPreviewMarkdown.includes('class BaseModel'),
+      'Project annotation drill-down should show BaseModel definition');
+    const baseDom = await waitForHoverDomState(['save'], ['BaseModel'], 10000, true);
+    assertStrictNativeTokenTheme(baseDom, 'Project annotation drill-down hover',
+      ['save'],
+      ['class BaseModel', 'def save']);
+
+    await vscode.commands.executeCommand('editor.action.hideHover');
+    await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+    await waitForPreviewState(null, 0);
+  });
+
+  test(`[${lang}] hover panel decorators are drill-down links`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(70000);
+
+    const folders = vscode.workspace.workspaceFolders!;
+    const serviceFile = vscode.Uri.file(path.join(folders[0].uri.fsPath, 'service.py'));
+    const doc = await vscode.workspace.openTextDocument(serviceFile);
+    const anchor = findIdentifier(doc, 'Company', 1);
+    assert.ok(anchor, 'Could not find Company annotation in service.py');
+    await vscode.window.showTextDocument(doc, { selection: new vscode.Range(anchor!, anchor!) });
+    await waitForLanguageServer(doc, 'Company');
+
+    async function prepareCompanyPreviewState() {
+      await vscode.commands.executeCommand('editor.action.hideHover');
+      await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+      await waitForPreviewState(null, 0);
+      await vscode.window.showTextDocument(doc, { selection: new vscode.Range(anchor!, anchor!) });
+      const hoverText = await getHoverText(doc.uri, anchor!);
+      assert.ok(hoverText.includes('Company'),
+        `Native decorator preview test should establish a Company hover anchor first. Got: ${hoverText.slice(0, 500)}`);
+      await vscode.commands.executeCommand('intellisenseRecursion.goToType', doc.uri.toString(), 'PREVIEW:Company');
+      const state = await waitForPreviewState('Company', 0);
+      assert.ok(state.currentPreviewMarkdown.includes('@model_annotation'),
+        'Company preview should include its class decorator');
+      assert.ok(state.currentPreviewMarkdown.includes('@method_annotation'),
+        'Company preview should include its method decorator');
+      assert.ok(state.currentPreviewMarkdown.includes('@decorator_factory'),
+        'Company preview should include call-style decorators');
+      assert.ok(state.currentPreviewMarkdown.includes('@classmethod'),
+        'Company preview should include builtin classmethod decorator');
+      assert.ok(state.currentPreviewMarkdown.includes('@staticmethod'),
+        'Company preview should include builtin staticmethod decorator');
+      return state;
+    }
+
+    async function showCompanyPreviewHover() {
+      const state = await prepareCompanyPreviewState();
+      const seedRows = await vscode.commands.executeCommand<any[]>(
+        'intellisenseRecursion.runHoverSeedPreviewHarnessForTests',
+        'Company',
+        state.currentPreviewMarkdown,
+      );
+      const seeded = (seedRows || []).map(row => row?.value).find(value => value?.ok);
+      assert.ok(seeded, `Could not seed decorated Company hover panel. Rows=${JSON.stringify(seedRows)}`);
+      return waitForHoverDomState(
+        ['model_annotation', 'method_annotation', 'decorator_factory', 'classmethod', 'staticmethod', 'get_owner'],
+        ['Company'],
+        10000,
+        true,
+      );
+    }
+
+    const companyDom = await showCompanyPreviewHover();
+    assert.strictEqual(companyDom.hoverCount, 1,
+      `Decorator test must use exactly one active hover. ${JSON.stringify(compactHoverDomState(companyDom))}`);
+    assert.ok(companyDom.backButtonVisibleCount > 0,
+      `Native decorator preview hover should expose a back button. ${JSON.stringify(compactHoverDomState(companyDom))}`);
+    assertStrictNativeTokenTheme(companyDom, 'Decorated class preview',
+      ['model_annotation', 'method_annotation', 'decorator_factory', 'classmethod', 'staticmethod', 'get_owner', 'User'],
+      ['@model_annotation', '@method_annotation', '@decorator_factory', '@classmethod', '@staticmethod', 'def get_owner']);
+    assertTokenizedLinkCounts(companyDom, {
+      model_annotation: 1,
+      method_annotation: 1,
+      decorator_factory: 2,
+      classmethod: 1,
+      staticmethod: 1,
+    }, 'Decorated class preview');
+
+    const decoratorCases = [
+      {
+        identifier: 'model_annotation',
+        includes: ['def model_annotation', 'return target'],
+        headerPattern: /^`model_annotation` — \*models\.py:4\*$/,
+      },
+      {
+        identifier: 'method_annotation',
+        includes: ['def method_annotation', 'return func'],
+        headerPattern: /^`method_annotation` — \*models\.py:8\*$/,
+      },
+      {
+        identifier: 'decorator_factory',
+        includes: ['def decorator_factory', 'return decorator'],
+        headerPattern: /^`decorator_factory` — \*models\.py:12\*$/,
+      },
+      {
+        identifier: 'classmethod',
+        includes: ['class classmethod'],
+        headerPattern: /^`classmethod` — \*.*builtins\.pyi:\d+\*$/,
+      },
+      {
+        identifier: 'staticmethod',
+        includes: ['class staticmethod'],
+        headerPattern: /^`staticmethod` — \*.*builtins\.pyi:\d+\*$/,
+      },
+    ];
+    const staleCompanyFragments = ['class Company', '@model_annotation', '@method_annotation', 'def get_owner'];
+
+    for (const decoratorCase of decoratorCases) {
+      await prepareCompanyPreviewState();
+      await vscode.commands.executeCommand(
+        'intellisenseRecursion.previewType',
+        doc.uri.toString(),
+        decoratorCase.identifier,
+      );
+      const directState = await waitForPreviewState(decoratorCase.identifier, 1);
+      assert.deepStrictEqual(directState.previewHistoryIdentifiers, ['Company'],
+        `${decoratorCase.identifier} direct drill-down should keep Company in preview history`);
+      assertPreviewHeaderMatches(directState, decoratorCase.headerPattern,
+        `${decoratorCase.identifier} direct drill-down`);
+      for (const fragment of decoratorCase.includes) {
+        assert.ok(directState.currentPreviewMarkdown.includes(fragment),
+          `${decoratorCase.identifier} direct drill-down should include ${fragment}`);
+      }
+      assertMarkdownDoesNotContain(directState.currentPreviewMarkdown, staleCompanyFragments,
+        `${decoratorCase.identifier} direct drill-down`);
+    }
+
+    await showCompanyPreviewHover();
+    const getOwnerRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverLinkClickHarnessForTests',
+      'get_owner',
+    );
+    const getOwnerClick = (getOwnerRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(getOwnerClick,
+      `Renderer did not click get_owner method link. Rows=${JSON.stringify(getOwnerRows)}`);
+    const getOwnerState = await waitForPreviewState('get_owner', 1);
+    assert.deepStrictEqual(getOwnerState.previewHistoryIdentifiers, ['Company'],
+      'get_owner drill-down should keep Company in preview history');
+    assert.ok(getOwnerState.currentPreviewMarkdown.includes('@method_annotation'),
+      'get_owner preview should keep the decorator attached above the function definition');
+    const getOwnerDom = await waitForHoverDomState(
+      ['method_annotation'],
+      ['@method_annotation', 'def get_owner'],
+      10000,
+      true,
+      true,
+      ['class Company'],
+    );
+    assertTokenizedLinkCounts(getOwnerDom, { method_annotation: 1 },
+      'Decorated function preview');
+    const methodDecoratorRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverLinkClickHarnessForTests',
+      'method_annotation',
+    );
+    const methodDecoratorClick = (methodDecoratorRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(methodDecoratorClick,
+      `Renderer did not click method_annotation above function definition. Rows=${JSON.stringify(methodDecoratorRows)}`);
+    const methodDecoratorState = await waitForPreviewState('method_annotation', 2);
+    assert.deepStrictEqual(methodDecoratorState.previewHistoryIdentifiers, ['Company', 'get_owner'],
+      'method_annotation drill-down from decorated function should keep Company > get_owner history');
+    assertPreviewHeaderMatches(methodDecoratorState, /^`method_annotation` — \*models\.py:8\*$/,
+      'method_annotation from decorated function drill-down');
+
+    await prepareCompanyPreviewState();
+    const fillerTypeLines = Array.from({ length: 560 }, (_, index) =>
+      `    field_${String(index).padStart(3, '0')}: DeferredFillerType${String(index).padStart(3, '0')}`);
+    const fillerMethodLines = Array.from({ length: 220 }, (_, index) =>
+      `    def filler_${String(index).padStart(3, '0')}(self) -> None:\n        pass`);
+    const deferredDecoratorCode = [
+      'class DeferredDecoratorPreview:',
+      ...fillerTypeLines,
+      ...fillerMethodLines,
+      '    @method_annotation',
+      '    def decorated(self) -> None:',
+      '        pass',
+    ].join('\n');
+    assert.ok(deferredDecoratorCode.length > 24000,
+      `Deferred decorator fixture must exceed eager wrapping threshold, got ${deferredDecoratorCode.length}`);
+    const deferredDecoratorMarkdown = [
+      '`Company` — *models.py:39*',
+      '```python',
+      deferredDecoratorCode,
+      '```',
+    ].join('\n');
+    const deferredRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverSeedPreviewHarnessForTests',
+      'Company',
+      deferredDecoratorMarkdown,
+    );
+    const deferredSeed = (deferredRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(deferredSeed, `Could not seed deferred decorator hover panel. Rows=${JSON.stringify(deferredRows)}`);
+    assert.ok(!(deferredSeed.linkTypes || []).includes('method_annotation'),
+      `Deferred large hover should not eagerly pre-wrap method_annotation. ${JSON.stringify(deferredSeed)}`);
+    const deferredDom = await waitForHoverDomState(
+      [],
+      ['DeferredDecoratorPreview'],
+      10000,
+      true,
+      true,
+    );
+    assert.ok(deferredDom.activeTextLength > 24000,
+      `Deferred decorator hover should stay large. ${JSON.stringify(compactHoverDomState(deferredDom))}`);
+    const deferredClickRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverLinkClickHarnessForTests',
+      'method_annotation',
+    );
+    const deferredClick = (deferredClickRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(deferredClick,
+      `Pointer hover did not promote @method_annotation into a drill-down link. Rows=${JSON.stringify(deferredClickRows)}`);
+    assert.strictEqual(deferredClick.linkAlreadyExisted, false,
+      `Deferred decorator test must exercise point-based wrapping, not eager links. ${JSON.stringify(deferredClick)}`);
+    assert.ok(deferredClick.pointWrap?.decoratorContext,
+      `Point wrapper should recognize @method_annotation as a decorator context. ${JSON.stringify(deferredClick)}`);
+    assert.ok(deferredClick.pointWrap?.pointActive || deferredClick.pointActive,
+      `Hovering the decorator should visibly activate underline state. ${JSON.stringify(deferredClick)}`);
+    const deferredDecoratorState = await waitForPreviewState('method_annotation', 1);
+    assert.deepStrictEqual(deferredDecoratorState.previewHistoryIdentifiers, ['Company'],
+      'Deferred decorator drill-down should keep Company in preview history');
+    assertPreviewHeaderMatches(deferredDecoratorState, /^`method_annotation` — \*models\.py:8\*$/,
+      'deferred @method_annotation hover click drill-down');
+
+    for (const decoratorCase of decoratorCases) {
+      await showCompanyPreviewHover();
+      const rows = await vscode.commands.executeCommand<any[]>(
+        'intellisenseRecursion.runHoverLinkClickHarnessForTests',
+        decoratorCase.identifier,
+      );
+      const click = (rows || []).map(row => row?.value).find(value => value?.ok);
+      assert.ok(click,
+        `Renderer did not click decorator link ${decoratorCase.identifier}. Rows=${JSON.stringify(rows)}`);
+      assert.strictEqual(click.syntheticHover, false,
+        `Decorator drill-down test must use the real hover DOM, not a synthetic hover. ${JSON.stringify(click)}`);
+      const decoratorState = await waitForPreviewState(decoratorCase.identifier, 1);
+      assert.deepStrictEqual(decoratorState.previewHistoryIdentifiers, ['Company'],
+        `${decoratorCase.identifier} drill-down should keep Company in preview history`);
+      assertPreviewHeaderMatches(decoratorState, decoratorCase.headerPattern,
+        `${decoratorCase.identifier} hover click drill-down`);
+      for (const fragment of decoratorCase.includes) {
+        assert.ok(decoratorState.currentPreviewMarkdown.includes(fragment),
+          `${decoratorCase.identifier} drill-down should include ${fragment}`);
+      }
+      assertMarkdownDoesNotContain(decoratorState.currentPreviewMarkdown, staleCompanyFragments,
+        `${decoratorCase.identifier} hover click drill-down`);
+      const decoratorDom = await waitForHoverDomState(
+        [],
+        decoratorCase.includes,
+        10000,
+        true,
+        true,
+        staleCompanyFragments,
+      );
+      assertHoverDoesNotContain(decoratorDom, staleCompanyFragments,
+        `${decoratorCase.identifier} hover click drill-down`);
+      assertHoverHasNoWideTrace(decoratorDom, `${decoratorCase.identifier} hover click drill-down`);
+      assertStrictNativeTokenTheme(decoratorDom, `${decoratorCase.identifier} drill-down hover`,
+        [],
+        decoratorCase.includes);
+      const backRows = await vscode.commands.executeCommand<any[]>(
+        'intellisenseRecursion.runHoverBackButtonClickHarnessForTests',
+      );
+      const backClick = (backRows || []).map(row => row?.value).find(value => value?.ok);
+      assert.ok(backClick,
+        `${decoratorCase.identifier} drill-down should expose a working back button. Rows=${JSON.stringify(backRows)}`);
+      const backState = await waitForPreviewState('Company', 0);
+      assert.ok(backState.currentPreviewMarkdown.includes('@method_annotation'),
+        `${decoratorCase.identifier} back should restore the decorated Company preview`);
+      const backDom = await waitForHoverDomState(
+        ['model_annotation', 'method_annotation', 'decorator_factory'],
+        ['class Company', '@method_annotation'],
+        10000,
+        true,
+      );
+      assertStrictNativeTokenTheme(backDom, `${decoratorCase.identifier} back to decorated class`,
+        ['model_annotation', 'method_annotation', 'decorator_factory'],
+        ['class Company', '@method_annotation']);
+    }
+
+    await vscode.commands.executeCommand('editor.action.hideHover');
+    await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+    await waitForPreviewState(null, 0);
+  });
+
+  test(`[${lang}] hover panel property decorator drills down through definition provider`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(45000);
+
+    const folders = vscode.workspace.workspaceFolders!;
+    const serviceFile = vscode.Uri.file(path.join(folders[0].uri.fsPath, 'service.py'));
+    const doc = await vscode.workspace.openTextDocument(serviceFile);
+    const anchor = findIdentifier(doc, 'Company', 1);
+    assert.ok(anchor, 'Could not find Company annotation in service.py');
+    await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+    await waitForPreviewState(null, 0);
+    await vscode.window.showTextDocument(doc, { selection: new vscode.Range(anchor!, anchor!) });
+    await waitForLanguageServer(doc, 'Company');
+    const hoverText = await getHoverText(doc.uri, anchor!);
+    assert.ok(hoverText.includes('Company'),
+      `Initial Company hover should establish an anchor before preview. Got: ${hoverText.slice(0, 500)}`);
+
+    await vscode.commands.executeCommand('intellisenseRecursion.goToType', doc.uri.toString(), 'PREVIEW:Company');
+    const state = await waitForPreviewState('Company', 0);
+    assert.ok(state.currentPreviewMarkdown.includes('@property'),
+      'Company preview should include its @property decorator');
+    assert.ok(state.currentPreviewMarkdown.includes('def owner_display_name'),
+      'Company preview should include the decorated property method');
+    const seedRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverSeedPreviewHarnessForTests',
+      'Company',
+      state.currentPreviewMarkdown,
+    );
+    const seeded = (seedRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(seeded, `Could not seed Company hover panel. Rows=${JSON.stringify(seedRows)}`);
+    const companyDom = await waitForHoverDomState(
+      ['property'],
+      ['@property', 'owner_display_name'],
+      10000,
+      true,
+    );
+    assert.ok(companyDom.tokenizedLinkTypes.includes('property'),
+      `@property should be a tokenized drill-down link. ${JSON.stringify(compactHoverDomState(companyDom))}`);
+
+    const propertyRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverLinkClickHarnessForTests',
+      'property',
+    );
+    const propertyClick = (propertyRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(propertyClick,
+      `Renderer did not click @property link. Rows=${JSON.stringify(propertyRows)}`);
+    const propertyState = await waitForPreviewState('property', 1);
+    assert.deepStrictEqual(propertyState.previewHistoryIdentifiers, ['Company'],
+      '@property drill-down should keep Company in preview history');
+    assert.ok(propertyState.currentPreviewMarkdown.includes('class property'),
+      '@property drill-down should show builtins.property definition');
+    const propertyDom = await waitForHoverDomState(
+      [],
+      ['class property'],
+      10000,
+      true,
+    );
+    assertStrictNativeTokenTheme(propertyDom, '@property drill-down hover',
+      [],
+      ['class property']);
+
+    await vscode.commands.executeCommand('editor.action.hideHover');
+    await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+    await waitForPreviewState(null, 0);
+  });
+
+  test(`[${lang}] hover panel links every editor definition-provider symbol in preview code`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(60000);
+
+    const folders = vscode.workspace.workspaceFolders!;
+    const serviceFile = vscode.Uri.file(path.join(folders[0].uri.fsPath, 'service.py'));
+    const modelsFile = vscode.Uri.file(path.join(folders[0].uri.fsPath, 'models.py'));
+    const serviceDoc = await vscode.workspace.openTextDocument(serviceFile);
+    const modelsDoc = await vscode.workspace.openTextDocument(modelsFile);
+    const anchor = findIdentifier(serviceDoc, 'Company', 1);
+    assert.ok(anchor, 'Could not find Company annotation in service.py');
+    await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+    await waitForPreviewState(null, 0);
+    await vscode.window.showTextDocument(serviceDoc, { selection: new vscode.Range(anchor!, anchor!) });
+    await waitForLanguageServer(serviceDoc, 'Company');
+    await getHoverText(serviceDoc.uri, anchor!);
+
+    const editorSymbols = [
+      { identifier: 'model_annotation', line: '@model_annotation' },
+      { identifier: 'TimestampedModel', line: 'class Company(TimestampedModel)' },
+      { identifier: 'STATUS_ACTIVE', line: 'STATUS_ACTIVE = "active"' },
+      { identifier: 'User', line: 'def get_owner(self) -> User' },
+      { identifier: 'method_annotation', line: '@method_annotation' },
+      { identifier: 'get_owner', line: 'def get_owner(self) -> User' },
+      { identifier: 'property', line: '@property' },
+      { identifier: 'owner_display_name', line: 'def owner_display_name' },
+      { identifier: 'owner', line: 'return self.owner.get_display_name()' },
+      { identifier: 'get_display_name', line: 'return self.owner.get_display_name()' },
+      { identifier: 'classmethod', line: '@classmethod' },
+      { identifier: 'decorator_factory', line: '@decorator_factory("empty")' },
+      { identifier: 'create_empty', line: 'def create_empty' },
+      { identifier: 'staticmethod', line: '@staticmethod' },
+      { identifier: 'normalize_title', line: 'def normalize_title' },
+    ];
+
+    const cmdClickable = new Set<string>();
+    for (const symbol of editorSymbols) {
+      const pos = findIdentifierOnLine(modelsDoc, symbol.line, symbol.identifier);
+      assert.ok(pos,
+        `Could not find ${symbol.identifier} on fixture line "${symbol.line}"`);
+      const defs = await vscode.commands.executeCommand<any[]>(
+        'vscode.executeDefinitionProvider',
+        modelsDoc.uri,
+        pos!,
+      );
+      const def = getDefLocation(defs || []);
+      assert.ok(def,
+        `${symbol.identifier} on "${symbol.line}" should be editor cmd+click navigable`);
+      cmdClickable.add(symbol.identifier);
+    }
+
+    await vscode.commands.executeCommand('intellisenseRecursion.goToType', serviceDoc.uri.toString(), 'PREVIEW:Company');
+    const state = await waitForPreviewState('Company', 0);
+    const seedRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverSeedPreviewHarnessForTests',
+      'Company',
+      state.currentPreviewMarkdown,
+    );
+    const seeded = (seedRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(seeded, `Could not seed Company hover panel. Rows=${JSON.stringify(seedRows)}`);
+
+    const expectedLinks = [...cmdClickable];
+    const dom = await waitForHoverDomState(
+      expectedLinks,
+      ['@property', 'get_display_name'],
+      10000,
+      true,
+    );
+    for (const identifier of expectedLinks) {
+      assert.ok(dom.tokenizedLinkTypes.includes(identifier),
+        `Editor cmd+clickable symbol "${identifier}" should be a drill-down link. `
+        + `${JSON.stringify(compactHoverDomState(dom))}`);
+    }
+
+    const rows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverLinkClickHarnessForTests',
+      'get_display_name',
+    );
+    const clicked = (rows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(clicked,
+      `Renderer did not click get_display_name method-access link. Rows=${JSON.stringify(rows)}`);
+    const methodState = await waitForPreviewState('get_display_name', 1);
+    assert.deepStrictEqual(methodState.previewHistoryIdentifiers, ['Company'],
+      'Method-access drill-down should keep Company in preview history');
+    assert.ok(methodState.currentPreviewMarkdown.includes('def get_display_name'),
+      'Method-access drill-down should show get_display_name definition');
+    assert.ok(methodState.currentPreviewMarkdown.includes('return self.name'),
+      'Method-access drill-down should show the resolved method body');
+
+    await vscode.commands.executeCommand('editor.action.hideHover');
+    await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+    await waitForPreviewState(null, 0);
   });
 });
 
@@ -601,10 +1769,15 @@ suite('Hover Symbol Coverage E2E', () => {
       includes: string[];
     }> = [
       { doc: serviceDoc, identifier: 'Company', occurrence: 1, includes: ['class Company', 'owner: User'] },
+      { doc: serviceDoc, identifier: 'CAN_EXERCISE', occurrence: 1, includes: ['CAN_EXERCISE = "can_exercise"'] },
+      { doc: modelsDoc, identifier: 'model_annotation', occurrence: 1, includes: ['def model_annotation', 'return target'] },
+      { doc: modelsDoc, identifier: 'method_annotation', occurrence: 1, includes: ['def method_annotation', 'return func'] },
+      { doc: modelsDoc, identifier: 'decorator_factory', occurrence: 1, includes: ['def decorator_factory', 'return decorator'] },
       { doc: modelsDoc, identifier: 'STATUS_ACTIVE', includes: ['STATUS_ACTIVE = "active"'] },
       { doc: modelsDoc, identifier: 'get_owner', includes: ['def get_owner', 'return self.owner'] },
       { doc: serviceDoc, identifier: 'get_company_stakeholders', includes: ['def get_company_stakeholders', 'return []'] },
       { doc: serviceDoc, identifier: 'save', includes: ['def save', 'pass'] },
+      { doc: serviceDoc, identifier: 'get_display_name', occurrence: 1, includes: ['def get_display_name', 'return self.name'] },
     ];
 
     for (const entry of cases) {
@@ -617,18 +1790,36 @@ suite('Hover Symbol Coverage E2E', () => {
         symbolRange!.end.line,
         Math.max(symbolRange!.start.character, symbolRange!.end.character - 1),
       );
-      const probePositions = [symbolRange!.start, endProbe];
-      let hoverText = '';
+      const lineLength = entry.doc.lineAt(symbolRange!.start.line).text.length;
+      const beforeProbe = new vscode.Position(
+        symbolRange!.start.line,
+        Math.max(0, symbolRange!.start.character - 1),
+      );
+      const afterProbe = new vscode.Position(
+        symbolRange!.end.line,
+        Math.min(lineLength, symbolRange!.end.character),
+      );
+      const probePositions = [symbolRange!.start, endProbe, beforeProbe, afterProbe]
+        .filter((probe, index, all) => all.findIndex(other => other.isEqual(probe)) === index);
+      const hoverTexts: string[] = [];
       for (const probe of probePositions) {
         const hovers = await getRawHovers(entry.doc.uri, probe);
         const probeText = textFromHovers(hovers);
-        if (!hoverText) { hoverText = probeText; }
+        if (probeText) { hoverTexts.push(probeText); }
         assert.ok(probeText.length > 0,
-          `Hover on ${entry.identifier} at ${probe.character} returned empty content`);
+          `Hover on ${entry.identifier} near ${probe.character} returned empty content`);
         assert.ok(hoverRangeCovers(hovers, symbolRange!),
-          `Hover on ${entry.identifier} at ${probe.character} should cover full symbol range `
+          `Hover on ${entry.identifier} near ${probe.character} should cover full symbol range `
           + `${symbolRange!.start.line}:${symbolRange!.start.character}-${symbolRange!.end.character}`);
+        const normalizedTexts = hovers
+          .map(hoverToText)
+          .map(normalizeHoverContent)
+          .filter(Boolean);
+        const duplicates = normalizedTexts.filter((text, index) => normalizedTexts.indexOf(text) !== index);
+        assert.strictEqual(duplicates.length, 0,
+          `Hover on ${entry.identifier} near ${probe.character} returned duplicate provider content`);
       }
+      const hoverText = hoverTexts.join('\n');
       assert.ok(hoverText.length > 0,
         `Hover on ${entry.identifier} returned empty content`);
       for (const fragment of entry.includes) {
@@ -650,10 +1841,12 @@ suite('Hover Renderer E2E', () => {
     const rows = await vscode.commands.executeCommand<any[]>(
       'intellisenseRecursion.runHoverRendererHarnessForTests',
     );
+    assert.strictEqual((rows || []).length, 1,
+      `Renderer DOM harness should run in exactly one VS Code window. Rows=${JSON.stringify(rows)}`);
     const result = (rows || []).map(row => row?.value).find(value => value?.ok);
     assert.ok(result, `Renderer harness did not run. Rows=${JSON.stringify(rows)}`);
 
-    assert.ok(result.patchVersion >= 101,
+    assert.ok(result.patchVersion >= 122,
       `Renderer hover patch should be installed, got ${result.patchVersion}`);
     assert.ok(result.largeBefore.isScrollable,
       `Large synthetic hover should be scrollable. ${JSON.stringify(result.largeBefore)}`);
@@ -662,6 +1855,20 @@ suite('Hover Renderer E2E', () => {
     assert.ok(result.largeAfterWheel.scroller.scrollTop > result.largeBefore.scroller.scrollTop,
       `Wheel should scroll hover panel. Before=${JSON.stringify(result.largeBefore.scroller)} `
       + `After=${JSON.stringify(result.largeAfterWheel.scroller)}`);
+    assert.ok(result.hugeTextLength > 24000,
+      `Huge synthetic hover should exercise deferred wrapping. ${JSON.stringify(result)}`);
+    assert.strictEqual(result.hugeEagerLinks, 0,
+      `Huge hover should not eagerly wrap every symbol. ${JSON.stringify(result)}`);
+    assert.ok(result.dedupeHoverConnected,
+      `Duplicate dedupe must not remove the active hover. ${JSON.stringify(result)}`);
+    assert.ok(result.dedupeSentinelConnected,
+      `Duplicate dedupe must not remove non-markdown row state. ${JSON.stringify(result)}`);
+    assert.ok(result.dedupeSecondRowConnected,
+      `Duplicate dedupe should narrow removal to markdown when a row has extra state. ${JSON.stringify(result)}`);
+    assert.strictEqual(result.dedupeMarkdownCount, 1,
+      `Renderer DOM dedupe should remove duplicate markdown blocks without removing row state. ${JSON.stringify(result)}`);
+    assert.ok(result.dedupeTextLength > 0,
+      `Duplicate dedupe must leave hover content visible. ${JSON.stringify(result)}`);
     assert.strictEqual(result.largeBefore.handles.visible, 0,
       `Large hover native handles should be hidden. ${JSON.stringify(result.largeBefore.handles)}`);
     assert.strictEqual(result.small.handles.visible, 0,
@@ -670,8 +1877,42 @@ suite('Hover Renderer E2E', () => {
       `Small hover should not keep previous large handle geometry. ${JSON.stringify(result.small.handles)}`);
     assert.ok(!result.largeConnectedAfterSmall,
       'Switching to a small hover should remove the previous large hover');
+    assert.ok(result.smallConnectedAfterEmptyRoot,
+      'Empty cursor-sized hover roots must not remove the active populated hover');
+    assert.ok(!result.orphanConnectedAfterSmall,
+      'Switching to a small hover should remove inactive previous hover panels');
+    assert.ok(!result.lateHandleConnectedAfterCleanup,
+      'Late native hover handles should be removed after the active hover is already shown');
+    assert.ok(!result.bodyHandleConnectedAfterCleanup,
+      'Body-level stale hover handles should be removed after final hover sizing');
+    assert.ok(!result.unownedBodyHandleConnectedAfterCleanup,
+      'Unowned body-level hover sashes at the hover edge should be removed after final hover sizing');
+    assert.ok(!result.topBodyHandleConnectedAfterCleanup,
+      'Top-right body-level hover sashes at the hover edge should be removed after final hover sizing');
+    assert.ok(result.workbenchSashConnectedAfterCleanup,
+      'Workbench/editor sashes must not be removed by hover cleanup');
+    assert.ok(result.topWorkbenchSashConnectedAfterCleanup,
+      'Top workbench/editor sashes must not be removed by hover cleanup');
+    assert.ok(!result.mutatingHandleConnectedAfterCleanup,
+      'Native hover handles that reappear via class/style mutation should be removed');
+    assert.ok(result.small.nativeScrollbar.scrollbarWidth === 'none'
+      || result.small.nativeScrollbar.webkit.display === 'none'
+      || result.small.nativeScrollbar.webkit.width === '0px',
+      `Native scrollbars should be hidden. ${JSON.stringify(result.small.nativeScrollbar)}`);
+    assert.strictEqual(result.inactiveAfterSmall.inactiveHovers, 0,
+      `No inactive hover panels should remain. ${JSON.stringify(result.inactiveAfterSmall)}`);
+    assert.strictEqual(result.inactiveAfterSmall.externalArtifacts, 0,
+      `No external hover artifacts should remain. ${JSON.stringify(result.inactiveAfterSmall)}`);
     assert.ok(result.small.rect.height < result.largeBefore.rect.height,
       `Small hover should not keep large height (${result.small.rect.height} >= ${result.largeBefore.rect.height})`);
+    assert.ok(result.small.rect.width < result.largeBefore.rect.width,
+      `Small hover should not keep large width (${result.small.rect.width} >= ${result.largeBefore.rect.width})`);
+    assert.ok(result.small.protrusions.maxRightOverflow <= 2,
+      `Small hover should not leave a protruding old-width box. ${JSON.stringify(result.small.protrusions)}`);
+    assert.ok(result.small.protrusions.maxBottomOverflow <= 2,
+      `Small hover should not leave a protruding old-height box. ${JSON.stringify(result.small.protrusions)}`);
+    assert.strictEqual(result.small.protrusions.wideBlockCount, 0,
+      `Small hover should not contain wide stale block geometry. ${JSON.stringify(result.small.protrusions)}`);
     assert.ok(result.small.sizeTier === 'small',
       `Small hover should use small size tier. ${JSON.stringify(result.small)}`);
 
