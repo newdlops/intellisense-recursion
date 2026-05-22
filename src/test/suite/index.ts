@@ -10,7 +10,17 @@ export async function run(): Promise<void> {
   });
 
   const testsRoot = path.resolve(__dirname, '.');
-  const files = await glob('**/*.test.js', { cwd: testsRoot });
+  const requestedFiles = (process.env.IR_E2E_FILES || '')
+    .split(',')
+    .map(file => file.trim())
+    .filter(Boolean);
+  const files = requestedFiles.length
+    ? requestedFiles
+    : await glob('**/*.test.js', { cwd: testsRoot });
+
+  if (process.env.IR_E2E_GREP) {
+    mocha.grep(new RegExp(process.env.IR_E2E_GREP));
+  }
 
   for (const f of files) {
     mocha.addFile(path.resolve(testsRoot, f));

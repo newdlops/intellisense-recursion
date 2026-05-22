@@ -860,9 +860,18 @@ let hoverRecursionDepth = 0;
 let reinjectTimer: ReturnType<typeof setInterval> | undefined;
 let rendererReconnectTimer: ReturnType<typeof setTimeout> | undefined;
 let rendererInjectInFlight: Promise<void> | null = null;
+const rendererHoverFallbackTimers = new Set<ReturnType<typeof setTimeout>>();
+const nativeHoverRefireScheduledKeys = new Set<string>();
+const nativeHoverRefireLastAt = new Map<string, number>();
+const NATIVE_HOVER_REFIRE_SUPPRESS_MS = 1600;
+let rendererHoverFallbackLogCount = 0;
 let extensionDeactivated = false;
 let extensionRunsInTestMode = false;
 let rendererUserDataDirHint: string | null = null;
+let mainWsRefIsRendererTarget = false;
+let testRendererWebSocketUrlRef: string | null = null;
+let mainWsRefTargetUrl: string | null = null;
+let lastTestRendererTargetLogSignature = '';
 let lastClickId = '';
 let lastClickTime = 0;
 // A new click aborts an in-flight click via this controller.
@@ -871,6 +880,12 @@ let hoverPatchActive = false;
 // Current main-process CDP WebSocket, tracked so reconnect cleanup only
 // clears the listener that originally owned the socket.
 let mainWsRef: WebSocket | null = null;
+
+interface NativeHoverRefireAnchor {
+  uri: vscode.Uri;
+  line: number;
+  character: number;
+}
 
 function cappedPreviewLocationSet(map: Map<string, vscode.Location>, key: string, value: vscode.Location) {
   if (map.has(key)) { map.delete(key); }
@@ -1004,9 +1019,16 @@ function clearRendererReconnectTimer() {
 function closeMainWebSocket() {
   const ws = mainWsRef;
   mainWsRef = null;
+  mainWsRefIsRendererTarget = false;
+  testRendererWebSocketUrlRef = null;
+  mainWsRefTargetUrl = null;
   if (!ws) { return; }
   try { ws.removeAllListeners(); } catch {}
   try { ws.close(); } catch {}
+}
+
+function isTestRendererDebugMode(): boolean {
+  return extensionRunsInTestMode && !!process.env.IR_TEST_REMOTE_DEBUGGING_PORT;
 }
 
 function scheduleRendererReconnect() {
@@ -1041,6 +1063,8 @@ interface PendingPreviewHover {
   anchorLine: number;
   anchorCharacter: number;
   expiresAt: number;
+  matchedAt?: number;
+  matchCount?: number;
 }
 let pendingPreviewHover: PendingPreviewHover | null = null;
 // After the override is delivered to the first handle, suppress only the
@@ -1055,6 +1079,14 @@ let previewHoverSuppressUntil = 0;
 let previewHoverSuppressKey: string | null = null;
 let previewHoverSuppressCount = 0;
 let previewHoverWrongRequestLogCount = 0;
+let previewHoverDebugSeq = 0;
+const previewHoverDebugEvents: any[] = [];
+function recordPreviewHoverDebug(event: any): void {
+  try {
+    previewHoverDebugEvents.push({ seq: ++previewHoverDebugSeq, at: Date.now(), ...event });
+    while (previewHoverDebugEvents.length > 80) { previewHoverDebugEvents.shift(); }
+  } catch {}
+}
 
 function hoverRequestUriKey(uri: any): string {
   return uri?.scheme
@@ -1111,6 +1143,7 @@ interface PreviewState {
   anchor: { uri: vscode.Uri; line: number; character: number };
   anchorRange?: vscode.Range;
   scrollState?: PreviewScrollState;
+  originScrollState?: PreviewScrollState;
 }
 interface PreviewScrollState {
   scrollerScrollTop?: number;
@@ -1192,7 +1225,7 @@ const PREVIEW_CLICK_DEDUPE_MAX = 200;
 // hover widget to reopen; in-place apply keeps the user's current hover alive.
 // If no renderer target exists, applyPreviewStateAsHover falls back to the
 // native refire path.
-const PREVIEW_DIRECT_RENDERER_APPLY = true;
+const PREVIEW_DIRECT_RENDERER_APPLY = false;
 function clickNegGet(identifier: string): boolean {
   const ts = clickNegCache.get(identifier);
   if (ts === undefined) { return false; }
@@ -1238,13 +1271,32 @@ function splitHoverPreviewBlocks(markdown: string): string[] {
     .filter(Boolean);
 }
 
+function hoverMarkdownCodeFenceKeys(markdown: string): string[] {
+  const out: string[] = [];
+  const fenceRe = /```[\w-]*\n?([\s\S]*?)```/g;
+  let match: RegExpExecArray | null;
+  while ((match = fenceRe.exec(markdown)) !== null) {
+    const key = normalizeHoverMarkdownForDedupe(match[1] ?? '');
+    if (key) { out.push(`fence:${key}`); }
+  }
+  return out;
+}
+
+function hoverPreviewDedupeKeys(block: string): string[] {
+  const keys: string[] = [];
+  const blockKey = normalizeHoverMarkdownForDedupe(block);
+  if (blockKey) { keys.push(`block:${blockKey}`); }
+  keys.push(...hoverMarkdownCodeFenceKeys(block));
+  return keys;
+}
+
 function dedupeHoverPreviewBlocks(blocks: string[]): string[] {
   const seen = new Set<string>();
   const out: string[] = [];
   for (const block of blocks) {
-    const key = normalizeHoverMarkdownForDedupe(block);
-    if (!key || seen.has(key)) { continue; }
-    seen.add(key);
+    const keys = hoverPreviewDedupeKeys(block);
+    if (!keys.length || keys.some(key => seen.has(key))) { continue; }
+    for (const key of keys) { seen.add(key); }
     out.push(block);
   }
   return out;
@@ -1440,6 +1492,41 @@ function typeRegex(name: string): RegExp {
   return r;
 }
 
+function preferDefinitionProviderForPreviewIdentifier(identifier: string): boolean {
+  return identifier === 'classmethod' || identifier === 'staticmethod' || identifier === 'property';
+}
+
+function builtinDecoratorPreviewMarkdown(identifier: string): string | null {
+  if (identifier === 'classmethod') {
+    return [
+      '`classmethod` — *builtins.pyi:1*',
+      '```python',
+      'class classmethod:',
+      '    def __init__(self, method: object) -> None: ...',
+      '```',
+    ].join('\n');
+  }
+  if (identifier === 'staticmethod') {
+    return [
+      '`staticmethod` — *builtins.pyi:1*',
+      '```python',
+      'class staticmethod:',
+      '    def __init__(self, method: object) -> None: ...',
+      '```',
+    ].join('\n');
+  }
+  if (identifier === 'property') {
+    return [
+      '`property` — *builtins.pyi:1*',
+      '```python',
+      'class property:',
+      '    def __get__(self, obj: object, objtype: type | None = None) -> object: ...',
+      '```',
+    ].join('\n');
+  }
+  return null;
+}
+
 // ── (A) Position-level preview cache ──
 // Key: "uri:line:col". Short TTL — guards against re-computing for the same
 // hover event across handles and for rapid re-hovers at the same point.
@@ -1557,22 +1644,26 @@ function filterDeliveredHoverPreviewBlocks(existingText: string, previews: strin
   if (!HOVER_PREVIEW_BLOCK_DELIVERY_DEDUPE_ENABLED) { return previews; }
   const now = Date.now();
   pruneHoverPreviewDeliveredBlocks(now);
-  const existingKeys = new Set(
-    splitHoverPreviewBlocks(existingText).map(block => normalizeHoverMarkdownForDedupe(block)).filter(Boolean),
-  );
+  const existingKeys = new Set<string>();
+  for (const block of splitHoverPreviewBlocks(existingText)) {
+    for (const key of hoverPreviewDedupeKeys(block)) { existingKeys.add(key); }
+  }
   const out: string[] = [];
   let group = hoverPreviewDeliveredBlocks.get(deliveryGroupKey);
   for (const block of dedupeHoverPreviewBlocks(splitHoverPreviewBlocks(previews))) {
-    const key = normalizeHoverMarkdownForDedupe(block);
-    if (!key || existingKeys.has(key)) { continue; }
-    const prev = group?.blocks.get(key);
-    if (prev && now - prev <= HOVER_PREVIEW_BLOCK_DELIVERY_SUPPRESS_MS) { continue; }
+    const keys = hoverPreviewDedupeKeys(block);
+    if (!keys.length || keys.some(key => existingKeys.has(key))) { continue; }
+    const delivered = keys.some(key => {
+      const prev = group?.blocks.get(key);
+      return !!(prev && now - prev <= HOVER_PREVIEW_BLOCK_DELIVERY_SUPPRESS_MS);
+    });
+    if (delivered) { continue; }
     if (!group) {
       group = { timestamp: now, blocks: new Map<string, number>() };
       hoverPreviewDeliveredBlocks.set(deliveryGroupKey, group);
     }
     group.timestamp = now;
-    group.blocks.set(key, now);
+    for (const key of keys) { group.blocks.set(key, now); }
     out.push(block);
   }
   return out.join(HOVER_PREVIEW_SEPARATOR);
@@ -1645,6 +1736,11 @@ interface HoverWordCandidate {
   nearby: boolean;
 }
 
+function centerPositionOfRange(range: vscode.Range): vscode.Position {
+  const width = Math.max(1, range.end.character - range.start.character);
+  return new vscode.Position(range.start.line, range.start.character + Math.floor(width / 2));
+}
+
 function isCallableHoverContext(doc: vscode.TextDocument, range: vscode.Range): boolean {
   const line = doc.lineAt(range.start.line).text;
   const before = line.slice(Math.max(0, range.start.character - 48), range.start.character);
@@ -1669,11 +1765,11 @@ function hoverWordCandidateFromRange(
     return null;
   }
   if (TYPE_SHAPED_NAME.test(name) || CONSTANT_SHAPED_NAME.test(name)) {
-    return { name, anchor: range.start, range, nearby };
+    return { name, anchor: centerPositionOfRange(range), range, nearby };
   }
   if (/^[a-z_$][\w$]*$/.test(name)
     && (allowNoisyIdentifier || name.includes('_') || isCallableHoverContext(doc, range))) {
-    return { name, anchor: range.start, range, nearby };
+    return { name, anchor: centerPositionOfRange(range), range, nearby };
   }
   return null;
 }
@@ -2061,7 +2157,7 @@ const BROAD_SYMBOL_HOVER_SELECTOR: vscode.DocumentSelector = [
 export async function activate(context: vscode.ExtensionContext) {
   extensionDeactivated = false;
   extensionRunsInTestMode = context.extensionMode === vscode.ExtensionMode.Test;
-  rendererUserDataDirHint = deriveUserDataDirHint(context.globalStorageUri.fsPath);
+  rendererUserDataDirHint = process.env.IR_TEST_USER_DATA_DIR || deriveUserDataDirHint(context.globalStorageUri.fsPath);
   const version = (context.extension?.packageJSON?.version as string | undefined) ?? 'unknown';
   log.info(`IntelliSense Recursion v${version} activating...`);
 
@@ -2090,6 +2186,7 @@ export async function activate(context: vscode.ExtensionContext) {
       currentPreviewIdentifier: currentPreviewState?.identifier ?? null,
       currentPreviewMarkdown: currentPreviewState?.markdown ?? '',
       pendingPreviewIdentifier: pendingPreviewHover?.identifier ?? null,
+      previewHoverDebugEvents: previewHoverDebugEvents.slice(-40),
       previewHistoryLength: previewHistory.length,
       previewHistoryIdentifiers: previewHistory.map(state => state.identifier),
       lastHoverFetchPosition: lastHoverFetchPosition
@@ -2139,6 +2236,34 @@ export async function activate(context: vscode.ExtensionContext) {
         runHoverRendererHarnessForTests,
       ),
       vscode.commands.registerCommand(
+        'intellisenseRecursion.runHoverSplitColumnHarnessForTests',
+        runHoverSplitColumnHarnessForTests,
+      ),
+      vscode.commands.registerCommand(
+        'intellisenseRecursion.runNativeHoverGeometryHarnessForTests',
+        runNativeHoverGeometryHarnessForTests,
+      ),
+      vscode.commands.registerCommand(
+        'intellisenseRecursion.runNativePopupStateHarnessForTests',
+        runNativePopupStateHarnessForTests,
+      ),
+      vscode.commands.registerCommand(
+        'intellisenseRecursion.cleanupNativeHoverInteractionStateForTests',
+        cleanupNativeHoverInteractionStateForTests,
+      ),
+      vscode.commands.registerCommand(
+        'intellisenseRecursion.dismissNativeKeybindingRecorderForTests',
+        dismissNativeKeybindingRecorderForTests,
+      ),
+      vscode.commands.registerCommand(
+        'intellisenseRecursion.dispatchRendererMouseMoveForTests',
+        dispatchRendererMouseMoveForTests,
+      ),
+      vscode.commands.registerCommand(
+        'intellisenseRecursion.dispatchRendererKeyForTests',
+        dispatchRendererKeyForTests,
+      ),
+      vscode.commands.registerCommand(
         'intellisenseRecursion.runHoverLinkClickHarnessForTests',
         runHoverLinkClickHarnessForTests,
       ),
@@ -2178,10 +2303,15 @@ export async function activate(context: vscode.ExtensionContext) {
                   for(var i=0;i<nodes.length;i++){
                     try{if(nodes[i].parentNode){nodes[i].parentNode.removeChild(nodes[i]);removed++;}}catch(_){}
                   }
+                  window.__irOriginalHoverSnapshot=null;
+                  window.__irHistoryFor=null;
+                  window.__irHistory=[];
+                  window.__irHistoryCurrent=null;
+                  window.__irLastPreviewTarget=null;
                   return {ok:true,removed:removed,patchVersion:Number(window.__irPatchVersion)||0};
                 })()
               `.trim();
-              await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpr), 3000);
+              await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpr, true), 3000);
             }
           } catch {}
         },
@@ -2285,11 +2415,15 @@ function patchSharedService(service: any) {
     const col = position?.column !== undefined ? position.column : (position?.character !== undefined ? position.character + 1 : 1);
     const range = hoverRange ?? { startLineNumber: ln, startColumn: col, endLineNumber: ln, endColumn: col };
     const existingText = hoverResultText(res);
-    const existingKeys = new Set(
-      splitHoverPreviewBlocks(existingText).map(block => normalizeHoverMarkdownForDedupe(block)).filter(Boolean),
-    );
+    const existingKeys = new Set<string>();
+    for (const block of splitHoverPreviewBlocks(existingText)) {
+      for (const key of hoverPreviewDedupeKeys(block)) { existingKeys.add(key); }
+    }
     const previewBlocks = dedupeHoverPreviewBlocks(splitHoverPreviewBlocks(previews))
-      .filter(block => !existingKeys.has(normalizeHoverMarkdownForDedupe(block)));
+      .filter(block => {
+        const keys = hoverPreviewDedupeKeys(block);
+        return keys.length > 0 && !keys.some(key => existingKeys.has(key));
+      });
     const dedupedPreviews = previewBlocks.join(HOVER_PREVIEW_SEPARATOR);
     if (!dedupedPreviews) {
       return hoverRange ? { ...res, range: hoverRange ?? res?.range } : res;
@@ -2389,6 +2523,23 @@ function patchSharedService(service: any) {
       && Date.now() < pendingPreviewHover.expiresAt
       && pendingPreviewMatchesHoverRequest(pendingPreviewHover, requestUriKey, requestLine, requestChar)) {
       const preview = pendingPreviewHover;
+      const matchedAt = Date.now();
+      preview.matchedAt = matchedAt;
+      preview.matchCount = (preview.matchCount ?? 0) + 1;
+      preview.expiresAt = Math.min(preview.expiresAt, matchedAt + 1800);
+      recordPreviewHoverDebug({
+        kind: "pending-match",
+        handle,
+        identifier: preview.identifier,
+        requestUriKey,
+        requestLine,
+        requestChar,
+        anchorLine: preview.anchorLine,
+        anchorCharacter: preview.anchorCharacter,
+        hasRange: !!preview.range,
+        matchCount: preview.matchCount,
+        contentsLength: hoverResultText({ contents: preview.contents }).length,
+      });
       // Keep the redirect alive for every provider handle in this native
       // showHover fanout. VS Code may render a later handle, not the first
       // one that reaches us; consuming the preview on the first hit can leave
@@ -2404,10 +2555,35 @@ function patchSharedService(service: any) {
     }
     if (pendingPreviewHover && Date.now() >= pendingPreviewHover.expiresAt) {
       log.info(`[hover] page-transition pending "${pendingPreviewHover.identifier}" expired before matching request`);
+      recordPreviewHoverDebug({ kind: "pending-expired", identifier: pendingPreviewHover.identifier, requestUriKey, requestLine, requestChar });
       pendingPreviewHover = null;
+    } else if (pendingPreviewHover?.matchedAt && Date.now() - pendingPreviewHover.matchedAt > 120) {
+      recordPreviewHoverDebug({
+        kind: "pending-cleared-after-match",
+        identifier: pendingPreviewHover.identifier,
+        requestUriKey,
+        requestLine,
+        requestChar,
+        anchorLine: pendingPreviewHover.anchorLine,
+        anchorCharacter: pendingPreviewHover.anchorCharacter,
+        ageMs: Date.now() - pendingPreviewHover.matchedAt,
+        matchCount: pendingPreviewHover.matchCount ?? 0,
+      });
+      pendingPreviewHover = null;
+    } else if (pendingPreviewHover?.matchedAt) {
+      recordPreviewHoverDebug({
+        kind: "pending-ignored-during-match-fanout",
+        identifier: pendingPreviewHover.identifier,
+        requestUriKey,
+        requestLine,
+        requestChar,
+        ageMs: Date.now() - pendingPreviewHover.matchedAt,
+      });
+      return null;
     } else if (pendingPreviewHover && previewHoverWrongRequestLogCount < 30) {
       previewHoverWrongRequestLogCount++;
       log.info(`[hover] page-transition pending "${pendingPreviewHover.identifier}" ignored non-anchor request ${requestUriKey}:${requestLine}:${requestChar}`);
+      recordPreviewHoverDebug({ kind: "pending-ignored", identifier: pendingPreviewHover.identifier, requestUriKey, requestLine, requestChar, anchorLine: pendingPreviewHover.anchorLine, anchorCharacter: pendingPreviewHover.anchorCharacter });
       return null;
     } else if (pendingPreviewHover) {
       return null;
@@ -2476,6 +2652,20 @@ function patchSharedService(service: any) {
     if (!result?.contents?.length && !hoveredCandidate) { return result; }
     if (hoverRecursionDepth > 1) { return result; }
 
+    const returnWithNativeFallback = (value: any, source: string): any => {
+      if (hoveredCandidate && primaryHoverHandle && value?.contents?.length) {
+        const markdown = hoverResultText(value);
+        if (markdown.trim().length > 20) {
+          scheduleRendererNativeHoverFallback(hoveredCandidate.name, markdown, source, {
+            uri: docUri,
+            line: anchorForCache.line,
+            character: anchorForCache.character,
+          });
+        }
+      }
+      return value;
+    };
+
     // Prefer the exact word under the cursor, then supplement with type names
     // discovered in native hover code fences. This covers symbols where the
     // language server has definition data but no hover text.
@@ -2483,7 +2673,9 @@ function patchSharedService(service: any) {
       ? nativeHoverHasClassLikeSource(result, hoveredCandidate.name)
       : false;
     const directCandidateNeedsFallback = hoveredCandidate
-      ? shouldDirectHoverCandidate(hoveredCandidate.name) || !result?.contents?.length
+      ? shouldDirectHoverCandidate(hoveredCandidate.name)
+        || !result?.contents?.length
+        || !skipDirectClassPreview
       : false;
     const types: string[] = [];
     if (hoveredCandidate && directCandidateNeedsFallback && !skipDirectClassPreview) {
@@ -2502,9 +2694,10 @@ function patchSharedService(service: any) {
     }
     const uniqueTypes = [...new Set(types)];
     if (uniqueTypes.length === 0) {
-      return hoveredInternalRange && result?.contents?.length
+      const nativeResult = hoveredInternalRange && result?.contents?.length
         ? { ...result, range: hoveredInternalRange }
         : result;
+      return returnWithNativeFallback(nativeResult, 'native-only');
     }
 
     const hoverMs = () => `${Date.now() - hoverT0}ms`;
@@ -2517,7 +2710,7 @@ function patchSharedService(service: any) {
     const cachedPreviews = posPreviewGet(posKey, typesKey);
     if (cachedPreviews) {
       log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} POS-CACHE hit (${hoverMs()})`);
-      return attachPreviewsOnce(
+      return returnWithNativeFallback(attachPreviewsOnce(
         result,
         cachedPreviews,
         position,
@@ -2525,7 +2718,7 @@ function patchSharedService(service: any) {
         deliveryGroupKey,
         `handle=${handle} source=pos-cache`,
         primaryHoverHandle,
-      );
+      ), 'pos-cache');
     }
 
     // (E) In-flight preview dedup — share work with other handles called
@@ -2538,7 +2731,7 @@ function patchSharedService(service: any) {
       });
       if (computed) {
         log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} INFLIGHT attached (${hoverMs()}, post=${postNativeMs()})`);
-        return attachPreviewsOnce(
+        return returnWithNativeFallback(attachPreviewsOnce(
           result,
           computed.previews,
           position,
@@ -2546,10 +2739,10 @@ function patchSharedService(service: any) {
           deliveryGroupKey,
           `handle=${handle} source=inflight`,
           primaryHoverHandle,
-        );
+        ), 'inflight');
       }
       log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} INFLIGHT empty (${hoverMs()}, post=${postNativeMs()})`);
-      return result;
+      return returnWithNativeFallback(result, 'inflight-empty');
     }
 
     log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} types=[${uniqueTypes.join(',')}] (${hoverMs()})`);
@@ -2717,7 +2910,7 @@ function patchSharedService(service: any) {
       if (computed) {
         posPreviewSet(posKey, computed.typesKey, computed.previews);
         log.info(`[hover] done: first-hover preview attached md=${computed.previews.length} (${hoverMs()}, post=${postNativeMs()})`);
-        return attachPreviewsOnce(
+        return returnWithNativeFallback(attachPreviewsOnce(
           result,
           computed.previews,
           position,
@@ -2725,7 +2918,7 @@ function patchSharedService(service: any) {
           deliveryGroupKey,
           `handle=${handle} source=first`,
           primaryHoverHandle,
-        );
+        ), 'first');
       }
     } catch (err) {
       log.error(`[hover] compute error: ${err} (${hoverMs()})`);
@@ -2735,7 +2928,7 @@ function patchSharedService(service: any) {
     }
 
     log.info(`[hover] done: no definition preview resolved; returning native hover (${hoverMs()}, post=${postNativeMs()})`);
-    return result;
+    return returnWithNativeFallback(result, 'unresolved');
   };
 
   hoverPatchActive = true;
@@ -2744,7 +2937,7 @@ function patchSharedService(service: any) {
 
 // ── Renderer injection via main process CDP ──
 
-const RENDERER_PATCH_VERSION = 130;
+const RENDERER_PATCH_VERSION = 169;
 
 interface ProcessRow {
   pid: number;
@@ -2843,7 +3036,216 @@ function makeRendererEvalExpression(script: string): string {
   return `(function(){var bin=atob(${JSON.stringify(patchB64)});var bytes=new Uint8Array(bin.length);for(var i=0;i<bin.length;i++){bytes[i]=bin.charCodeAt(i);}return eval(new TextDecoder('utf-8').decode(bytes));})()`;
 }
 
+function cdpRequest(ws: WebSocket, method: string, params: any = {}, timeoutMs = 5000): Promise<any> {
+  return new Promise((resolve, reject) => {
+    const id = (Date.now() % 1_000_000_000) + Math.floor(Math.random() * 1000);
+    let done = false;
+    const finish = (err: Error | null, value?: any) => {
+      if (done) { return; }
+      done = true;
+      clearTimeout(timeout);
+      try { ws.off('message', onMessage); } catch {}
+      if (err) { reject(err); } else { resolve(value); }
+    };
+    const timeout = setTimeout(() => {
+      const err = new Error(`CDP ${method} timed out`);
+      finish(err);
+      if (ws === mainWsRef && method !== 'Input.dispatchMouseEvent') {
+        log.warn(`[cdp] ${method} timed out; dropping stale renderer CDP socket`);
+        closeMainWebSocket();
+      }
+    }, timeoutMs);
+    const onMessage = (data: string) => {
+      try {
+        const resp = JSON.parse(data);
+        if (resp.id !== id) { return; }
+        if (resp.error) {
+          finish(new Error(resp.error.message || String(resp.error)));
+          return;
+        }
+        finish(null, resp.result);
+      } catch (err) {
+        finish(err instanceof Error ? err : new Error(String(err)));
+      }
+    };
+    ws.on('message', onMessage);
+    try {
+      ws.send(JSON.stringify({ id, method, params }));
+    } catch (err) {
+      finish(err instanceof Error ? err : new Error(String(err)));
+    }
+  });
+}
+
+async function findTestRendererWebSocketUrl(): Promise<string | null> {
+  const port = Number(process.env.IR_TEST_REMOTE_DEBUGGING_PORT || '');
+  if (!port) { return null; }
+  const marker = process.env.IR_TEST_WINDOW_MARKER || '';
+  for (let attempt = 0; attempt < 40; attempt++) {
+    let targets: any[] = [];
+    try {
+      targets = JSON.parse(await httpGet(`http://127.0.0.1:${port}/json/list`));
+    } catch {
+      await new Promise(resolve => setTimeout(resolve, 250));
+      continue;
+    }
+    const candidates = (targets || []).filter(target => {
+      const wsUrl = String(target?.webSocketDebuggerUrl || '');
+      const url = String(target?.url || '');
+      return wsUrl && (/workbench/i.test(url) || /vscode-file:|vscode-app:/i.test(url));
+    });
+    if (!candidates.length && targets?.length) {
+      candidates.push(...targets.filter(target => String(target?.webSocketDebuggerUrl || '')));
+    }
+    if (!marker) {
+      const first = candidates[0]?.webSocketDebuggerUrl;
+      if (first) { return String(first); }
+    }
+    const probeSummaries: string[] = [];
+    for (const candidate of candidates) {
+      const wsUrl = String(candidate?.webSocketDebuggerUrl || '');
+      if (!wsUrl) { continue; }
+      const ws = new WebSocket(wsUrl);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          ws.once('open', resolve);
+          ws.once('error', reject);
+          setTimeout(() => reject(new Error('test renderer target connect timed out')), 1000);
+        });
+        await cdpRequest(ws, 'Runtime.enable', {}, 1000).catch(() => undefined);
+        const probe = await cdpRequest(ws, 'Runtime.evaluate', {
+          expression: `(function(){var m=${JSON.stringify(marker)};var b=String(document.body&&document.body.textContent||'');return {title:String(document.title||''),href:String(location&&location.href||''),bodyHasMarker:!!(m&&b.indexOf(m)>=0),titleHasMarker:!!(m&&String(document.title||'').indexOf(m)>=0),bodySample:b.replace(/\\s+/g,' ').slice(0,160)}})()`,
+          returnByValue: true,
+        }, 1500);
+        const value = probe?.result?.value;
+        probeSummaries.push([
+          `title=${JSON.stringify(String(value?.title || '').slice(0, 120))}`,
+          `bodyMarker=${value?.bodyHasMarker ? '1' : '0'}`,
+          `titleMarker=${value?.titleHasMarker ? '1' : '0'}`,
+          `targetUrl=${JSON.stringify(String(candidate?.url || value?.href || '').slice(0, 160))}`,
+          `body=${JSON.stringify(String(value?.bodySample || '').slice(0, 120))}`,
+        ].join(' '));
+        if (value?.bodyHasMarker || value?.titleHasMarker) {
+          const signature = `match:${wsUrl}:${probeSummaries[probeSummaries.length - 1] || ''}`;
+          if (signature !== lastTestRendererTargetLogSignature) {
+            lastTestRendererTargetLogSignature = signature;
+            log.info(`[cdp] test renderer target matched attempt=${attempt + 1} ${probeSummaries[probeSummaries.length - 1] || ''}`);
+          }
+          return wsUrl;
+        }
+      } catch (err) {
+        probeSummaries.push(`probe-error targetUrl=${JSON.stringify(String(candidate?.url || '').slice(0, 160))} error=${JSON.stringify(String(err instanceof Error ? err.message : err).slice(0, 160))}`);
+        // Try the next target.
+      } finally {
+        try { ws.close(); } catch {}
+      }
+    }
+    if (probeSummaries.length) {
+      const signature = `miss:${marker}:${probeSummaries.join(' | ')}`;
+      if (signature !== lastTestRendererTargetLogSignature) {
+        lastTestRendererTargetLogSignature = signature;
+        log.info(`[cdp] test renderer target scan attempt=${attempt + 1} marker=${marker ? JSON.stringify(marker) : '(none)'} ${probeSummaries.join(' | ')}`);
+      }
+    }
+    if (candidates.length === 1 && !marker) {
+      return String(candidates[0].webSocketDebuggerUrl || '') || null;
+    }
+    await new Promise(resolve => setTimeout(resolve, 250));
+  }
+  if (marker) {
+    log.warn(`[cdp] test renderer target not found for marker ${JSON.stringify(marker)}`);
+  }
+  return null;
+}
+
+async function withRendererInputCdpSessionForTests<T>(
+  fn: (ws: WebSocket, mode: string) => Promise<T>,
+): Promise<T> {
+  if (isTestRendererDebugMode()) {
+    try {
+      const wsUrl = await findTestRendererWebSocketUrl();
+      if (wsUrl) {
+        testRendererWebSocketUrlRef = wsUrl;
+        const ws = new WebSocket(wsUrl);
+        await new Promise<void>((resolve, reject) => {
+          let done = false;
+          const finish = (err?: Error) => {
+            if (done) { return; }
+            done = true;
+            clearTimeout(timeout);
+            if (err) { reject(err); } else { resolve(); }
+          };
+          const timeout = setTimeout(() => finish(new Error('test renderer input CDP connect timed out')), 3000);
+          ws.once('open', () => finish());
+          ws.once('error', err => finish(err instanceof Error ? err : new Error(String(err))));
+        });
+        try {
+          await cdpRequest(ws, 'Runtime.enable', {}, 1500).catch(() => undefined);
+          return await fn(ws, 'fresh-test-renderer');
+        } finally {
+          try { ws.close(); } catch {}
+        }
+      }
+    } catch (err) {
+      log.warn(`[cdp] fresh test renderer input session failed: ${err}`);
+    }
+  }
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) {
+    throw new Error('renderer CDP socket is not open');
+  }
+  return fn(mainWsRef, mainWsRefIsRendererTarget ? 'main-renderer-ref' : 'main-process-ref');
+}
+
+async function injectRendererViaTestRemoteDebugging() {
+    try {
+      const wsUrl = await findTestRendererWebSocketUrl();
+      if (!wsUrl) {
+        log.warn('[inject] test renderer CDP target not found');
+        return;
+      }
+      testRendererWebSocketUrlRef = wsUrl;
+      const ws = new WebSocket(wsUrl);
+      (ws as any).__irTargetWsUrl = wsUrl;
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', resolve);
+      ws.once('error', reject);
+      setTimeout(() => reject(new Error('test renderer CDP connect timed out')), 3000);
+    });
+    await cdpRequest(ws, 'Runtime.enable', {}, 3000).catch(() => undefined);
+    await cdpRequest(ws, 'Runtime.addBinding', { name: 'irGoToType' }, 3000).catch(err => {
+      if (!/already|exists|duplicate/i.test(String(err && err.message || err))) { throw err; }
+    });
+    const rendererMetaExpr = `try{window.__irHostWindowMeta=${JSON.stringify({
+      id: 'test-renderer',
+      title: 'test-renderer',
+      url: '',
+      phase: 'test-remote',
+    })};window.__irHostWindowId='test-renderer';window.__irHostWindowTitle='test-renderer';}catch(_){}`;
+    await cdpRequest(ws, 'Runtime.evaluate', {
+      expression: rendererMetaExpr,
+      includeCommandLineAPI: true,
+      returnByValue: true,
+    }, 3000).catch(() => undefined);
+    const evalExpr = makeRendererEvalExpression(getHoverPatchScript());
+    const result = await cdpRequest(ws, 'Runtime.evaluate', {
+      expression: evalExpr,
+      includeCommandLineAPI: true,
+      returnByValue: true,
+      awaitPromise: true,
+    }, 8000);
+    const value = result?.result?.value;
+    log.info(`[inject] test renderer injection: ${value || 'ok'}`);
+    startClickListener(ws, true);
+  } catch (err) {
+    log.warn(`[inject] test renderer injection failed: ${err}`);
+  }
+}
+
 async function injectRenderer() {
+  if (isTestRendererDebugMode()) {
+    await injectRendererViaTestRemoteDebugging();
+    return;
+  }
   try {
     if (extensionDeactivated) { return; }
     log.info('[inject] Starting renderer injection...');
@@ -2865,6 +3267,8 @@ async function injectRenderer() {
     }
     log.info(`[inject] Connecting WebSocket...`);
     const ws = new WebSocket(wsUrl);
+    const workspacePathForRenderer = workspaceRootFsPath() ?? '';
+    const workspaceNameForRenderer = workspacePathForRenderer ? path.basename(workspacePathForRenderer) : '';
 
     await new Promise<void>((resolve) => {
       let msgId = 1;
@@ -2897,7 +3301,67 @@ async function injectRenderer() {
             }
             var BW = require('electron').BrowserWindow;
             var wins = BW.getAllWindows();
+            var workspacePath = ${JSON.stringify(workspacePathForRenderer)};
+            var workspaceName = ${JSON.stringify(workspaceNameForRenderer)};
             var results = [];
+            function decodeMaybe(s) { try { return decodeURIComponent(String(s || '')); } catch (_) { return String(s || ''); } }
+            function windowTitle(w) { try { return String((w.getTitle && w.getTitle()) || ''); } catch (_) { return ''; } }
+            function windowUrl(w) { try { return String(w.webContents && w.webContents.getURL && w.webContents.getURL() || ''); } catch (_) { return ''; } }
+            function isCandidateWindow(w) {
+              try {
+                if (!w || (w.isDestroyed && w.isDestroyed())) return false;
+                if (!w.webContents || (w.webContents.isDestroyed && w.webContents.isDestroyed())) return false;
+                var title = windowTitle(w);
+                var url = windowUrl(w);
+                if (/Developer Tools/i.test(title) || /devtools:/i.test(url)) return false;
+                return true;
+              } catch (_) {
+                return false;
+              }
+            }
+            function windowMatchesWorkspace(w) {
+              var title = windowTitle(w);
+              var url = windowUrl(w);
+              var decodedUrl = decodeMaybe(url);
+              var encodedWorkspace = workspacePath ? encodeURIComponent(workspacePath) : '';
+              return !!(
+                (workspacePath && (
+                  url.indexOf(workspacePath) >= 0
+                  || decodedUrl.indexOf(workspacePath) >= 0
+                  || (encodedWorkspace && url.indexOf(encodedWorkspace) >= 0)
+                ))
+                || (workspaceName && title.indexOf(workspaceName) >= 0)
+              );
+            }
+            function chooseInjectionWindows(list) {
+              var candidates = [];
+              for (var ci = 0; ci < list.length; ci++) {
+                if (isCandidateWindow(list[ci])) candidates.push(list[ci]);
+              }
+              if (!candidates.length) return [];
+              var matched = [];
+              if (workspacePath || workspaceName) {
+                for (var mi = 0; mi < candidates.length; mi++) {
+                  if (windowMatchesWorkspace(candidates[mi])) matched.push(candidates[mi]);
+                }
+                if (matched.length) return matched;
+              }
+              var focused = [];
+              for (var fi = 0; fi < candidates.length; fi++) {
+                try { if (candidates[fi].isFocused && candidates[fi].isFocused()) focused.push(candidates[fi]); } catch (_) {}
+              }
+              if (focused.length) return focused;
+              if (candidates.length === 1) return candidates;
+              var visible = [];
+              for (var vi = 0; vi < candidates.length; vi++) {
+                try { if (candidates[vi].isVisible && candidates[vi].isVisible()) visible.push(candidates[vi]); } catch (_) {}
+              }
+              return visible.length ? [visible[0]] : [];
+            }
+            wins = chooseInjectionWindows(wins);
+            if (!wins.length) {
+              return 'no target renderer window for workspace ' + (workspacePath || workspaceName || '(none)');
+            }
             function evalSummary(id, r) {
               if (!r) { return 'skip:' + id + '(no response)'; }
               if (r.exceptionDetails) {
@@ -2916,6 +3380,25 @@ async function injectRenderer() {
                 });
                 return Number(chk && chk.result && chk.result.value) || 0;
               } catch(eChk) { return 0; }
+            }
+            async function setRendererMeta(w, phase) {
+              try {
+                var title = windowTitle(w);
+                var url = windowUrl(w);
+                var meta = {
+                  id: w.id,
+                  title: title.slice(0, 160),
+                  url: url.slice(0, 240),
+                  workspaceName: workspaceName,
+                  workspacePath: workspacePath,
+                  phase: phase
+                };
+                var expr = 'try{window.__irHostWindowMeta=' + JSON.stringify(meta)
+                  + ';window.__irHostWindowId=' + JSON.stringify(String(w.id))
+                  + ';window.__irHostWindowTitle=' + JSON.stringify(meta.title)
+                  + ';}catch(_){}';
+                await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: expr, returnByValue: true });
+              } catch(eMeta) {}
             }
             async function ensureBinding(w) {
               try {
@@ -2951,6 +3434,7 @@ async function injectRenderer() {
                 }
                 await w.webContents.debugger.sendCommand('Runtime.enable');
                 var bindingResult = await ensureBinding(w);
+                await setRendererMeta(w, 'initial');
                 var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(evalExpr)}, includeCommandLineAPI: true, returnByValue: true });
                 var value = r && r.result && r.result.value;
                 var ok = value === 'hover patch installed' || value === 'already patched';
@@ -2962,7 +3446,7 @@ async function injectRenderer() {
                   }
                 }
                 if (ok) {
-                  results.push('injected:' + w.id + '(' + value + ')');
+                  results.push('injected:' + w.id + ':' + windowTitle(w).replace(/\\s+/g, ' ').slice(0, 80) + '(' + value + ')');
                   results.push(bindingResult);
                 } else {
                   results.push(evalSummary(w.id, r));
@@ -3002,6 +3486,10 @@ async function injectRenderer() {
 }
 
 async function reinjectRenderer() {
+  if (isTestRendererDebugMode()) {
+    await injectRendererViaTestRemoteDebugging();
+    return;
+  }
   try {
     if (extensionDeactivated) { return; }
     const mainPid = findCurrentVSCodeMainPid();
@@ -3012,6 +3500,8 @@ async function reinjectRenderer() {
     if (!wsUrl) { return; }
 
     const ws = new WebSocket(wsUrl);
+    const workspacePathForRenderer = workspaceRootFsPath() ?? '';
+    const workspaceNameForRenderer = workspacePathForRenderer ? path.basename(workspacePathForRenderer) : '';
 
     await new Promise<void>((resolve) => {
       let done = false;
@@ -3033,7 +3523,64 @@ async function reinjectRenderer() {
             if (process.pid !== ${mainPid}) { return 0; }
             var BW = require('electron').BrowserWindow;
             var wins = BW.getAllWindows();
+            var workspacePath = ${JSON.stringify(workspacePathForRenderer)};
+            var workspaceName = ${JSON.stringify(workspaceNameForRenderer)};
             var n = 0;
+            function decodeMaybe(s) { try { return decodeURIComponent(String(s || '')); } catch (_) { return String(s || ''); } }
+            function windowTitle(w) { try { return String((w.getTitle && w.getTitle()) || ''); } catch (_) { return ''; } }
+            function windowUrl(w) { try { return String(w.webContents && w.webContents.getURL && w.webContents.getURL() || ''); } catch (_) { return ''; } }
+            function isCandidateWindow(w) {
+              try {
+                if (!w || (w.isDestroyed && w.isDestroyed())) return false;
+                if (!w.webContents || (w.webContents.isDestroyed && w.webContents.isDestroyed())) return false;
+                var title = windowTitle(w);
+                var url = windowUrl(w);
+                if (/Developer Tools/i.test(title) || /devtools:/i.test(url)) return false;
+                return true;
+              } catch (_) {
+                return false;
+              }
+            }
+            function windowMatchesWorkspace(w) {
+              var title = windowTitle(w);
+              var url = windowUrl(w);
+              var decodedUrl = decodeMaybe(url);
+              var encodedWorkspace = workspacePath ? encodeURIComponent(workspacePath) : '';
+              return !!(
+                (workspacePath && (
+                  url.indexOf(workspacePath) >= 0
+                  || decodedUrl.indexOf(workspacePath) >= 0
+                  || (encodedWorkspace && url.indexOf(encodedWorkspace) >= 0)
+                ))
+                || (workspaceName && title.indexOf(workspaceName) >= 0)
+              );
+            }
+            function chooseInjectionWindows(list) {
+              var candidates = [];
+              for (var ci = 0; ci < list.length; ci++) {
+                if (isCandidateWindow(list[ci])) candidates.push(list[ci]);
+              }
+              if (!candidates.length) return [];
+              var matched = [];
+              if (workspacePath || workspaceName) {
+                for (var mi = 0; mi < candidates.length; mi++) {
+                  if (windowMatchesWorkspace(candidates[mi])) matched.push(candidates[mi]);
+                }
+                if (matched.length) return matched;
+              }
+              var focused = [];
+              for (var fi = 0; fi < candidates.length; fi++) {
+                try { if (candidates[fi].isFocused && candidates[fi].isFocused()) focused.push(candidates[fi]); } catch (_) {}
+              }
+              if (focused.length) return focused;
+              if (candidates.length === 1) return candidates;
+              var visible = [];
+              for (var vi = 0; vi < candidates.length; vi++) {
+                try { if (candidates[vi].isVisible && candidates[vi].isVisible()) visible.push(candidates[vi]); } catch (_) {}
+              }
+              return visible.length ? [visible[0]] : [];
+            }
+            wins = chooseInjectionWindows(wins);
             async function installedVersion(w) {
               try {
                 var chk = await w.webContents.debugger.sendCommand('Runtime.evaluate', {
@@ -3042,6 +3589,25 @@ async function reinjectRenderer() {
                 });
                 return Number(chk && chk.result && chk.result.value) || 0;
               } catch(eChk) { return 0; }
+            }
+            async function setRendererMeta(w, phase) {
+              try {
+                var title = windowTitle(w);
+                var url = windowUrl(w);
+                var meta = {
+                  id: w.id,
+                  title: title.slice(0, 160),
+                  url: url.slice(0, 240),
+                  workspaceName: workspaceName,
+                  workspacePath: workspacePath,
+                  phase: phase
+                };
+                var expr = 'try{window.__irHostWindowMeta=' + JSON.stringify(meta)
+                  + ';window.__irHostWindowId=' + JSON.stringify(String(w.id))
+                  + ';window.__irHostWindowTitle=' + JSON.stringify(meta.title)
+                  + ';}catch(_){}';
+                await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: expr, returnByValue: true });
+              } catch(eMeta) {}
             }
             async function ensureBinding(w) {
               try {
@@ -3073,6 +3639,7 @@ async function reinjectRenderer() {
                 }
                 await w.webContents.debugger.sendCommand('Runtime.enable');
                 await ensureBinding(w);
+                await setRendererMeta(w, 'reinject');
                 var r = await w.webContents.debugger.sendCommand('Runtime.evaluate', { expression: ${JSON.stringify(evalExpr)}, includeCommandLineAPI: true, returnByValue: true });
                 var value = r && r.result && r.result.value;
                 if (value === 'hover patch installed' || value === 'already patched') {
@@ -3103,12 +3670,14 @@ async function reinjectRenderer() {
   } catch {}
 }
 
-function startClickListener(mainWs: any) {
+function startClickListener(mainWs: any, isRendererTarget = false) {
   if (mainWsRef && mainWsRef !== mainWs) {
     closeMainWebSocket();
   }
   clearRendererReconnectTimer();
   mainWsRef = mainWs;
+  mainWsRefIsRendererTarget = isRendererTarget;
+  mainWsRefTargetUrl = typeof mainWs.__irTargetWsUrl === 'string' ? mainWs.__irTargetWsUrl : null;
   if (mainWs.__irClickListenerStarted) { return; }
   mainWs.__irClickListenerStarted = true;
   log.info('[listen] Click event listener started (binding-driven)');
@@ -3116,7 +3685,8 @@ function startClickListener(mainWs: any) {
   mainWs.on('message', (data: string) => {
     try {
       const resp = JSON.parse(data);
-      if (resp.method === 'Runtime.bindingCalled' && resp.params?.name === 'irClickNotify') {
+      if (resp.method === 'Runtime.bindingCalled'
+        && (resp.params?.name === 'irClickNotify' || resp.params?.name === 'irGoToType')) {
         const val = String(resp.params.payload);
         if (val.startsWith('LOG:')) {
           log.info(`[renderer] ${val.substring(4)}`);
@@ -3124,6 +3694,30 @@ function startClickListener(mainWs: any) {
         }
         if (val.startsWith('SEND:')) {
           log.info(`[send] ${val.substring(5)}`);
+          return;
+        }
+        if (val === 'HIDE_HOVER' || val.startsWith('HIDE_HOVER:')) {
+          vscode.commands.executeCommand('editor.action.hideHover')
+            .then(
+              () => log.info(`[renderer] hide hover requested${val.startsWith('HIDE_HOVER:') ? ` ${val.substring('HIDE_HOVER:'.length)}` : ''}`),
+              err => log.warn(`[renderer] hide hover request failed: ${err}`),
+            );
+          return;
+        }
+        if (val === 'SHOW_HOVER' || val.startsWith('SHOW_HOVER:')) {
+          const reason = val.startsWith('SHOW_HOVER:') ? val.substring('SHOW_HOVER:'.length) : '';
+          void (async () => {
+            try {
+              await vscode.commands.executeCommand('editor.action.hideHover');
+            } catch {}
+            await new Promise(resolve => setTimeout(resolve, 90));
+            try {
+              await vscode.commands.executeCommand('editor.action.showHover');
+              log.info(`[renderer] native show hover requested${reason ? ` ${reason}` : ''}`);
+            } catch (err) {
+              log.warn(`[renderer] native show hover request failed${reason ? ` ${reason}` : ''}: ${err}`);
+            }
+          })();
           return;
         }
 
@@ -3135,15 +3729,18 @@ function startClickListener(mainWs: any) {
 
         log.info(`Click: "${val}"`);
         const editor = vscode.window.activeTextEditor;
-        const docUri = editor?.document.uri.toString() || '';
+        const docUri = lastHoverFetchPosition?.uri.toString()
+          || lastHoverDocUri
+          || editor?.document.uri.toString()
+          || '';
 
         if (val === 'BACK') {
           previewBackHandler().catch(err => log.warn(`previewBack: error: ${err}`));
         } else if (val.startsWith('PREVIEW:')) {
           const typeName = val.substring('PREVIEW:'.length);
           previewTypeHandler(docUri, typeName).catch(err => log.warn(`preview: error: ${err}`));
-        } else if (editor) {
-          goToTypeHandler(editor.document.uri.toString(), val);
+        } else if (docUri || editor) {
+          goToTypeHandler(docUri, val);
         }
       }
     } catch {}
@@ -3214,7 +3811,12 @@ async function cleanupRendererInjection(reason: string): Promise<void> {
       ws.send(JSON.stringify({
         id: requestId,
         method: 'Runtime.evaluate',
-        params: { expression: cleanupScript, includeCommandLineAPI: true, returnByValue: true, awaitPromise: true },
+        params: {
+          expression: mainWsRefIsRendererTarget ? rendererExpr : cleanupScript,
+          includeCommandLineAPI: true,
+          returnByValue: true,
+          awaitPromise: true,
+        },
       }));
     } catch {
       finish();
@@ -3222,7 +3824,57 @@ async function cleanupRendererInjection(reason: string): Promise<void> {
   });
 }
 
-function evaluateInMainProcessForTests(expression: string, timeoutMs = 7000): Promise<any> {
+async function evaluateInTestRendererForTests(expression: string, timeoutMs = 7000): Promise<any> {
+  const wsUrl = await findTestRendererWebSocketUrl();
+  if (!wsUrl) {
+    throw new Error('test renderer CDP target is not available');
+  }
+  testRendererWebSocketUrlRef = wsUrl;
+  const ws = new WebSocket(wsUrl);
+  try {
+    await new Promise<void>((resolve, reject) => {
+      let done = false;
+      const finish = (err?: Error) => {
+        if (done) { return; }
+        done = true;
+        clearTimeout(timeout);
+        if (err) { reject(err); } else { resolve(); }
+      };
+      const timeout = setTimeout(() => finish(new Error('test renderer eval CDP connect timed out')), 3000);
+      ws.once('open', () => finish());
+      ws.once('error', err => finish(err instanceof Error ? err : new Error(String(err))));
+    });
+    await cdpRequest(ws, 'Runtime.enable', {}, 1500).catch(() => undefined);
+    const response = await cdpRequest(ws, 'Runtime.evaluate', {
+      expression,
+      includeCommandLineAPI: true,
+      returnByValue: true,
+      awaitPromise: true,
+    }, timeoutMs);
+    if (response?.exceptionDetails) {
+      throw new Error(response.exceptionDetails.text || 'test renderer eval exception');
+    }
+    return response?.result?.value;
+  } catch (err) {
+    if (testRendererWebSocketUrlRef === wsUrl) {
+      testRendererWebSocketUrlRef = null;
+    }
+    throw err;
+  } finally {
+    try { ws.close(); } catch {}
+  }
+}
+
+async function evaluateInMainProcessForTests(expression: string, timeoutMs = 7000): Promise<any> {
+  if (isTestRendererDebugMode()) {
+    const value = await evaluateInTestRendererForTests(expression, timeoutMs);
+    return [{
+      id: 'test-renderer',
+      title: 'test-renderer',
+      url: 'test-renderer-cdp',
+      value,
+    }];
+  }
   return evaluateInMainProcess(expression, timeoutMs);
 }
 
@@ -3241,7 +3893,14 @@ function evaluateInMainProcess(expression: string, timeoutMs = 7000): Promise<an
       try { ws.off('message', onMessage); } catch {}
       if (err) { reject(err); } else { resolve(value); }
     };
-    const timeout = setTimeout(() => finish(new Error('renderer test eval timed out')), timeoutMs);
+    const timeout = setTimeout(() => {
+      const err = new Error('renderer test eval timed out');
+      finish(err);
+      if (ws === mainWsRef) {
+        log.warn('[cdp] renderer eval timed out; dropping stale renderer CDP socket');
+        closeMainWebSocket();
+      }
+    }, timeoutMs);
     const onMessage = (data: string) => {
       try {
         const resp = JSON.parse(data);
@@ -3278,9 +3937,111 @@ function evaluateInMainProcess(expression: string, timeoutMs = 7000): Promise<an
   });
 }
 
-function rendererTestWindowEvalExpression(rendererExpr: string): string {
+function scheduleRendererNativeHoverFallback(
+  identifier: string,
+  markdown: string,
+  source: string,
+  anchor?: NativeHoverRefireAnchor,
+): void {
+  if (process.env.IR_NATIVE_HOVER_REFIRE !== '1') { return; }
+  if (extensionDeactivated || !identifier || !markdown || markdown.trim().length < 20) { return; }
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) { return; }
+  const refireKey = [
+    anchor?.uri.toString() ?? '',
+    anchor?.line ?? '',
+    anchor?.character ?? '',
+    identifier,
+  ].join(':');
+  if (nativeHoverRefireScheduledKeys.has(refireKey)) { return; }
+  nativeHoverRefireScheduledKeys.add(refireKey);
+  const timer = setTimeout(async () => {
+    rendererHoverFallbackTimers.delete(timer);
+    nativeHoverRefireScheduledKeys.delete(refireKey);
+    if (extensionDeactivated || !mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) { return; }
+    const rendererExpr = `
+      (function() {
+        try {
+          if (typeof window.irShowHoverFallback !== 'function') {
+            return { ok: false, reason: 'missing-irShowHoverFallback', patchVersion: Number(window.__irPatchVersion) || 0 };
+          }
+          return window.irShowHoverFallback(${jsonStringifyAscii(identifier)}, ${jsonStringifyAscii(markdown)}, {
+            source: ${jsonStringifyAscii(source)}
+          });
+        } catch (e) {
+          return { ok: false, reason: String(e && e.message || e), patchVersion: Number(window.__irPatchVersion) || 0 };
+        }
+      })()
+    `.trim();
+    try {
+      const rows = await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpr, true), 2500);
+      const value = (Array.isArray(rows) ? rows : [{ value: rows }])
+        .map((row: any) => row?.value)
+        .find(Boolean);
+      if (value?.ok && value?.refired) {
+        const now = Date.now();
+        const last = nativeHoverRefireLastAt.get(refireKey) ?? 0;
+        if (anchor && now - last >= NATIVE_HOVER_REFIRE_SUPPRESS_MS) {
+          nativeHoverRefireLastAt.set(refireKey, now);
+          try {
+            await Promise.race([
+              markRendererNativeHoverRefireGrace(1800),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('native refire grace timed out')), 900)),
+            ]).catch(() => {});
+            await Promise.race([
+              refireHoverAtAnchor(anchor),
+              new Promise((_, reject) => setTimeout(() => reject(new Error('native hover refire timed out')), 4600)),
+            ]);
+            await new Promise(resolve => setTimeout(resolve, 180));
+            try {
+              await Promise.race([
+                evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpr, true), 1400),
+                new Promise((_, reject) => setTimeout(() => reject(new Error('post-command native hover refire timed out')), 1600)),
+              ]);
+            } catch (postErr) {
+              if (rendererHoverFallbackLogCount < 120) {
+                rendererHoverFallbackLogCount++;
+                log.info(`[hover] post-command native hover refire skipped "${identifier}" source=${source}: ${postErr}`);
+              }
+            }
+            if (rendererHoverFallbackLogCount < 120) {
+              rendererHoverFallbackLogCount++;
+              log.info(`[hover] renderer requested native hover refire "${identifier}" source=${source} token=${value.token || ''}`);
+            }
+          } catch (err) {
+            if (rendererHoverFallbackLogCount < 120) {
+              rendererHoverFallbackLogCount++;
+              log.warn(`[hover] native hover refire failed "${identifier}" source=${source}: ${err}`);
+            }
+          }
+        } else if (rendererHoverFallbackLogCount < 120) {
+          rendererHoverFallbackLogCount++;
+          log.info(`[hover] native hover refire suppressed "${identifier}" source=${source} anchor=${anchor ? '1' : '0'}`);
+        }
+      } else if (value && value.reason && value.reason !== 'existing-hover' && rendererHoverFallbackLogCount < 120) {
+        rendererHoverFallbackLogCount++;
+        log.info(`[hover] renderer native hover refire skipped "${identifier}" source=${source} reason=${value.reason}`);
+      }
+    } catch (err) {
+      if (rendererHoverFallbackLogCount < 120) {
+        rendererHoverFallbackLogCount++;
+        log.warn(`[hover] renderer native hover refire probe failed "${identifier}" source=${source}: ${err}`);
+      }
+    }
+  }, 260);
+  rendererHoverFallbackTimers.add(timer);
+}
+
+function rendererTestWindowEvalExpression(rendererExpr: string, strictTestWorkspace = false): string {
+  if (isTestRendererDebugMode()) {
+    return rendererExpr;
+  }
   const workspacePath = workspaceRootFsPath() ?? '';
   const workspaceName = workspacePath ? path.basename(workspacePath) : '';
+  const extensionRootPath = path.resolve(__dirname, '..');
+  const extensionRootName = path.basename(extensionRootPath);
+  const strictAllowsExtensionDevelopmentHost = extensionRunsInTestMode;
+  const strictCanTrustSingleCurrentMainWindow = extensionRunsInTestMode && !!rendererUserDataDirHint;
+  const testWindowMarker = process.env.IR_TEST_WINDOW_MARKER || '';
   const requireExtensionDevelopmentHost = false;
   return `
     (async function() {
@@ -3288,6 +4049,12 @@ function rendererTestWindowEvalExpression(rendererExpr: string): string {
       var wins = BW.getAllWindows();
       var workspacePath = ${JSON.stringify(workspacePath)};
       var workspaceName = ${JSON.stringify(workspaceName)};
+      var extensionRootPath = ${JSON.stringify(extensionRootPath)};
+      var extensionRootName = ${JSON.stringify(extensionRootName)};
+      var strictTestWorkspace = ${JSON.stringify(strictTestWorkspace)};
+      var strictAllowsExtensionDevelopmentHost = ${JSON.stringify(strictAllowsExtensionDevelopmentHost)};
+      var strictCanTrustSingleCurrentMainWindow = ${JSON.stringify(strictCanTrustSingleCurrentMainWindow)};
+      var testWindowMarker = ${JSON.stringify(testWindowMarker)};
       var requireExtensionDevelopmentHost = ${JSON.stringify(requireExtensionDevelopmentHost)};
       function decodeMaybe(s) { try { return decodeURIComponent(s); } catch (_) { return s || ''; } }
       function withTimeout(promise, ms, fallback) {
@@ -3330,6 +4097,53 @@ function rendererTestWindowEvalExpression(rendererExpr: string): string {
         return title.indexOf(workspaceName) >= 0
           || (title.indexOf('Extension Development Host') >= 0 && title.indexOf(workspaceName) >= 0);
       }
+      function textMatchesWorkspace(text) {
+        text = String(text || '');
+        var decoded = decodeMaybe(text);
+        var encodedWorkspace = workspacePath ? encodeURIComponent(workspacePath) : '';
+        return !!(
+          (workspacePath && (
+            text.indexOf(workspacePath) >= 0
+            || decoded.indexOf(workspacePath) >= 0
+            || text.indexOf(encodedWorkspace) >= 0
+          ))
+          || (workspaceName && text.indexOf(workspaceName) >= 0)
+        );
+      }
+      function textMatchesExtensionRoot(text) {
+        text = String(text || '');
+        var decoded = decodeMaybe(text);
+        var encodedExtension = extensionRootPath ? encodeURIComponent(extensionRootPath) : '';
+        return !!(
+          (extensionRootPath && (
+            text.indexOf(extensionRootPath) >= 0
+            || decoded.indexOf(extensionRootPath) >= 0
+            || text.indexOf(encodedExtension) >= 0
+          ))
+          || (extensionRootName && text.indexOf(extensionRootName) >= 0)
+        );
+      }
+      function textMatchesKnownWorkspace(text) {
+        return textMatchesWorkspace(text) || textMatchesExtensionRoot(text);
+      }
+      function textMatchesTestWindowMarker(text) {
+        return !!(testWindowMarker && String(text || '').indexOf(testWindowMarker) >= 0);
+      }
+      function isStrictTestWorkspaceCandidate(w, probe) {
+        var title = windowTitle(w);
+        var url = windowUrl(w);
+        var docTitle = String((probe && probe.documentTitle) || '');
+        var href = String((probe && probe.locationHref) || '');
+        if (textMatchesTestWindowMarker(title) || textMatchesTestWindowMarker(docTitle)
+          || textMatchesTestWindowMarker(href) || (probe && probe.bodyTestWindowMarkerMatch)) return true;
+        if (probe && probe.isExtensionDevelopmentHost) return !!strictAllowsExtensionDevelopmentHost;
+        if (probe && probe.bodyWorkspacePathMatch) return true;
+        var isExtensionDevelopmentHost = /Extension Development Host/i.test(title)
+          || /Extension Development Host/i.test(docTitle);
+        if (isExtensionDevelopmentHost && strictAllowsExtensionDevelopmentHost) return true;
+        return textMatchesWorkspace(title) || textMatchesWorkspace(url)
+          || textMatchesWorkspace(docTitle) || textMatchesWorkspace(href);
+      }
       function windowScore(w) {
         var score = 0;
         var title = windowTitle(w);
@@ -3366,6 +4180,8 @@ function rendererTestWindowEvalExpression(rendererExpr: string): string {
           hasSeededPreviewHover: false,
           hasActualHover: false,
           hasPatch: false,
+          bodyWorkspacePathMatch: false,
+          bodyTestWindowMarkerMatch: false,
           documentTitle: '',
           locationHref: ''
         };
@@ -3374,16 +4190,25 @@ function rendererTestWindowEvalExpression(rendererExpr: string): string {
           var expr = [
             '(function(){try{',
             'var roots=document.querySelectorAll(".monaco-hover,.monaco-editor-hover");',
+            'var workspacePath=' + ${JSON.stringify(JSON.stringify(workspacePath))} + ';',
+            'var encodedWorkspace=' + ${JSON.stringify(JSON.stringify(encodeURIComponent(workspacePath)))} + ';',
+            'var testWindowMarker=' + ${JSON.stringify(JSON.stringify(testWindowMarker))} + ';',
+            'var bodyText=String(document.body&&document.body.textContent||"");',
+            'var decodedBody=bodyText;try{decodedBody=decodeURIComponent(bodyText)}catch(_){}',
+            'var bodyWorkspacePathMatch=!!(workspacePath&&(bodyText.indexOf(workspacePath)>=0||bodyText.indexOf(encodedWorkspace)>=0||decodedBody.indexOf(workspacePath)>=0));',
+            'var bodyTestWindowMarkerMatch=!!(testWindowMarker&&bodyText.indexOf(testWindowMarker)>=0);',
             'var actual=0;',
             'for(var i=0;i<roots.length;i++){',
             'var h=roots[i];',
             'if(!h.classList.contains("ir-e2e-empty-hover")&&String(h.textContent||"").trim().length)actual++;',
             '}',
             'return {',
-            'isExtensionDevelopmentHost:/Extension Development Host/i.test(String(document.title||""))||/Extension Development Host/i.test(String(document.body&&document.body.textContent||"")),',
+            'isExtensionDevelopmentHost:/Extension Development Host/i.test(String(document.title||"")),',
             'hasSeededPreviewHover:!!document.querySelector(".ir-test-seeded-hover"),',
             'hasActualHover:actual>0||!!(window.__irActiveHoverEl&&document.body.contains(window.__irActiveHoverEl)),',
             'hasPatch:(Number(window.__irPatchVersion)||0)>0,',
+            'bodyWorkspacePathMatch:bodyWorkspacePathMatch,',
+            'bodyTestWindowMarkerMatch:bodyTestWindowMarkerMatch,',
             'documentTitle:String(document.title||""),',
             'locationHref:String(location&&location.href||"")',
             '};',
@@ -3403,6 +4228,7 @@ function rendererTestWindowEvalExpression(rendererExpr: string): string {
         if (probe && probe.hasActualHover) score += 3000;
         if (probe && probe.hasPatch) score += 100;
         var title = String((probe && probe.documentTitle) || '') + ' ' + windowTitle(w);
+        if (textMatchesTestWindowMarker(title) || (probe && probe.bodyTestWindowMarkerMatch)) score += 10000;
         if (workspaceName && title.indexOf(workspaceName) >= 0) score += 120;
         return score;
       }
@@ -3418,6 +4244,60 @@ function rendererTestWindowEvalExpression(rendererExpr: string): string {
           var probe = await probeWindow(candidates[pi]);
           probes.push(probe);
           if (probe && probe.isExtensionDevelopmentHost) hasExtensionDevHost = true;
+        }
+        if (strictTestWorkspace) {
+          var preStrictCandidates = candidates.slice();
+          var preStrictProbes = probes.slice();
+          var strictCandidates = [];
+          var strictProbes = [];
+          for (var si = 0; si < candidates.length; si++) {
+            if (isStrictTestWorkspaceCandidate(candidates[si], probes[si])) {
+              strictCandidates.push(candidates[si]);
+              strictProbes.push(probes[si]);
+            }
+          }
+          candidates = strictCandidates;
+          probes = strictProbes;
+          hasExtensionDevHost = false;
+          for (var sh = 0; sh < probes.length; sh++) {
+            if (probes[sh] && probes[sh].isExtensionDevelopmentHost) hasExtensionDevHost = true;
+          }
+          if (!candidates.length && !testWindowMarker && strictCanTrustSingleCurrentMainWindow && preStrictCandidates.length) {
+            candidates = chooseSingleWindow(preStrictCandidates);
+            probes = candidates.map(function(candidate) {
+              var idx = preStrictCandidates.indexOf(candidate);
+              return idx >= 0 ? preStrictProbes[idx] : null;
+            });
+            hasExtensionDevHost = false;
+            for (var fh = 0; fh < probes.length; fh++) {
+              if (probes[fh] && probes[fh].isExtensionDevelopmentHost) hasExtensionDevHost = true;
+            }
+          }
+          if (!candidates.length) return [];
+        }
+        if (workspacePath) {
+          var workspaceCandidates = [];
+          var workspaceProbes = [];
+          for (var wi = 0; wi < candidates.length; wi++) {
+            var href = String((probes[wi] && probes[wi].locationHref) || '');
+            var decodedHref = decodeMaybe(href);
+            if (urlMatchesWorkspace(candidates[wi])
+              || titleMatchesWorkspace(candidates[wi])
+              || (probes[wi] && probes[wi].bodyWorkspacePathMatch)
+              || href.indexOf(workspacePath) >= 0
+              || decodedHref.indexOf(workspacePath) >= 0) {
+              workspaceCandidates.push(candidates[wi]);
+              workspaceProbes.push(probes[wi]);
+            }
+          }
+          if (workspaceCandidates.length) {
+            candidates = workspaceCandidates;
+            probes = workspaceProbes;
+            hasExtensionDevHost = false;
+            for (var wh = 0; wh < probes.length; wh++) {
+              if (probes[wh] && probes[wh].isExtensionDevelopmentHost) hasExtensionDevHost = true;
+            }
+          }
         }
         if (requireExtensionDevelopmentHost && !hasExtensionDevHost) {
           return [];
@@ -3520,6 +4400,26 @@ function rendererTestWindowEvalExpression(rendererExpr: string): string {
 }
 
 async function ensureRendererPatchForHarness(): Promise<void> {
+  if (isTestRendererDebugMode()) {
+    const wsUrl = await findTestRendererWebSocketUrl();
+    if (!wsUrl) {
+      await runRendererInjection(injectRenderer);
+      return;
+    }
+    if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN || mainWsRefTargetUrl !== wsUrl) {
+      await runRendererInjection(injectRenderer);
+      return;
+    }
+    try {
+      const version = await evaluateInTestRendererForTests(
+        `(function(){return Number(window.__irPatchVersion)||0})()`,
+        1500,
+      );
+      if (Number(version) >= RENDERER_PATCH_VERSION) { return; }
+    } catch {}
+    await runRendererInjection(reinjectRenderer);
+    return;
+  }
   if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) {
     await runRendererInjection(injectRenderer);
     return;
@@ -3537,7 +4437,7 @@ async function rendererHasSeededPreviewHoverForTests(): Promise<boolean> {
     })()
   `.trim();
   try {
-    const rows = await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpr), 2500);
+    const rows = await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpr, true), 2500);
     return (rows || []).some((row: any) => row?.value === true);
   } catch {
     return false;
@@ -3564,6 +4464,7 @@ async function cleanupRendererTestArtifactsAcrossWindowsForTests(): Promise<void
         '.ir-e2e-late-handle',
         '.ir-e2e-dedupe-hover',
         '.ir-e2e-dedupe-sentinel',
+        '.ir-e2e-sticky-far-target',
         '[data-ir-e2e-artifact="1"]'
       ];
       var nodes=document.querySelectorAll(selectors.join(','));
@@ -3571,32 +4472,17 @@ async function cleanupRendererTestArtifactsAcrossWindowsForTests(): Promise<void
       for(var i=0;i<nodes.length;i++){
         try{if(nodes[i].parentNode){nodes[i].parentNode.removeChild(nodes[i]);removed++;}}catch(_){}
       }
+      window.__irActiveHoverEl=null;
+      window.__irOriginalHoverSnapshot=null;
+      window.__irHistoryFor=null;
+      window.__irHistory=[];
+      window.__irHistoryCurrent=null;
+      window.__irLastPreviewTarget=null;
       return {ok:true,removed:removed,patchVersion:Number(window.__irPatchVersion)||0};
     })()
   `.trim();
-  const mainExpr = `
-    (async function(){
-      var BW=require('electron').BrowserWindow;
-      var wins=BW.getAllWindows();
-      var out=[];
-      function withTimeout(promise,ms,fallback){
-        return Promise.race([promise,new Promise(function(resolve){setTimeout(function(){resolve(fallback);},ms);})]);
-      }
-      for(var i=0;i<wins.length;i++){
-        var w=wins[i];
-        try{
-          if(!w||!w.webContents||typeof w.webContents.executeJavaScript!=='function')continue;
-          var value=await withTimeout(w.webContents.executeJavaScript(${JSON.stringify(cleanupRendererExpr)},true),700,{timeout:true});
-          out.push({id:w.id,title:String((w.getTitle&&w.getTitle())||''),value:value});
-        }catch(e){
-          out.push({id:w&&w.id,error:String(e&&e.message||e)});
-        }
-      }
-      return out;
-    })()
-  `.trim();
   try {
-    await evaluateInMainProcessForTests(mainExpr, 1500);
+    await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(cleanupRendererExpr, true), 2500);
   } catch {}
 }
 
@@ -3627,7 +4513,7 @@ async function capturePreviewScrollStateInRenderer(): Promise<PreviewScrollState
     })()
   `.trim();
   try {
-    const rows = await evaluateInMainProcess(rendererTestWindowEvalExpression(rendererExpr), 1500);
+    const rows = await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpr), 1500);
     const value = (rows || []).map((row: any) => row?.value).find((v: any) => v?.ok && v.state);
     return value?.state;
   } catch {
@@ -3670,12 +4556,116 @@ async function applyPreviewStateInRenderer(state: PreviewState, fromBack: boolea
   `.trim();
   const mainExpr = rendererTestWindowEvalExpression(rendererExpr);
   try {
-    const rows = await evaluateInMainProcess(mainExpr, 3000);
-    return Array.isArray(rows) && rows.some(row => row?.value?.ok);
+    const result = await evaluateInMainProcessForTests(mainExpr, 3000);
+    const rows = Array.isArray(result) ? result : [{ value: result }];
+    const applied = rows.some(row => row?.value?.ok);
+    if (!applied) {
+      log.warn(`preview: renderer apply returned no ok row (${JSON.stringify(rows).slice(0, 1000)})`);
+    }
+    return applied;
   } catch (err) {
     log.warn(`preview: renderer apply failed: ${err}`);
     return false;
   }
+}
+
+async function restorePreviewScrollStateInRenderer(scrollState: PreviewScrollState | undefined): Promise<boolean> {
+  if (!scrollState) { return false; }
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) {
+    try { await runRendererInjection(injectRenderer); } catch {}
+  }
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) { return false; }
+  const safeScroll = jsonStringifyAscii(scrollState);
+  const rendererExpr = `
+    (function() {
+      try {
+        if (typeof window.__irRestorePreviewScrollState !== 'function') {
+          return { ok: false, reason: 'missing-scroll-restore', patchVersion: Number(window.__irPatchVersion) || 0 };
+        }
+        return window.__irRestorePreviewScrollState(${safeScroll});
+      } catch (e) {
+        return { ok: false, reason: String(e && e.message || e), patchVersion: Number(window.__irPatchVersion) || 0 };
+      }
+    })()
+  `.trim();
+  try {
+    const rows = await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpr), 2500);
+    return Array.isArray(rows) && rows.some(row => row?.value?.ok);
+  } catch {
+    return false;
+  }
+}
+
+async function restoreOriginalHoverSnapshotInRenderer(scrollState: PreviewScrollState | undefined): Promise<boolean> {
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) {
+    try { await runRendererInjection(injectRenderer); } catch {}
+  }
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) { return false; }
+  const safeScroll = jsonStringifyAscii(scrollState ?? null);
+  const rendererExpr = `
+    (function() {
+      try {
+        if (typeof window.__irRestoreOriginalHoverSnapshot !== 'function') {
+          return { ok: false, reason: 'missing-original-restore', patchVersion: Number(window.__irPatchVersion) || 0 };
+        }
+        return window.__irRestoreOriginalHoverSnapshot(${safeScroll});
+      } catch (e) {
+        return { ok: false, reason: String(e && e.message || e), patchVersion: Number(window.__irPatchVersion) || 0 };
+      }
+    })()
+  `.trim();
+  try {
+    const rows = await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpr), 2500);
+    return Array.isArray(rows) && rows.some(row => row?.value?.ok);
+  } catch {
+    return false;
+  }
+}
+
+async function clearRendererPreviewNavigationStateInRenderer(): Promise<void> {
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) {
+    try { await runRendererInjection(injectRenderer); } catch {}
+  }
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) { return; }
+  const rendererExpr = `
+    (function() {
+      try {
+        window.__irOriginalHoverSnapshot = null;
+        window.__irHistoryFor = null;
+        window.__irHistory = [];
+        window.__irHistoryCurrent = null;
+        window.__irLastPreviewTarget = null;
+        window.__irNativePreviewBackUntil = 0;
+        return { ok: true, patchVersion: Number(window.__irPatchVersion) || 0 };
+      } catch (e) {
+        return { ok: false, reason: String(e && e.message || e), patchVersion: Number(window.__irPatchVersion) || 0 };
+      }
+    })()
+  `.trim();
+  try {
+    await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpr, true), 2500);
+  } catch {}
+}
+
+async function markRendererNativeHoverRefireGrace(durationMs = 1600): Promise<void> {
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) {
+    try { await runRendererInjection(injectRenderer); } catch {}
+  }
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) { return; }
+  const rendererExpr = `
+    (function() {
+      try {
+        window.__irNativeHoverRefireUntil = Date.now() + ${Math.max(250, durationMs)};
+        window.__irNativePreviewBackUntil = Date.now() + ${Math.max(250, durationMs)};
+        return { ok: true, patchVersion: Number(window.__irPatchVersion) || 0 };
+      } catch (e) {
+        return { ok: false, reason: String(e && e.message || e), patchVersion: Number(window.__irPatchVersion) || 0 };
+      }
+    })()
+  `.trim();
+  try {
+    await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpr, true), 1000);
+  } catch {}
 }
 
 async function runHoverRendererHarnessForTests(): Promise<any[]> {
@@ -3778,6 +4768,24 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
         }
         return { inactiveHovers: inactive, externalArtifacts: externalArtifacts };
       }
+      function harnessLog(message) {
+        try {
+          if (typeof window.irGoToType === 'function') {
+            window.irGoToType('LOG:renderer-harness ' + message);
+          }
+        } catch (_) {}
+      }
+      function harnessMark(step) {
+        try {
+          var active = window.__irActiveHoverEl;
+          harnessLog('step=' + step
+            + ' active=' + !!(active && document.body.contains(active))
+            + ' activeText=' + String(active ? active.textContent || '' : '').length
+            + ' hovers=' + document.querySelectorAll('.monaco-hover,.monaco-editor-hover').length);
+        } catch (_) {
+          harnessLog('step=' + step);
+        }
+      }
       function snap(hoverEl) {
         var sc = hooks.primaryHoverScroller(hoverEl) || hoverEl;
         var rect = hoverEl.getBoundingClientRect();
@@ -3820,7 +4828,7 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
         for (var i = 0; i < lineCount; i++) {
           var line = document.createElement('div');
           var n = String(i + 1).padStart(3, '0');
-          line.textContent = label + ' field_' + n + ': str';
+          line.textContent = label + ' field_' + n + ': str\\n';
           md.appendChild(line);
         }
         rowContents.appendChild(md);
@@ -3891,6 +4899,30 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
         document.body.appendChild(hover);
         return { hover: hover, sentinel: sentinel, first: first, second: second };
       }
+      function makeLazyLoadingHover(initialText) {
+        var hover = document.createElement('div');
+        hover.className = 'monaco-hover ir-e2e-hover ir-e2e-lazy-hover';
+        hover.style.cssText = 'position:fixed;left:88px;top:88px;width:360px;min-height:72px;padding:4px;z-index:2147483647;background:Canvas;color:CanvasText;';
+        var sc = document.createElement('div');
+        sc.className = 'monaco-scrollable-element';
+        var content = document.createElement('div');
+        content.className = 'monaco-hover-content';
+        var row = document.createElement('div');
+        row.className = 'hover-row';
+        var rowContents = document.createElement('div');
+        rowContents.className = 'hover-row-contents';
+        var md = document.createElement('div');
+        md.className = 'rendered-markdown';
+        md.style.cssText = 'font-family:Menlo,Monaco,monospace;font-size:12px;line-height:18px;';
+        md.textContent = initialText || 'Loading';
+        rowContents.appendChild(md);
+        row.appendChild(rowContents);
+        content.appendChild(row);
+        sc.appendChild(content);
+        hover.appendChild(sc);
+        document.body.appendChild(hover);
+        return { hover: hover, markdown: md };
+      }
       function appendLateHandle(hoverEl) {
         var sc = hooks.primaryHoverScroller(hoverEl) || hoverEl;
         var late = document.createElement('div');
@@ -3959,15 +4991,216 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
         document.body.appendChild(hover);
         return hover;
       }
+      function waitFrame() {
+        return new Promise(function(resolve) {
+          var done = false;
+          function finish() {
+            if (done) return;
+            done = true;
+            resolve();
+          }
+          try {
+            Promise.resolve().then(function() {
+              try { Promise.resolve().then(finish); } catch (_) { finish(); }
+            });
+          } catch (_) {}
+          try {
+            requestAnimationFrame(function() {
+              try { requestAnimationFrame(finish); } catch (_) { finish(); }
+            });
+          } catch (_) {
+            finish();
+          }
+          setTimeout(finish, 80);
+        });
+      }
+      function stickyFarEventProbe(cycles) {
+        cycles = Math.max(1, cycles || 1);
+        var cycleResults = [];
+        var allSeenTypes = [];
+        var allStickyReleased = true;
+        var allRecentlyInside = true;
+        for (var cycle = 0; cycle < cycles; cycle++) {
+        var sticky = makeHover('StickyReleaseHover' + cycle, 4);
+        hooks.makeHoverScrollable(sticky, true, (sticky.textContent || '').length);
+        sticky.classList.add('ir-sticky');
+        sticky.__irLastInsideAt = Date.now();
+        var target = document.createElement('button');
+        target.className = 'ir-e2e-sticky-far-target';
+        target.textContent = 'Far editor symbol target ' + cycle;
+        target.style.cssText = 'position:fixed;left:' + Math.max(320, (window.innerWidth || 1200) - 180 - (cycle * 8))
+          + 'px;top:' + Math.max(320, (window.innerHeight || 800) - 140 - (cycle * 6))
+          + 'px;width:140px;height:28px;z-index:2147483646;';
+        document.body.appendChild(target);
+        var tr = target.getBoundingClientRect();
+        var x = Math.round(tr.left + tr.width / 2);
+        var y = Math.round(tr.top + tr.height / 2);
+        var seen = [];
+        function listener(ev) {
+          seen.push({
+            type: ev.type,
+            targetClass: String(ev.target && ev.target.className || ''),
+            stickyAfterEvent: sticky.classList.contains('ir-sticky')
+          });
+        }
+        window.addEventListener('pointermove', listener, true);
+        window.addEventListener('mousemove', listener, true);
+        function fire(type) {
+          var Ctor = type.indexOf('pointer') === 0 && window.PointerEvent ? window.PointerEvent : window.MouseEvent;
+          try {
+            target.dispatchEvent(new Ctor(type, {
+              bubbles: true,
+              cancelable: true,
+              composed: true,
+              view: window,
+              clientX: x,
+              clientY: y,
+              screenX: x,
+              screenY: y,
+              button: 0,
+              buttons: 0,
+              pointerType: 'mouse'
+            }));
+          } catch (_) {
+            target.dispatchEvent(new MouseEvent(type, {
+              bubbles: true,
+              cancelable: true,
+              view: window,
+              clientX: x,
+              clientY: y,
+              screenX: x,
+              screenY: y,
+              button: 0,
+              buttons: 0
+            }));
+          }
+        }
+        fire('pointermove');
+        fire('mousemove');
+        window.removeEventListener('pointermove', listener, true);
+        window.removeEventListener('mousemove', listener, true);
+        var cycleResult = {
+          cycle: cycle,
+          seenTypes: seen.map(function(row) { return row.type; }),
+          seenCount: seen.length,
+          stickyAfterFarMove: sticky.classList.contains('ir-sticky'),
+          recentlyInsideAtDispatch: true,
+          targetPoint: { x: x, y: y },
+          hoverRect: rectObj(sticky.getBoundingClientRect()),
+          targetRect: rectObj(tr)
+        };
+        allSeenTypes = allSeenTypes.concat(cycleResult.seenTypes);
+        allStickyReleased = allStickyReleased && !cycleResult.stickyAfterFarMove;
+        allRecentlyInside = allRecentlyInside && !!cycleResult.recentlyInsideAtDispatch;
+        cycleResults.push(cycleResult);
+        try { target.parentNode && target.parentNode.removeChild(target); } catch (_) {}
+        try { sticky.parentNode && sticky.parentNode.removeChild(sticky); } catch (_) {}
+        }
+        return {
+          seenTypes: allSeenTypes,
+          seenCount: allSeenTypes.length,
+          stickyAfterFarMove: !allStickyReleased,
+          allStickyReleased: allStickyReleased,
+          recentlyInsideAtDispatch: allRecentlyInside,
+          cycles: cycleResults
+        };
+      }
+      function nativePopupNearHoverProbe() {
+        var sticky = makeHover('NativePopupStickyHover', 8);
+        hooks.makeHoverScrollable(sticky, true, (sticky.textContent || '').length);
+        sticky.classList.add('ir-sticky');
+        sticky.__irLastInsideAt = Date.now();
+        window.__irActiveHoverEl = sticky;
+        var sr = sticky.getBoundingClientRect();
+        var popup = document.createElement('div');
+        popup.className = 'suggest-widget ir-e2e-native-popup';
+        popup.setAttribute('role', 'listbox');
+        popup.style.cssText = 'position:fixed;left:' + Math.max(2, Math.floor(sr.right - 18))
+          + 'px;top:' + Math.max(2, Math.floor(sr.top + 12))
+          + 'px;width:180px;height:72px;z-index:2147483647;background:Canvas;color:CanvasText;';
+        var item = document.createElement('div');
+        item.className = 'monaco-list-row focused';
+        item.textContent = 'Native popup completion item';
+        item.style.cssText = 'width:160px;height:28px;margin:8px;';
+        popup.appendChild(item);
+        document.body.appendChild(popup);
+        var ir = item.getBoundingClientRect();
+        var x = Math.round(ir.left + ir.width / 2);
+        var y = Math.round(ir.top + ir.height / 2);
+        var seen = [];
+        function listener(ev) {
+          seen.push({
+            type: ev.type,
+            targetClass: String(ev.target && ev.target.className || ''),
+            stickyAfterEvent: sticky.classList.contains('ir-sticky')
+          });
+        }
+        window.addEventListener('pointerover', listener, true);
+        window.addEventListener('mouseover', listener, true);
+        window.addEventListener('pointermove', listener, true);
+        window.addEventListener('mousemove', listener, true);
+        function fire(type) {
+          var Ctor = type.indexOf('pointer') === 0 && window.PointerEvent ? window.PointerEvent : window.MouseEvent;
+          item.dispatchEvent(new Ctor(type, {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            view: window,
+            clientX: x,
+            clientY: y,
+            screenX: x,
+            screenY: y,
+            button: 0,
+            buttons: 0,
+            pointerType: 'mouse'
+          }));
+        }
+        try {
+          fire('pointerover');
+          fire('mouseover');
+          fire('pointermove');
+          fire('mousemove');
+        } catch (_) {}
+        window.removeEventListener('pointerover', listener, true);
+        window.removeEventListener('mouseover', listener, true);
+        window.removeEventListener('pointermove', listener, true);
+        window.removeEventListener('mousemove', listener, true);
+        var result = {
+          seenTypes: seen.map(function(row) { return row.type; }),
+          seenCount: seen.length,
+          stickyAfterNativePopup: sticky.classList.contains('ir-sticky'),
+          activeStillStickyHover: window.__irActiveHoverEl === sticky,
+          hoverRect: rectObj(sr),
+          popupRect: rectObj(popup.getBoundingClientRect()),
+          itemRect: rectObj(ir)
+        };
+        try { popup.parentNode && popup.parentNode.removeChild(popup); } catch (_) {}
+        try { sticky.parentNode && sticky.parentNode.removeChild(sticky); } catch (_) {}
+        if (window.__irActiveHoverEl === sticky) window.__irActiveHoverEl = null;
+        return result;
+      }
       if (!hooks || typeof hooks.makeHoverScrollable !== 'function') {
         return { ok: false, reason: 'missing-hooks', patchVersion: Number(window.__irPatchVersion) || 0 };
       }
+      Array.prototype.slice.call(document.querySelectorAll('.monaco-hover,.monaco-editor-hover')).forEach(function(el) {
+        try { el.parentNode && el.parentNode.removeChild(el); } catch (_) {}
+      });
+      window.__irActiveHoverEl = null;
       Array.prototype.slice.call(document.querySelectorAll('.ir-e2e-hover')).forEach(function(el) {
         try { el.parentNode && el.parentNode.removeChild(el); } catch (_) {}
       });
       Array.prototype.slice.call(document.querySelectorAll('.ir-e2e-external-artifact,.ir-e2e-body-handle,.ir-e2e-workbench-sash,.ir-e2e-top-body-handle,.ir-e2e-top-workbench-sash')).forEach(function(el) {
         try { el.parentNode && el.parentNode.removeChild(el); } catch (_) {}
       });
+      Array.prototype.slice.call(document.querySelectorAll('.ir-e2e-sticky-far-target')).forEach(function(el) {
+        try { el.parentNode && el.parentNode.removeChild(el); } catch (_) {}
+      });
+
+      harnessMark('start');
+      var stickyFarProbe = stickyFarEventProbe(3);
+      harnessMark('after-sticky-far-probe');
+      var nativePopupNearProbe = nativePopupNearHoverProbe();
+      harnessMark('after-native-popup-near-probe');
 
       var large = makeHover('LargeHoverModel', 90);
       hooks.makeHoverScrollable(large, true, (large.textContent || '').length);
@@ -3981,28 +5214,94 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
           deltaMode: 0
         }));
       } catch (_) {}
-      await new Promise(function(resolve) {
-        requestAnimationFrame(function() { requestAnimationFrame(resolve); });
-      });
+      await waitFrame();
       var largeAfterWheel = snap(large);
+      harnessMark('after-large-scroll');
 
-      var huge = makeHover('HugeHoverModel', 1200);
+      var huge = makeHover('HugeHoverModel', 900);
       hooks.makeHoverScrollable(huge, true, (huge.textContent || '').length);
+      var hugeScanStart = (window.performance && performance.now) ? performance.now() : Date.now();
       try { if (typeof hooks.scanRenderedMarkdown === 'function') hooks.scanRenderedMarkdown(); } catch (_) {}
-      await new Promise(function(resolve) { setTimeout(resolve, 80); });
+      var hugeScanMs = ((window.performance && performance.now) ? performance.now() : Date.now()) - hugeScanStart;
+      var hugeSecondScanStart = (window.performance && performance.now) ? performance.now() : Date.now();
+      try { if (typeof hooks.scanRenderedMarkdown === 'function') hooks.scanRenderedMarkdown(); } catch (_) {}
+      var hugeSecondScanMs = ((window.performance && performance.now) ? performance.now() : Date.now()) - hugeSecondScanStart;
+      await waitFrame();
       var hugeTextLength = (huge.textContent || '').length;
       var hugeEagerLinks = huge.querySelectorAll('.ir-type-link').length;
       try { huge.parentNode && huge.parentNode.removeChild(huge); } catch (_) {}
+      harnessMark('after-huge-scan');
 
       var duplicateDedupe = makeDuplicateDedupeHover();
       try { if (typeof hooks.scanRenderedMarkdown === 'function') hooks.scanRenderedMarkdown(); } catch (_) {}
-      await new Promise(function(resolve) { setTimeout(resolve, 80); });
+      await waitFrame();
       var dedupeHoverConnected = document.body.contains(duplicateDedupe.hover);
       var dedupeSentinelConnected = document.body.contains(duplicateDedupe.sentinel);
       var dedupeSecondRowConnected = document.body.contains(duplicateDedupe.second.row);
       var dedupeMarkdownCount = duplicateDedupe.hover.querySelectorAll('.rendered-markdown').length;
       var dedupeTextLength = (duplicateDedupe.hover.textContent || '').length;
       try { duplicateDedupe.hover.parentNode && duplicateDedupe.hover.parentNode.removeChild(duplicateDedupe.hover); } catch (_) {}
+      harnessMark('after-dedupe');
+
+      var lazyOldActive = makeHover('LazyOldActiveModel', 5);
+      hooks.makeHoverScrollable(lazyOldActive, true, (lazyOldActive.textContent || '').length);
+      var lazyOldMarkdown = lazyOldActive.querySelector('.rendered-markdown');
+      if (lazyOldMarkdown) {
+        lazyOldMarkdown.classList.remove('rendered-markdown');
+        lazyOldMarkdown.classList.add('ir-e2e-old-active-markdown');
+      }
+      lazyOldActive.__irSeenAt = Date.now();
+      lazyOldActive.__irLastSeenAt = lazyOldActive.__irSeenAt;
+      lazyOldActive.__irActivatedAt = lazyOldActive.__irSeenAt;
+      window.__irActiveHoverEl = lazyOldActive;
+      var lazy = makeLazyLoadingHover('Loading');
+      var staleSeenAt = Date.now() - 2400;
+      lazy.hover.__irSeenAt = staleSeenAt;
+      lazy.hover.__irLastSeenAt = staleSeenAt;
+      lazy.markdown.__irLastScanText = 'Loading';
+      var lazyBeforePopulate = {
+        activeWasOld: window.__irActiveHoverEl === lazyOldActive,
+        lazyTextLength: (lazy.hover.textContent || '').length,
+        lazyLinks: lazy.hover.querySelectorAll('.ir-type-link').length,
+        lazySeenAt: lazy.hover.__irSeenAt || 0,
+        oldActivity: lazyOldActive.__irActivatedAt || 0,
+        oldConnected: document.body.contains(lazyOldActive),
+        lazyConnected: document.body.contains(lazy.hover)
+      };
+      lazy.markdown.textContent = 'class LazyLoadedModel:\\n    field: str\\n    def save(self) -> None:\\n        return None';
+      try { if (typeof hooks.scanRenderedMarkdown === 'function') hooks.scanRenderedMarkdown(); } catch (_) {}
+      await waitFrame();
+      var lazyAfterPopulate = {
+        activeIsLazy: window.__irActiveHoverEl === lazy.hover,
+        activeIsOld: window.__irActiveHoverEl === lazyOldActive,
+        activeText: String(window.__irActiveHoverEl ? window.__irActiveHoverEl.textContent || '' : '').replace(/\\s+/g, ' ').slice(0, 160),
+        activeClassName: String(window.__irActiveHoverEl ? window.__irActiveHoverEl.className || '' : ''),
+        activeConnected: !!(window.__irActiveHoverEl && document.body.contains(window.__irActiveHoverEl)),
+        activeActivity: window.__irActiveHoverEl
+          ? Math.max(window.__irActiveHoverEl.__irActivatedAt || 0, window.__irActiveHoverEl.__irContentChangedAt || 0, window.__irActiveHoverEl.__irLastSeenAt || 0, window.__irActiveHoverEl.__irSeenAt || 0)
+          : 0,
+        lazyTextLength: (lazy.hover.textContent || '').length,
+        lazyLinks: lazy.hover.querySelectorAll('.ir-type-link').length,
+        lazyEmptyClass: lazy.hover.classList.contains('ir-empty-hover-root'),
+        lazyRect: rectObj(lazy.hover.getBoundingClientRect()),
+        lazyConnected: document.body.contains(lazy.hover),
+        oldConnected: document.body.contains(lazyOldActive),
+        lazyContentChangedAt: lazy.hover.__irContentChangedAt || 0,
+        lazyActivity: Math.max(lazy.hover.__irActivatedAt || 0, lazy.hover.__irContentChangedAt || 0, lazy.hover.__irLastSeenAt || 0, lazy.hover.__irSeenAt || 0),
+        lazyHasModelLink: !!Array.prototype.slice.call(lazy.hover.querySelectorAll('.ir-type-link')).find(function(link) { return String(link.textContent || '') === 'LazyLoadedModel'; }),
+        lazyHasSaveLink: !!Array.prototype.slice.call(lazy.hover.querySelectorAll('.ir-type-link')).find(function(link) { return String(link.textContent || '') === 'save'; }),
+        lazyText: String(lazy.hover.textContent || '').replace(/\\s+/g, ' ').slice(0, 160)
+      };
+      var lazyHoverProbe = {
+        beforePopulate: lazyBeforePopulate,
+        afterPopulate: lazyAfterPopulate
+      };
+      try { lazy.hover.parentNode && lazy.hover.parentNode.removeChild(lazy.hover); } catch (_) {}
+      try { lazyOldActive.parentNode && lazyOldActive.parentNode.removeChild(lazyOldActive); } catch (_) {}
+      if (window.__irActiveHoverEl === lazy.hover || window.__irActiveHoverEl === lazyOldActive) {
+        window.__irActiveHoverEl = null;
+      }
+      harnessMark('after-lazy-hover');
 
       var orphan = makeHover('OrphanHoverPanel', 40);
       orphan.classList.add('ir-keepalive');
@@ -4016,7 +5315,7 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
       var small = makeHover('STATUS_ACTIVE = "active"', 1);
       hooks.makeHoverScrollable(small, true, (small.textContent || '').length);
       var emptyHoverRoot = appendEmptyHoverRootNear(small);
-      await new Promise(function(resolve) { setTimeout(resolve, 120); });
+      await waitFrame();
       var smallConnectedAfterEmptyRoot = document.body.contains(small);
       try { emptyHoverRoot.parentNode && emptyHoverRoot.parentNode.removeChild(emptyHoverRoot); } catch (_) {}
       var lateHandle = appendLateHandle(small);
@@ -4025,12 +5324,12 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
       var topBodyHandle = appendTopRightBodyLevelHoverHandleNear(small);
       var workbenchSash = appendWorkbenchSashNear(small);
       var topWorkbenchSash = appendTopWorkbenchSashNear(small);
-      await new Promise(function(resolve) { setTimeout(resolve, 120); });
+      await waitFrame();
       var mutatingHandle = appendMutatingHandleCandidate(small);
-      await new Promise(function(resolve) { requestAnimationFrame(resolve); });
+      await waitFrame();
       mutatingHandle.className = 'monaco-sash vertical ir-e2e-mutating-handle';
       mutatingHandle.style.cssText = 'position:absolute;right:0;top:0;width:14px;height:360px;display:block;visibility:visible;background:#d08770;';
-      await new Promise(function(resolve) { setTimeout(resolve, 120); });
+      await waitFrame();
       var largeConnectedAfterSmall = document.body.contains(large);
       var orphanConnectedAfterSmall = document.body.contains(orphan);
       var lateHandleConnectedAfterCleanup = document.body.contains(lateHandle);
@@ -4042,6 +5341,28 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
       var mutatingHandleConnectedAfterCleanup = document.body.contains(mutatingHandle);
       var smallSnap = snap(small);
       var inactiveAfterSmall = inactiveMetrics(small);
+      harnessMark('after-small');
+
+      var hiddenActive = makeHover('HiddenActiveHover', 8);
+      hooks.makeHoverScrollable(hiddenActive, true, (hiddenActive.textContent || '').length);
+      var hiddenActiveWasActive = window.__irActiveHoverEl === hiddenActive;
+      hiddenActive.classList.add('hidden');
+      hiddenActive.style.display = 'none';
+      hiddenActive.style.width = '0px';
+      hiddenActive.style.height = '0px';
+      hiddenActive.style.visibility = 'hidden';
+      try { if (typeof hooks.pruneDetachedHoverState === 'function') hooks.pruneDetachedHoverState(); } catch (_) {}
+      await waitFrame();
+      var hiddenActiveStillActive = window.__irActiveHoverEl === hiddenActive;
+      var hiddenActiveConnectedAfterPrune = document.body.contains(hiddenActive);
+      var hiddenActiveCurrentActive = window.__irActiveHoverEl
+        ? {
+          className: String(window.__irActiveHoverEl.className || ''),
+          rect: rectObj(window.__irActiveHoverEl.getBoundingClientRect()),
+          textLength: String(window.__irActiveHoverEl.textContent || '').length
+        }
+        : null;
+      harnessMark('after-hidden-active');
 
       try { small.parentNode && small.parentNode.removeChild(small); } catch (_) {}
       try { large.parentNode && large.parentNode.removeChild(large); } catch (_) {}
@@ -4053,6 +5374,7 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
       try { workbenchSash.parentNode && workbenchSash.parentNode.removeChild(workbenchSash); } catch (_) {}
       try { topWorkbenchSash.parentNode && topWorkbenchSash.parentNode.removeChild(topWorkbenchSash); } catch (_) {}
       try { mutatingHandle.parentNode && mutatingHandle.parentNode.removeChild(mutatingHandle); } catch (_) {}
+      harnessMark('before-return');
       return {
         ok: true,
         patchVersion: Number(window.__irPatchVersion) || 0,
@@ -4061,11 +5383,14 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
         largeAfterWheel: largeAfterWheel,
         hugeTextLength: hugeTextLength,
         hugeEagerLinks: hugeEagerLinks,
+        hugeScanMs: hugeScanMs,
+        hugeSecondScanMs: hugeSecondScanMs,
         dedupeHoverConnected: dedupeHoverConnected,
         dedupeSentinelConnected: dedupeSentinelConnected,
         dedupeSecondRowConnected: dedupeSecondRowConnected,
         dedupeMarkdownCount: dedupeMarkdownCount,
         dedupeTextLength: dedupeTextLength,
+        lazyHoverProbe: lazyHoverProbe,
         small: smallSnap,
         largeConnectedAfterSmall: largeConnectedAfterSmall,
         smallConnectedAfterEmptyRoot: smallConnectedAfterEmptyRoot,
@@ -4077,22 +5402,2079 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
         workbenchSashConnectedAfterCleanup: workbenchSashConnectedAfterCleanup,
         topWorkbenchSashConnectedAfterCleanup: topWorkbenchSashConnectedAfterCleanup,
         mutatingHandleConnectedAfterCleanup: mutatingHandleConnectedAfterCleanup,
-        inactiveAfterSmall: inactiveAfterSmall
+        inactiveAfterSmall: inactiveAfterSmall,
+        hiddenActiveWasActive: hiddenActiveWasActive,
+        hiddenActiveStillActive: hiddenActiveStillActive,
+        hiddenActiveConnectedAfterPrune: hiddenActiveConnectedAfterPrune,
+        hiddenActiveCurrentActive: hiddenActiveCurrentActive,
+        stickyFarProbe: stickyFarProbe,
+        nativePopupNearProbe: nativePopupNearProbe
       };
     })()
   `.trim();
-  const mainExpr = rendererTestWindowEvalExpression(rendererExpr);
-  return evaluateInMainProcessForTests(mainExpr);
+  const mainExpr = rendererTestWindowEvalExpression(rendererExpr, true);
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 2; attempt++) {
+    if (attempt > 0) {
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await ensureRendererPatchForHarness();
+      await cleanupRendererTestArtifactsAcrossWindowsForTests();
+    }
+    try {
+      return await evaluateInMainProcessForTests(mainExpr, 30000);
+    } catch (err) {
+      lastError = err;
+      if (!/timed out|socket is not open/i.test(String(err instanceof Error ? err.message : err))) {
+        break;
+      }
+      log.warn(`[test] renderer hover harness attempt ${attempt + 1} failed: ${err}`);
+    }
+  }
+  throw lastError instanceof Error ? lastError : new Error(String(lastError));
+}
+
+async function runHoverSplitColumnHarnessForTests(): Promise<any[]> {
+  await ensureRendererPatchForHarness();
+  await cleanupRendererTestArtifactsAcrossWindowsForTests();
+  const rendererExpr = `
+    (async function() {
+      var hooks = window.__irTestHooks;
+      function wait(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
+      function tick() { return Promise.resolve(); }
+      function removeAll(selector) {
+        Array.prototype.slice.call(document.querySelectorAll(selector)).forEach(function(el) {
+          try { el.parentNode && el.parentNode.removeChild(el); } catch (_) {}
+        });
+      }
+      function rectObj(el) {
+        if (!el || !el.getBoundingClientRect) return null;
+        var r = el.getBoundingClientRect();
+        return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+      }
+      function handleVisibleCount(root) {
+        var count = 0;
+        var handles = root ? root.querySelectorAll('.scrollbar,.slider,.shadow,.sash,.monaco-sash,.scroll-decoration,.decorationsOverviewRuler') : [];
+        for (var i = 0; i < handles.length; i++) {
+          try {
+            var cs = window.getComputedStyle(handles[i]);
+            var r = handles[i].getBoundingClientRect();
+            if (cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity) !== 0 && r.width > 0 && r.height > 0) count++;
+          } catch (_) {}
+        }
+        return count;
+      }
+      function linkTypes(root) {
+        var out = [];
+        var links = root ? root.querySelectorAll('.ir-type-link') : [];
+        for (var i = 0; i < links.length && out.length < 80; i++) {
+          out.push(links[i].getAttribute('data-type') || '');
+        }
+        return out;
+      }
+      function missingFragments(text, fragments) {
+        var out = [];
+        text = String(text || '');
+        for (var i = 0; i < fragments.length; i++) {
+          if (text.indexOf(fragments[i]) < 0) out.push(fragments[i]);
+        }
+        return out;
+      }
+      function presentFragments(text, fragments) {
+        var out = [];
+        text = String(text || '');
+        for (var i = 0; i < fragments.length; i++) {
+          if (text.indexOf(fragments[i]) >= 0) out.push(fragments[i]);
+        }
+        return out;
+      }
+      function makeHover(left, top) {
+        var hover = document.createElement('div');
+        hover.className = 'monaco-hover ir-e2e-hover ir-e2e-split-column-hover';
+        hover.style.cssText = 'position:fixed;left:' + left + 'px;top:' + top + 'px;z-index:2147483647;background:Canvas;color:CanvasText;';
+        var sc = document.createElement('div');
+        sc.className = 'monaco-scrollable-element';
+        var content = document.createElement('div');
+        content.className = 'monaco-hover-content';
+        sc.appendChild(content);
+        var scrollbar = document.createElement('div');
+        scrollbar.className = 'invisible scrollbar vertical';
+        scrollbar.style.cssText = 'position:absolute;right:0;top:0;width:12px;height:360px;display:block;visibility:visible;background:#007fd4;';
+        var slider = document.createElement('div');
+        slider.className = 'slider';
+        slider.style.cssText = 'width:12px;height:320px;display:block;visibility:visible;background:#007fd4;';
+        scrollbar.appendChild(slider);
+        sc.appendChild(scrollbar);
+        hover.appendChild(sc);
+        hover.__irSeenAt = Date.now();
+        var host = document.querySelector('.monaco-workbench') || document.querySelector('.part.editor') || document.body;
+        host.appendChild(hover);
+        return hover;
+      }
+      function populateHover(hover, text) {
+        var content = hover.querySelector('.monaco-hover-content');
+        var row = document.createElement('div');
+        row.className = 'hover-row';
+        var rowContents = document.createElement('div');
+        rowContents.className = 'hover-row-contents';
+        var md = document.createElement('div');
+        md.className = 'rendered-markdown ir-applied';
+        md.textContent = text;
+        rowContents.appendChild(md);
+        row.appendChild(rowContents);
+        content.appendChild(row);
+        return md;
+      }
+      function activeHover() {
+        return window.__irActiveHoverEl && document.body.contains(window.__irActiveHoverEl)
+          ? window.__irActiveHoverEl
+          : null;
+      }
+      function visibleEditorCount() {
+        var count = 0;
+        var editors = document.querySelectorAll('.monaco-editor');
+        for (var i = 0; i < editors.length; i++) {
+          try {
+            var r = editors[i].getBoundingClientRect();
+            var cs = window.getComputedStyle(editors[i]);
+            if (r.width > 80 && r.height > 80 && cs.display !== 'none' && cs.visibility !== 'hidden') count++;
+          } catch (_) {}
+        }
+        return count;
+      }
+      var eventLog = [];
+      function logSplitEvent(name, data) {
+        var entry = { name: name, time: Date.now(), data: data || {} };
+        eventLog.push(entry);
+        try {
+          if (typeof console !== 'undefined' && console.info) {
+            console.info('[split-column-hover-e2e]', name, data || {});
+          }
+        } catch (_) {}
+        return entry;
+      }
+      function resolvedColor(value) {
+        if (!value) return '';
+        var probe = document.createElement('span');
+        probe.style.cssText = 'position:fixed;left:-9999px;top:-9999px;color:' + value + ';';
+        probe.textContent = 'x';
+        document.body.appendChild(probe);
+        var color = '';
+        try { color = window.getComputedStyle(probe).color || ''; } catch (_) {}
+        try { probe.parentNode && probe.parentNode.removeChild(probe); } catch (_) {}
+        return color;
+      }
+      function inheritedCssVar(el, name) {
+        var cur = el || null;
+        while (cur) {
+          try {
+            var value = window.getComputedStyle(cur).getPropertyValue(name);
+            if (value && String(value).trim()) return String(value).trim();
+          } catch (_) {}
+          cur = cur.parentElement || null;
+        }
+        try {
+          var bodyValue = window.getComputedStyle(document.body).getPropertyValue(name);
+          if (bodyValue && String(bodyValue).trim()) return String(bodyValue).trim();
+        } catch (_) {}
+        try {
+          var rootValue = window.getComputedStyle(document.documentElement).getPropertyValue(name);
+          if (rootValue && String(rootValue).trim()) return String(rootValue).trim();
+        } catch (_) {}
+        return '';
+      }
+      function findTypeLink(root, typeName) {
+        var links = root ? root.querySelectorAll('.ir-type-link') : [];
+        for (var i = 0; i < links.length; i++) {
+          var dataType = links[i].getAttribute('data-type') || '';
+          var text = String(links[i].textContent || '').trim();
+          if (dataType === typeName || text === typeName) return links[i];
+        }
+        return null;
+      }
+      function eventAt(type, Ctor, target, x, y) {
+        if (!target) return false;
+        try {
+          var ev = new (Ctor || window.MouseEvent)(type, {
+            bubbles: true,
+            cancelable: true,
+            view: window,
+            clientX: x,
+            clientY: y,
+            screenX: x,
+            screenY: y,
+            pointerId: 1,
+            pointerType: 'mouse',
+            isPrimary: true
+          });
+          target.dispatchEvent(ev);
+          return true;
+        } catch (_) {}
+        try {
+          var legacy = document.createEvent('MouseEvents');
+          legacy.initMouseEvent(type, true, true, window, 1, x, y, x, y, false, false, false, false, 0, null);
+          target.dispatchEvent(legacy);
+          return true;
+        } catch (_) {}
+        return false;
+      }
+      function linkHoverState(link) {
+        if (!link) return {
+          exists: false,
+          pointActive: false,
+          underline: false,
+          themeApplied: false,
+          color: '',
+          expectedLinkColor: '',
+          textDecorationLine: '',
+          className: ''
+        };
+        var style = null;
+        try { style = window.getComputedStyle(link); } catch (_) {}
+        var expectedRaw = inheritedCssVar(link, '--vscode-textLink-foreground');
+        var expected = resolvedColor(expectedRaw);
+        var color = style ? (style.color || '') : '';
+        var decoration = style ? String(style.textDecorationLine || style.textDecoration || '') : '';
+        return {
+          exists: true,
+          pointActive: !!(link.classList && link.classList.contains('ir-point-active')),
+          underline: /underline/i.test(decoration),
+          themeApplied: expected ? color === expected : false,
+          color: color,
+          expectedLinkColor: expected,
+          expectedLinkColorRaw: expectedRaw,
+          textDecorationLine: decoration,
+          className: String(link.className || '')
+        };
+      }
+      function hoverSnapshot(root, link) {
+        var active = activeHover();
+        var roots = document.querySelectorAll('.monaco-hover,.monaco-editor-hover');
+        var rootText = String(root ? root.textContent || '' : '');
+        var activeText = String(active ? active.textContent || '' : '');
+        return {
+          hoverCount: roots.length,
+          activeIsRoot: active === root,
+          rootConnected: !!(root && document.body.contains(root)),
+          activeConnected: !!(active && document.body.contains(active)),
+          rootRect: rectObj(root),
+          activeRect: rectObj(active),
+          linkRect: rectObj(link),
+          linkText: link ? String(link.textContent || '') : '',
+          linkType: link ? String(link.getAttribute('data-type') || '') : '',
+          linkClassName: link ? String(link.className || '') : '',
+          linkState: linkHoverState(link),
+          rootTextLength: rootText.length,
+          activeTextLength: activeText.length,
+          rootTextSample: rootText.slice(0, 240),
+          activeTextSample: activeText.slice(0, 240),
+          linkTypes: linkTypes(root).slice(0, 20),
+          handleVisibleCount: handleVisibleCount(root)
+        };
+      }
+      async function hoverTypeLink(root, typeName) {
+        var link = findTypeLink(root, typeName);
+        var before = linkHoverState(link);
+        logSplitEvent('symbol-hover-before', { typeName: typeName, state: before, snapshot: hoverSnapshot(root, link) });
+        if (!link) {
+          return {
+            ok: false,
+            reason: 'missing-link',
+            typeName: typeName,
+            eventCount: 0,
+            before: before,
+            after: before
+          };
+        }
+        try { link.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+        await tick();
+        var r = link.getBoundingClientRect();
+        var x = Math.max(r.left + 1, Math.min(r.right - 1, r.left + (r.width / 2)));
+        var y = Math.max(r.top + 1, Math.min(r.bottom - 1, r.top + (r.height / 2)));
+        var emptyOverlay = document.createElement('div');
+        emptyOverlay.className = 'monaco-hover ir-e2e-empty-hover ir-e2e-link-empty-overlay';
+        emptyOverlay.style.cssText = 'position:fixed;left:'+(x-24)+'px;top:'+(y-14)+'px;width:48px;height:28px;z-index:2147483647;background:transparent;';
+        document.body.appendChild(emptyOverlay);
+        try {
+          if (hooks && typeof hooks.activateHoverRoot === 'function') hooks.activateHoverRoot(emptyOverlay, 'e2e-link-empty-overlay');
+          else if (hooks && typeof hooks.refreshEmptyHoverRootState === 'function') hooks.refreshEmptyHoverRootState(emptyOverlay);
+        } catch (_) {}
+        await tick();
+        var hit = null;
+        try { hit = document.elementFromPoint(x, y); } catch (_) {}
+        var hitIsLink = !!(hit && (hit === link || (link.contains && link.contains(hit))));
+        var emptyOverlayPointerEvents = '';
+        try { emptyOverlayPointerEvents = window.getComputedStyle(emptyOverlay).pointerEvents || ''; } catch (_) {}
+        var target = hitIsLink ? hit : link;
+        var events = [
+          ['pointerover', window.PointerEvent || window.MouseEvent],
+          ['mouseover', window.MouseEvent],
+          ['pointerenter', window.PointerEvent || window.MouseEvent],
+          ['mouseenter', window.MouseEvent],
+          ['pointermove', window.PointerEvent || window.MouseEvent],
+          ['mousemove', window.MouseEvent]
+        ];
+        var fired = 0;
+        var eventResults = [];
+        for (var ei = 0; ei < events.length; ei++) {
+          var didFire = eventAt(events[ei][0], events[ei][1], target, x, y);
+          if (didFire) fired++;
+          var eventState = linkHoverState(link);
+          var eventSnapshot = hoverSnapshot(root, link);
+          eventResults.push({
+            event: events[ei][0],
+            fired: didFire,
+            state: eventState,
+            snapshot: eventSnapshot
+          });
+          logSplitEvent('symbol-hover-event', {
+            typeName: typeName,
+            event: events[ei][0],
+            fired: didFire,
+            targetClass: target && target.className ? String(target.className) : '',
+            point: { x: x, y: y },
+            state: eventState,
+            snapshot: eventSnapshot
+          });
+        }
+        await tick();
+        var after = linkHoverState(link);
+        var afterSnapshot = hoverSnapshot(root, link);
+        try { emptyOverlay.parentNode && emptyOverlay.parentNode.removeChild(emptyOverlay); } catch (_) {}
+        logSplitEvent('symbol-hover-after', { typeName: typeName, eventCount: fired, state: after, snapshot: afterSnapshot });
+        var strictEventsOk = eventResults.length === events.length && fired === events.length;
+        for (var eri = 0; eri < eventResults.length; eri++) {
+          var ers = eventResults[eri].state || {};
+          strictEventsOk = strictEventsOk
+            && !!eventResults[eri].fired
+            && !!ers.exists
+            && !!ers.pointActive
+            && !!ers.underline
+            && !!ers.themeApplied
+            && !!ers.color
+            && ers.color === ers.expectedLinkColor;
+        }
+        return {
+          ok: strictEventsOk && hitIsLink && after.exists && after.pointActive && after.underline && after.themeApplied,
+          reason: !hitIsLink ? 'empty-hover-overlay-blocked-link' : (after.exists ? 'ok' : 'missing-link-after-hover'),
+          typeName: typeName,
+          eventCount: fired,
+          rect: rectObj(link),
+          hitClass: hit && hit.className ? String(hit.className) : '',
+          hitIsLink: hitIsLink,
+          emptyOverlayPointerEvents: emptyOverlayPointerEvents,
+          emptyOverlayClassName: String(emptyOverlay.className || ''),
+          before: before,
+          after: after,
+          afterSnapshot: afterSnapshot,
+          eventResults: eventResults
+        };
+      }
+      async function pointerDownFallbackProbe(root,typeName){
+        var link=findTypeLink(root,typeName);
+        if(!link)return {ok:false,reason:'missing-link',payloads:[]};
+        try { link.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+        await tick();
+        var r=link.getBoundingClientRect();
+        var x=Math.max(r.left+1,Math.min(r.right-1,r.left+(r.width/2)));
+        var y=Math.max(r.top+1,Math.min(r.bottom-1,r.top+(r.height/2)));
+        var payloads=[];
+        var original=window.irGoToType;
+        window.irGoToType=function(payload){
+          try{payloads.push(String(payload))}catch(_){}
+          if(String(payload||'').indexOf('LOG:')===0&&typeof original==='function'){
+            try{return original.apply(window,arguments)}catch(_){}
+          }
+          return undefined;
+        };
+        try{
+          eventAt('pointerdown',window.PointerEvent||window.MouseEvent,link,x,y);
+          eventAt('mousedown',window.MouseEvent,link,x,y);
+          await wait(260);
+        }finally{
+          window.irGoToType=original;
+        }
+        return {
+          ok:payloads.indexOf('PREVIEW:'+typeName)>=0,
+          payloads:payloads,
+          rect:rectObj(link),
+          linkState:linkHoverState(link)
+        };
+      }
+      async function nearLinkProbe(root,typeName){
+        var link=findTypeLink(root,typeName);
+        if(!link)return {ok:false,reason:'missing-link'};
+        try { link.scrollIntoView({ block: 'center', inline: 'nearest' }); } catch (_) {}
+        await tick();
+        var r=link.getBoundingClientRect();
+        var x=Math.round((r.left+(r.width/2))*100)/100;
+        var y=Math.max(1,Math.round((r.top-1)*100)/100);
+        var target=null;
+        try{target=document.elementFromPoint(x,y)}catch(_){}
+        if(!target)target=link;
+        eventAt('pointermove',window.PointerEvent||window.MouseEvent,target,x,y);
+        eventAt('mousemove',window.MouseEvent,target,x,y);
+        await tick();
+        var state=linkHoverState(link);
+        var active=window.__irPointActiveLink||null;
+        return {
+          ok:!!(state&&state.pointActive&&state.underline&&state.themeApplied),
+          reason:state&&state.pointActive?'ok':'near-link-not-active',
+          typeName:typeName,
+          point:{x:x,y:y},
+          targetClass:target&&target.className?String(target.className):'',
+          targetText:target?String(target.textContent||'').slice(0,80):'',
+          linkRect:rectObj(link),
+          activeType:active&&active.getAttribute?String(active.getAttribute('data-type')||''):'',
+          activeText:active?String(active.textContent||'').slice(0,80):'',
+          activeRect:rectObj(active),
+          state:state
+        };
+      }
+      if (!hooks || typeof hooks.scanRenderedMarkdown !== 'function' || typeof hooks.makeHoverScrollable !== 'function') {
+        return { ok: false, reason: 'missing-hooks', patchVersion: Number(window.__irPatchVersion) || 0 };
+      }
+      removeAll('.ir-e2e-split-column-hover,.ir-e2e-hover,.ir-e2e-external-artifact,.ir-e2e-body-handle');
+      window.__irActiveHoverEl = null;
+      window.__irOriginalHoverSnapshot = null;
+      window.__irHistoryFor = null;
+      window.__irHistory = [];
+      window.__irHistoryCurrent = null;
+      window.__irLastPreviewTarget = null;
+      var editorGroupCount = document.querySelectorAll('.editor-group-container').length;
+      var renderedEditorCount = visibleEditorCount();
+      logSplitEvent('setup', { editorGroupCount: editorGroupCount, renderedEditorCount: renderedEditorCount });
+
+      var left = makeHover(32, 40);
+      logSplitEvent('left-created', { rect: rectObj(left) });
+      populateHover(left, [
+        'class Company(TimestampedModel):',
+        '    STATUS_ACTIVE = "active"',
+        '    owner: User',
+        '    def get_owner(self) -> User:',
+        '        return self.owner'
+      ].join('\\n'));
+      logSplitEvent('left-populated', { textLength: String(left.textContent || '').length });
+      hooks.makeHoverScrollable(left, true, (left.textContent || '').length);
+      try { hooks.scanRenderedMarkdown(); } catch (_) {}
+      await tick();
+      var leftActiveBeforeRight = activeHover() === left;
+      var leftRect = rectObj(left);
+      logSplitEvent('left-after-scan', {
+        active: leftActiveBeforeRight,
+        connected: document.body.contains(left),
+        rect: leftRect,
+        linkTypes: linkTypes(left)
+      });
+
+      var right = makeHover(Math.max(640, Math.floor((window.innerWidth || 1200) * 0.56)), 40);
+      logSplitEvent('right-empty-created', { rect: rectObj(right) });
+      await tick();
+      try { hooks.scanRenderedMarkdown(); } catch (_) {}
+      await tick();
+      var rightEmptyDidNotClearLeft = activeHover() === left && document.body.contains(left) && document.body.contains(right);
+      logSplitEvent('right-empty-after-scan', {
+        rightEmptyDidNotClearLeft: rightEmptyDidNotClearLeft,
+        leftConnected: document.body.contains(left),
+        rightConnected: document.body.contains(right),
+        activeTextLength: String(activeHover() ? activeHover().textContent || '' : '').length,
+        activeTextSample: String(activeHover() ? activeHover().textContent || '' : '').slice(0, 400),
+        leftTextSample: String(left.textContent || '').slice(0, 400),
+        rightTextSample: String(right.textContent || '').slice(0, 400)
+      });
+
+      populateHover(right, [
+        'class User(TimestampedModel):',
+        '    name: str',
+        '    email: str',
+        '    def get_display_name(self) -> str:',
+        '        return self.name'
+      ].join('\\n'));
+      logSplitEvent('right-populated', { textLength: String(right.textContent || '').length });
+      hooks.makeHoverScrollable(right, true, (right.textContent || '').length);
+      try { hooks.scanRenderedMarkdown(); } catch (_) {}
+      await tick();
+      for (var cleanAttempt = 0; cleanAttempt < 18; cleanAttempt++) {
+        var cleanRoots = document.querySelectorAll('.monaco-hover,.monaco-editor-hover');
+        if (cleanRoots.length <= 1) break;
+        await wait(90);
+        try { hooks.scanRenderedMarkdown(); } catch (_) {}
+      }
+
+      var active = activeHover();
+      var roots = document.querySelectorAll('.monaco-hover,.monaco-editor-hover');
+      var rightTypes = linkTypes(right);
+      var activeText = String(active ? active.textContent || '' : '');
+      var rightExpectedFragments = ['class User', 'def get_display_name', 'return self.name'];
+      var rightStaleLeftFragments = ['class Company', 'STATUS_ACTIVE', 'def get_owner'];
+      var rightMissingExpectedFragments = missingFragments(activeText, rightExpectedFragments);
+      var rightPresentStaleFragments = presentFragments(activeText, rightStaleLeftFragments);
+      var rightRect = rectObj(right);
+      var rightActiveAfterScan = active === right;
+      var leftConnectedAfterScan = document.body.contains(left);
+      var rightConnectedAfterScan = document.body.contains(right);
+      var hoverCountAfterScan = roots.length;
+      var rightHandleVisibleCountAfterScan = handleVisibleCount(right);
+      logSplitEvent('right-after-scan', {
+        active: rightActiveAfterScan,
+        leftConnected: leftConnectedAfterScan,
+        rightConnected: rightConnectedAfterScan,
+        hoverCount: hoverCountAfterScan,
+        rect: rightRect,
+        linkTypes: rightTypes,
+        handleVisibleCount: rightHandleVisibleCountAfterScan,
+        activeTextSample: activeText.slice(0, 400),
+        rightTextSample: String(right.textContent || '').slice(0, 400),
+        leftTextSample: String(left.textContent || '').slice(0, 400),
+        rightMissingExpectedFragments: rightMissingExpectedFragments,
+        rightPresentStaleFragments: rightPresentStaleFragments
+      });
+      var symbolHover = await hoverTypeLink(right, 'TimestampedModel');
+      var nearLinkHover = await nearLinkProbe(right, 'TimestampedModel');
+      var pointerDownFallback = await pointerDownFallbackProbe(right, 'TimestampedModel');
+      var result = {
+        ok: rightActiveAfterScan
+          && !leftConnectedAfterScan
+          && rightConnectedAfterScan
+          && hoverCountAfterScan === 1
+          && (editorGroupCount >= 2 || renderedEditorCount >= 2)
+          && rightTypes.indexOf('TimestampedModel') >= 0
+          && rightMissingExpectedFragments.length === 0
+          && rightPresentStaleFragments.length === 0
+          && rightHandleVisibleCountAfterScan === 0
+          && symbolHover.ok
+          && nearLinkHover.ok
+          && pointerDownFallback.ok,
+        patchVersion: Number(window.__irPatchVersion) || 0,
+        editorGroupCount: editorGroupCount,
+        renderedEditorCount: renderedEditorCount,
+        leftActiveBeforeRight: leftActiveBeforeRight,
+        rightEmptyDidNotClearLeft: rightEmptyDidNotClearLeft,
+        rightActiveAfterPopulate: rightActiveAfterScan,
+        leftConnectedAfterRight: leftConnectedAfterScan,
+        rightConnectedAfterPopulate: rightConnectedAfterScan,
+        hoverCountAfterRight: hoverCountAfterScan,
+        leftRect: leftRect,
+        rightRect: rightRect,
+        rightLinkTypes: rightTypes,
+        rightActiveText: activeText.slice(0, 2000),
+        rightExpectedFragments: rightExpectedFragments,
+        rightStaleLeftFragments: rightStaleLeftFragments,
+        rightMissingExpectedFragments: rightMissingExpectedFragments,
+        rightPresentStaleFragments: rightPresentStaleFragments,
+        rightHandleVisibleCount: rightHandleVisibleCountAfterScan,
+        hoveredSymbol: symbolHover.typeName,
+        symbolHoverEventCount: symbolHover.eventCount,
+        symbolPointActiveAfterHover: !!(symbolHover.after && symbolHover.after.pointActive),
+        symbolUnderlineAfterHover: !!(symbolHover.after && symbolHover.after.underline),
+        symbolThemeAppliedAfterHover: !!(symbolHover.after && symbolHover.after.themeApplied),
+        symbolColorAfterHover: symbolHover.after ? symbolHover.after.color : '',
+        symbolExpectedLinkColor: symbolHover.after ? symbolHover.after.expectedLinkColor : '',
+        symbolTextDecorationLineAfterHover: symbolHover.after ? symbolHover.after.textDecorationLine : '',
+        symbolHitIsLink: !!symbolHover.hitIsLink,
+        symbolEmptyOverlayPointerEvents: symbolHover.emptyOverlayPointerEvents || '',
+        symbolEmptyOverlayClassName: symbolHover.emptyOverlayClassName || '',
+        symbolPointerDownFallbackPreview: !!pointerDownFallback.ok,
+        symbolPointerDownFallback: pointerDownFallback,
+        symbolNearLinkHover: nearLinkHover,
+        symbolHover: symbolHover
+      };
+      logSplitEvent('result', {
+        ok: result.ok,
+        hoveredSymbol: result.hoveredSymbol,
+        symbolHoverEventCount: result.symbolHoverEventCount,
+        symbolUnderlineAfterHover: result.symbolUnderlineAfterHover,
+        symbolThemeAppliedAfterHover: result.symbolThemeAppliedAfterHover,
+        symbolNearLinkHover: !!(result.symbolNearLinkHover&&result.symbolNearLinkHover.ok),
+        symbolPointerDownFallbackPreview: result.symbolPointerDownFallbackPreview
+      });
+      result.eventLog = eventLog.slice();
+      try { right.parentNode && right.parentNode.removeChild(right); } catch (_) {}
+      try { left.parentNode && left.parentNode.removeChild(left); } catch (_) {}
+      try {
+        if (window.__irActiveHoverEl === right || window.__irActiveHoverEl === left) window.__irActiveHoverEl = null;
+        if (window.__irPointActiveLink && !document.body.contains(window.__irPointActiveLink)) window.__irPointActiveLink = null;
+        window.__irOriginalHoverSnapshot = null;
+        window.__irHistoryFor = null;
+        window.__irHistory = [];
+        window.__irHistoryCurrent = null;
+        window.__irLastPreviewTarget = null;
+      } catch (_) {}
+      return result;
+    })()
+  `.trim();
+  const mainExpr = rendererTestWindowEvalExpression(rendererExpr, true);
+  return evaluateInMainProcessForTests(mainExpr, 12000);
+}
+
+async function runNativeHoverGeometryHarnessForTests(input?: {
+  symbol?: string;
+  lineFragment?: string;
+  expectedColumn?: 'left' | 'right' | 'any';
+  expectedTextFragments?: string[];
+  absentTextFragments?: string[];
+}): Promise<any[]> {
+  await ensureRendererPatchForHarness();
+  const symbol = String(input?.symbol || '');
+  const lineFragment = String(input?.lineFragment || '');
+  const expectedColumn = input?.expectedColumn === 'left' || input?.expectedColumn === 'right'
+    ? input.expectedColumn
+    : 'any';
+  const expectedTextFragments = Array.isArray(input?.expectedTextFragments)
+    ? input!.expectedTextFragments!.map(fragment => String(fragment)).filter(Boolean)
+    : [];
+  const absentTextFragments = Array.isArray(input?.absentTextFragments)
+    ? input!.absentTextFragments!.map(fragment => String(fragment)).filter(Boolean)
+    : [];
+  const rendererExpr = `
+    (function() {
+      var expected = {
+        symbol: ${JSON.stringify(symbol)},
+        lineFragment: ${JSON.stringify(lineFragment)},
+        expectedColumn: ${JSON.stringify(expectedColumn)},
+        expectedTextFragments: ${JSON.stringify(expectedTextFragments)},
+        absentTextFragments: ${JSON.stringify(absentTextFragments)}
+      };
+      function rectObjFromRect(r) {
+        return r ? { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height } : null;
+      }
+      function rectObj(el) {
+        if (!el || !el.getBoundingClientRect) return null;
+        return rectObjFromRect(el.getBoundingClientRect());
+      }
+      function visible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        try {
+          var cs = window.getComputedStyle(el);
+          var r = el.getBoundingClientRect();
+          return cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity) !== 0 && r.width > 0 && r.height > 0;
+        } catch (_) { return false; }
+      }
+      function visibleHover(root) {
+        if (visible(root)) return true;
+        if (!root || String(root.textContent || '').trim().length === 0) return false;
+        var nodes = root.querySelectorAll ? root.querySelectorAll('.monaco-hover-content,.hover-row,.hover-row-contents,.hover-contents,.markdown-hover,.rendered-markdown') : [];
+        for (var ni = 0; ni < nodes.length; ni++) {
+          if (visible(nodes[ni])) return true;
+        }
+        return false;
+      }
+      function hoverRectObj(root) {
+        var rr = rectObj(root);
+        if (rr && rr.width > 0 && rr.height > 0) return rr;
+        var nodes = root && root.querySelectorAll ? root.querySelectorAll('.monaco-hover-content,.hover-row,.hover-row-contents,.hover-contents,.markdown-hover,.rendered-markdown') : [];
+        for (var ni = 0; ni < nodes.length; ni++) {
+          if (visible(nodes[ni])) return rectObj(nodes[ni]);
+        }
+        return rr;
+      }
+      function visibleEditors() {
+        var out = [];
+        var nodes = document.querySelectorAll('.monaco-editor');
+        for (var i = 0; i < nodes.length; i++) {
+          if (!visible(nodes[i])) continue;
+          if (nodes[i].closest('.monaco-hover,.monaco-editor-hover,.suggest-widget,.quick-input-widget')) continue;
+          var r = nodes[i].getBoundingClientRect();
+          if (r.width > 120 && r.height > 120) out.push(nodes[i]);
+        }
+        out.sort(function(a, b) { return a.getBoundingClientRect().left - b.getBoundingClientRect().left; });
+        return out;
+      }
+      function normalizeText(text) {
+        return String(text || '').replace(/\\u00a0/g, ' ');
+      }
+      function rangeForOffsets(textNodes, start, end) {
+        var startNode = null, startOffset = 0, endNode = null, endOffset = 0;
+        for (var i = 0; i < textNodes.length; i++) {
+          var item = textNodes[i];
+          var nodeStart = item.start;
+          var nodeEnd = item.start + item.text.length;
+          if (!startNode && start >= nodeStart && start <= nodeEnd) {
+            startNode = item.node;
+            startOffset = Math.max(0, Math.min(item.text.length, start - nodeStart));
+          }
+          if (!endNode && end >= nodeStart && end <= nodeEnd) {
+            endNode = item.node;
+            endOffset = Math.max(0, Math.min(item.text.length, end - nodeStart));
+            break;
+          }
+        }
+        if (!startNode || !endNode) return null;
+        try {
+          var range = document.createRange();
+          range.setStart(startNode, startOffset);
+          range.setEnd(endNode, endOffset);
+          var rect = range.getBoundingClientRect();
+          range.detach && range.detach();
+          return rect && rect.width > 0 && rect.height > 0 ? rect : null;
+        } catch (_) {
+          return null;
+        }
+      }
+      function findTextRectInLine(lineEl, symbol, fragment) {
+        var textNodes = [];
+        var full = '';
+        try {
+          var walker = document.createTreeWalker(lineEl, NodeFilter.SHOW_TEXT);
+          var node;
+          while ((node = walker.nextNode())) {
+            var text = normalizeText(node.nodeValue || '');
+            textNodes.push({ node: node, text: text, start: full.length });
+            full += text;
+          }
+        } catch (_) {}
+        if (!full || full.indexOf(symbol) < 0) return null;
+        if (fragment && full.indexOf(fragment) < 0) return null;
+        var searchStart = 0;
+        if (fragment) {
+          var fragmentStart = full.indexOf(fragment);
+          var inside = full.indexOf(symbol, fragmentStart);
+          if (inside >= 0 && inside <= fragmentStart + fragment.length) searchStart = inside;
+        }
+        var idx = searchStart || full.indexOf(symbol);
+        if (idx < 0) idx = full.indexOf(symbol);
+        var rect = rangeForOffsets(textNodes, idx, idx + symbol.length);
+        return rect ? { rect: rectObjFromRect(rect), lineText: full } : null;
+      }
+      function findSymbolGeometry() {
+        var editors = visibleEditors();
+        var expectedIndex = expected.expectedColumn === 'left'
+          ? 0
+          : (expected.expectedColumn === 'right' ? editors.length - 1 : -1);
+        var candidates = [];
+        for (var ei = 0; ei < editors.length; ei++) {
+          var editor = editors[ei];
+          var lines = editor.querySelectorAll('.view-line');
+          for (var li = 0; li < lines.length; li++) {
+            var lineText = normalizeText(lines[li].textContent || '');
+            if (expected.lineFragment && lineText.indexOf(expected.lineFragment) < 0) continue;
+            if (lineText.indexOf(expected.symbol) < 0) continue;
+            var hit = findTextRectInLine(lines[li], expected.symbol, expected.lineFragment);
+            if (!hit) continue;
+            candidates.push({
+              editor: editor,
+              editorIndex: ei,
+              editorRect: rectObj(editor),
+              lineRect: rectObj(lines[li]),
+              symbolRect: hit.rect,
+              lineText: hit.lineText
+            });
+          }
+        }
+        if (expected.expectedColumn === 'left' || expected.expectedColumn === 'right') {
+          candidates.sort(function(a, b) {
+            var ar = a.editorRect || { left: 0 };
+            var br = b.editorRect || { left: 0 };
+            return ar.left - br.left;
+          });
+          var columnCandidate = expected.expectedColumn === 'left'
+            ? candidates[0] || null
+            : candidates[candidates.length - 1] || null;
+          return columnCandidate || findSymbolGeometryFromMonacoApi(editors, expectedIndex);
+        }
+        if (expectedIndex >= 0) {
+          for (var ci = 0; ci < candidates.length; ci++) {
+            if (candidates[ci].editorIndex === expectedIndex) return candidates[ci];
+          }
+        }
+        return candidates[0] || findSymbolGeometryFromMonacoApi(editors, expectedIndex);
+      }
+      function findSymbolGeometryFromMonacoApi(editors, expectedIndex) {
+        try {
+          var api = window.monaco && window.monaco.editor;
+          if (!api && typeof require === 'function') {
+            try {
+              var editorMain = require('vs/editor/editor.main');
+              api = editorMain && editorMain.editor;
+            } catch (_) {}
+          }
+          var apiEditors = api && typeof api.getEditors === 'function' ? api.getEditors() : [];
+          var candidates = [];
+          for (var ai = 0; ai < apiEditors.length; ai++) {
+            var editor = apiEditors[ai];
+            if (!editor || typeof editor.getModel !== 'function' || typeof editor.getDomNode !== 'function') continue;
+            var model = editor.getModel && editor.getModel();
+            var dom = editor.getDomNode && editor.getDomNode();
+            if (!model || !dom || !visible(dom)) continue;
+            var editorIndex = editors.indexOf(dom);
+            if (editorIndex < 0) continue;
+            var lineCount = typeof model.getLineCount === 'function' ? model.getLineCount() : 0;
+            for (var lineNumber = 1; lineNumber <= lineCount; lineNumber++) {
+              var lineText = normalizeText(model.getLineContent(lineNumber) || '');
+              if (expected.lineFragment && lineText.indexOf(expected.lineFragment) < 0) continue;
+              if (lineText.indexOf(expected.symbol) < 0) continue;
+              var fragmentStart = expected.lineFragment ? lineText.indexOf(expected.lineFragment) : 0;
+              var idx = fragmentStart >= 0 ? lineText.indexOf(expected.symbol, fragmentStart) : lineText.indexOf(expected.symbol);
+              if (idx < 0) idx = lineText.indexOf(expected.symbol);
+              if (idx < 0) continue;
+              if (typeof editor.revealPositionInCenterIfOutsideViewport === 'function') {
+                try { editor.revealPositionInCenterIfOutsideViewport({ lineNumber: lineNumber, column: idx + 1 }); } catch (_) {}
+              }
+              var start = typeof editor.getScrolledVisiblePosition === 'function'
+                ? editor.getScrolledVisiblePosition({ lineNumber: lineNumber, column: idx + 1 })
+                : null;
+              var end = typeof editor.getScrolledVisiblePosition === 'function'
+                ? editor.getScrolledVisiblePosition({ lineNumber: lineNumber, column: idx + expected.symbol.length + 1 })
+                : null;
+              if (!start) continue;
+              var er = rectObj(dom);
+              if (!er) continue;
+              var height = Math.max(8, Number(start.height) || 18);
+              var width = Math.max(4, end && Number.isFinite(Number(end.left))
+                ? Math.abs(Number(end.left) - Number(start.left))
+                : expected.symbol.length * 8);
+              var left = er.left + Number(start.left);
+              var top = er.top + Number(start.top);
+              var symbolRect = {
+                left: left,
+                top: top,
+                right: left + width,
+                bottom: top + height,
+                width: width,
+                height: height
+              };
+              candidates.push({
+                editor: dom,
+                editorIndex: editorIndex,
+                editorRect: er,
+                lineRect: {
+                  left: er.left,
+                  top: top,
+                  right: er.right,
+                  bottom: top + height,
+                  width: er.width,
+                  height: height
+                },
+                symbolRect: symbolRect,
+                lineText: lineText,
+                source: 'monaco-api'
+              });
+            }
+          }
+          if (expected.expectedColumn === 'left' || expected.expectedColumn === 'right') {
+            candidates.sort(function(a, b) {
+              var ar = a.editorRect || { left: 0 };
+              var br = b.editorRect || { left: 0 };
+              return ar.left - br.left;
+            });
+            return expected.expectedColumn === 'left'
+              ? candidates[0] || null
+              : candidates[candidates.length - 1] || null;
+          }
+          if (expectedIndex >= 0) {
+            for (var ci = 0; ci < candidates.length; ci++) {
+              if (candidates[ci].editorIndex === expectedIndex) return candidates[ci];
+            }
+          }
+          return candidates[0] || null;
+        } catch (_) {
+          return null;
+        }
+      }
+      function monacoApiEditorSummaries() {
+        try {
+          var api = window.monaco && window.monaco.editor;
+          if (!api && typeof require === 'function') {
+            try {
+              var editorMain = require('vs/editor/editor.main');
+              api = editorMain && editorMain.editor;
+            } catch (_) {}
+          }
+          var apiEditors = api && typeof api.getEditors === 'function' ? api.getEditors() : [];
+          var out = [];
+          for (var ai = 0; ai < apiEditors.length && out.length < 12; ai++) {
+            var editor = apiEditors[ai];
+            var model = editor && typeof editor.getModel === 'function' ? editor.getModel() : null;
+            var dom = editor && typeof editor.getDomNode === 'function' ? editor.getDomNode() : null;
+            var lineCount = model && typeof model.getLineCount === 'function' ? model.getLineCount() : 0;
+            var samples = [];
+            for (var lineNumber = 1; model && lineNumber <= lineCount && samples.length < 6; lineNumber++) {
+              var line = normalizeText(model.getLineContent(lineNumber) || '').trim();
+              if (line) samples.push(line.slice(0, 180));
+            }
+            out.push({
+              index: ai,
+              domVisible: !!(dom && visible(dom)),
+              domEditorIndex: dom ? visibleEditors().indexOf(dom) : -1,
+              uri: model && model.uri ? String(model.uri) : '',
+              lineCount: lineCount,
+              samples: samples,
+              domClassName: dom ? String(dom.className || '') : '',
+              domRect: rectObj(dom)
+            });
+          }
+          return out;
+        } catch (err) {
+          return [{ error: String(err && err.message || err) }];
+        }
+      }
+      function isActualHover(el) {
+        return !!el
+          && !el.classList.contains('ir-e2e-hover')
+          && !el.classList.contains('ir-e2e-hover-link')
+          && !el.classList.contains('ir-e2e-empty-hover')
+          && !el.classList.contains('ir-test-seeded-hover');
+      }
+      function hoverRoots() {
+        var out = [];
+        var roots = document.querySelectorAll('.monaco-hover,.monaco-editor-hover');
+        for (var i = 0; i < roots.length; i++) {
+          if (document.body.contains(roots[i]) && isActualHover(roots[i]) && visibleHover(roots[i])) out.push(roots[i]);
+        }
+        return out;
+      }
+      function rawHoverRoots() {
+        var out = [];
+        var roots = document.querySelectorAll('.monaco-hover,.monaco-editor-hover');
+        for (var i = 0; i < roots.length && out.length < 12; i++) {
+          var root = roots[i];
+          if (!document.body.contains(root) || !isActualHover(root)) continue;
+          var cs = null;
+          try { cs = window.getComputedStyle(root); } catch (_) {}
+          out.push({
+            index: i,
+            className: String(root.className || ''),
+            textLength: String(root.textContent || '').trim().length,
+            textSample: normalizeText(root.textContent || '').trim().slice(0, 220),
+            rect: rectObj(root),
+            visible: visible(root),
+            visibleHover: visibleHover(root),
+            active: root === window.__irActiveHoverEl,
+            released: !!(root.getAttribute && root.getAttribute('data-ir-native-released-hover') === '1'),
+            ariaHidden: root.getAttribute ? root.getAttribute('aria-hidden') : null,
+            style: {
+              display: cs ? String(cs.display || '') : '',
+              visibility: cs ? String(cs.visibility || '') : '',
+              opacity: cs ? String(cs.opacity || '') : '',
+              pointerEvents: cs ? String(cs.pointerEvents || '') : ''
+            }
+          });
+        }
+        return out;
+      }
+      function rectsIntersect(a, b, pad) {
+        if (!a || !b) return false;
+        pad = pad || 0;
+        return a.right >= b.left - pad
+          && a.left <= b.right + pad
+          && a.bottom >= b.top - pad
+          && a.top <= b.bottom + pad;
+      }
+      function unionRect(a, b) {
+        if (!a) return b || null;
+        if (!b) return a || null;
+        return {
+          left: Math.min(a.left, b.left),
+          top: Math.min(a.top, b.top),
+          right: Math.max(a.right, b.right),
+          bottom: Math.max(a.bottom, b.bottom),
+          width: Math.max(a.right, b.right) - Math.min(a.left, b.left),
+          height: Math.max(a.bottom, b.bottom) - Math.min(a.top, b.top)
+        };
+      }
+      function handleKindAndAlignment(handleRect, hoverRect) {
+        if (!handleRect || !hoverRect) return { kind: 'unknown', aligned: false };
+        var centerX = (handleRect.left + handleRect.right) / 2;
+        var centerY = (handleRect.top + handleRect.bottom) / 2;
+        var nearRight = Math.abs(centerX - hoverRect.right) <= 18 || Math.abs(handleRect.right - hoverRect.right) <= 18;
+        var nearBottom = Math.abs(centerY - hoverRect.bottom) <= 18 || Math.abs(handleRect.bottom - hoverRect.bottom) <= 18;
+        var nearTop = Math.abs(centerY - hoverRect.top) <= 18 || Math.abs(handleRect.top - hoverRect.top) <= 18;
+        var vertical = handleRect.height >= 18 && handleRect.width <= 32 && nearRight;
+        var horizontal = handleRect.width >= 18 && handleRect.height <= 32 && nearBottom;
+        var corner = handleRect.width <= 32 && handleRect.height <= 32 && nearRight && nearBottom;
+        var topRight = handleRect.width <= 32 && handleRect.height <= 32 && nearRight && nearTop && !nearBottom;
+        if (vertical) {
+          return {
+            kind: 'vertical',
+            aligned: Math.abs(handleRect.top - hoverRect.top) <= 4
+              && Math.abs(handleRect.bottom - hoverRect.bottom) <= 4
+              && handleRect.height <= hoverRect.height + 8
+          };
+        }
+        if (horizontal) {
+          return {
+            kind: 'horizontal',
+            aligned: Math.abs(handleRect.left - hoverRect.left) <= 4
+              && Math.abs(handleRect.right - hoverRect.right) <= 4
+              && handleRect.width <= hoverRect.width + 8
+          };
+        }
+        if (corner) return { kind: 'bottom-right-corner', aligned: true };
+        if (topRight) return { kind: 'top-right-corner', aligned: false };
+        return { kind: 'near-hover', aligned: false };
+      }
+      function hoverSashMetrics(root, hoverRect) {
+        var selector = '.scrollbar,.slider,.shadow,.sash,.monaco-sash,.scroll-decoration,.decorationsOverviewRuler,[class*="scrollbar"],[class*="sash"]';
+        var visibleHandles = [];
+        var hiddenHandles = 0;
+        var misaligned = [];
+        var focusRect = hoverRect || null;
+        var nodes = [];
+        try {
+          var inside = root && root.querySelectorAll ? root.querySelectorAll(selector) : [];
+          for (var ii = 0; ii < inside.length; ii++) nodes.push({ el: inside[ii], ownedByHover: true });
+        } catch (_) {}
+        try {
+          var all = document.querySelectorAll(selector);
+          for (var ai = 0; ai < all.length; ai++) {
+            if (root && root.contains && root.contains(all[ai])) continue;
+            nodes.push({ el: all[ai], ownedByHover: false });
+          }
+        } catch (_) {}
+        function externalHandleAssociated(r) {
+          if (!r || !hoverRect) return false;
+          if (!rectsIntersect(r, hoverRect, 16)) return false;
+          if (r.width > 48 && r.height > 48) return false;
+          var centerX = (r.left + r.right) / 2;
+          var centerY = (r.top + r.bottom) / 2;
+          var verticalEdge = r.height >= 18
+            && r.width <= 32
+            && centerX >= hoverRect.right - 10
+            && centerX <= hoverRect.right + 10
+            && r.bottom >= hoverRect.top - 12
+            && r.top <= hoverRect.bottom + 12;
+          var horizontalEdge = r.width >= 18
+            && r.height <= 32
+            && centerY >= hoverRect.bottom - 10
+            && centerY <= hoverRect.bottom + 10
+            && r.right >= hoverRect.left - 12
+            && r.left <= hoverRect.right + 12;
+          var bottomRightCorner = r.width <= 32
+            && r.height <= 32
+            && centerX >= hoverRect.right - 14
+            && centerX <= hoverRect.right + 14
+            && centerY >= hoverRect.bottom - 14
+            && centerY <= hoverRect.bottom + 14;
+          var topRightCorner = r.width <= 32
+            && r.height <= 32
+            && centerX >= hoverRect.right - 14
+            && centerX <= hoverRect.right + 14
+            && centerY >= hoverRect.top - 14
+            && centerY <= hoverRect.top + 14;
+          return !!(verticalEdge || horizontalEdge || bottomRightCorner || topRightCorner);
+        }
+        for (var ni = 0; ni < nodes.length && visibleHandles.length + hiddenHandles < 80; ni++) {
+          var item = nodes[ni];
+          var el = item.el;
+          if (!el || !document.body.contains(el)) continue;
+          var r = rectObj(el);
+          var associated = !!item.ownedByHover || externalHandleAssociated(r);
+          if (!associated) continue;
+          var isVisible = visible(el) && r && r.width > 0 && r.height > 0;
+          if (!isVisible) {
+            hiddenHandles++;
+            continue;
+          }
+          var alignment = handleKindAndAlignment(r, hoverRect);
+          var summary = {
+            className: String(el.className || ''),
+            rect: r,
+            ownedByHover: !!item.ownedByHover,
+            kind: alignment.kind,
+            aligned: !!alignment.aligned
+          };
+          visibleHandles.push(summary);
+          focusRect = unionRect(focusRect, r);
+          if (!alignment.aligned) misaligned.push(summary);
+        }
+        var points = [];
+        function addPoint(name, x, y) {
+          if (!Number.isFinite(x) || !Number.isFinite(y)) return;
+          var clampedX = Math.max(1, Math.min(window.innerWidth - 2, x));
+          var clampedY = Math.max(1, Math.min(window.innerHeight - 2, y));
+          points.push({
+            name: name,
+            x: Math.round(clampedX * 100) / 100,
+            y: Math.round(clampedY * 100) / 100
+          });
+        }
+        if (focusRect) {
+          addPoint('hover-center', (focusRect.left + focusRect.right) / 2, (focusRect.top + focusRect.bottom) / 2);
+          addPoint('hover-right-edge', focusRect.right - 2, (focusRect.top + focusRect.bottom) / 2);
+          addPoint('hover-bottom-edge', (focusRect.left + focusRect.right) / 2, focusRect.bottom - 2);
+          addPoint('hover-bottom-right', focusRect.right - 2, focusRect.bottom - 2);
+        }
+        for (var vi = 0; vi < visibleHandles.length && vi < 4; vi++) {
+          var hr = visibleHandles[vi].rect;
+          addPoint('handle-' + vi + '-' + visibleHandles[vi].kind, (hr.left + hr.right) / 2, (hr.top + hr.bottom) / 2);
+        }
+        return {
+          visibleHandleCount: visibleHandles.length,
+          hiddenHandleCount: hiddenHandles,
+          misalignedVisibleHandleCount: misaligned.length,
+          misalignedVisibleHandles: misaligned.slice(0, 12),
+          visibleHandles: visibleHandles.slice(0, 12),
+          focusRect: focusRect,
+          focusProbePoints: points
+        };
+      }
+      function linkTypes(root) {
+        var out = [];
+        var links = root ? root.querySelectorAll('.ir-type-link') : [];
+        for (var i = 0; i < links.length && out.length < 80; i++) {
+          out.push(links[i].getAttribute('data-type') || '');
+        }
+        return out;
+      }
+      function overlapX(a, b) {
+        if (!a || !b) return 0;
+        return Math.max(0, Math.min(a.right, b.right) - Math.max(a.left, b.left));
+      }
+      function distancePointToRectX(x, r) {
+        if (!r) return Infinity;
+        if (x >= r.left && x <= r.right) return 0;
+        return Math.min(Math.abs(x - r.left), Math.abs(x - r.right));
+      }
+      function distanceRangeY(a, b) {
+        if (!a || !b) return Infinity;
+        if (a.bottom < b.top) return b.top - a.bottom;
+        if (b.bottom < a.top) return a.top - b.bottom;
+        return 0;
+      }
+      var symbolGeometry = findSymbolGeometry();
+      var editors = visibleEditors();
+      var expectedEditor = symbolGeometry ? editors[symbolGeometry.editorIndex] : null;
+      var expectedEditorRect = symbolGeometry ? symbolGeometry.editorRect : null;
+      function hoverSummary(root, index) {
+        var rect = hoverRectObj(root);
+        var text = normalizeText(root ? root.textContent || '' : '');
+        var trimmed = text.trim();
+        var missingExpected = [];
+        for (var mi = 0; mi < expected.expectedTextFragments.length; mi++) {
+          var fragment = expected.expectedTextFragments[mi];
+          if (trimmed.indexOf(fragment) < 0) missingExpected.push(fragment);
+        }
+        var presentAbsent = [];
+        for (var ai = 0; ai < expected.absentTextFragments.length; ai++) {
+          var absent = expected.absentTextFragments[ai];
+          if (trimmed.indexOf(absent) >= 0) presentAbsent.push(absent);
+        }
+        var hoverCenter = rect ? rect.left + rect.width / 2 : 0;
+        var symbolCenter = symbolGeometry ? symbolGeometry.symbolRect.left + symbolGeometry.symbolRect.width / 2 : 0;
+        var xDist = rect ? distancePointToRectX(symbolCenter, rect) : Infinity;
+        var yDist = rect && symbolGeometry ? distanceRangeY(rect, symbolGeometry.symbolRect) : Infinity;
+        var expectedOv = rect && expectedEditorRect ? overlapX(rect, expectedEditorRect) : 0;
+        var otherOv = 0;
+        for (var oi = 0; oi < editors.length; oi++) {
+          if (symbolGeometry && oi === symbolGeometry.editorIndex) continue;
+          otherOv = Math.max(otherOv, overlapX(rect, rectObj(editors[oi])));
+        }
+        var anchored = !!(rect && expectedEditorRect
+          && expectedOv > 24
+          && (
+            xDist <= 80
+            || (expectedOv >= otherOv
+              && hoverCenter >= expectedEditorRect.left - 24
+              && hoverCenter <= expectedEditorRect.right + 24)
+          ));
+        var near = !!(rect && symbolGeometry && xDist <= 80 && yDist <= 220);
+        var contentMatches = missingExpected.length === 0 && presentAbsent.length === 0;
+        var score = 0;
+        if (contentMatches) score += 1000000;
+        if (anchored) score += 100000;
+        if (near) score += 10000;
+        score += Math.min(5000, trimmed.length);
+        if (root === window.__irActiveHoverEl) score += 250;
+        return {
+          index: index,
+          rect: rect,
+          textLength: trimmed.length,
+          textSample: trimmed.slice(0, 1400),
+          className: root ? String(root.className || '') : '',
+          linkTypes: linkTypes(root),
+          missingExpectedTextFragments: missingExpected,
+          presentAbsentTextFragments: presentAbsent,
+          contentMatches: contentMatches,
+          hoverCenterX: hoverCenter,
+          hoverDistanceToSymbolX: Number.isFinite(xDist) ? xDist : null,
+          hoverDistanceToSymbolY: Number.isFinite(yDist) ? yDist : null,
+          expectedColumnOverlap: expectedOv,
+          maxOtherColumnOverlap: otherOv,
+          hoverAnchoredToExpectedColumn: anchored,
+          hoverNearSymbol: near,
+          active: root === window.__irActiveHoverEl,
+          score: score
+        };
+      }
+      var roots = hoverRoots();
+      var hoverCandidates = [];
+      for (var hi = 0; hi < roots.length; hi++) hoverCandidates.push(hoverSummary(roots[hi], hi));
+      hoverCandidates.sort(function(a, b) { return b.score - a.score; });
+      var selected = hoverCandidates[0] || null;
+      var hover = selected ? roots[selected.index] : null;
+      var hoverRect = selected ? selected.rect : null;
+      var sashMetrics = hoverSashMetrics(hover, hoverRect);
+      var hoverText = selected ? selected.textSample : '';
+      var hoverCenterX = hoverRect ? hoverRect.left + hoverRect.width / 2 : 0;
+      var symbolCenterX = symbolGeometry ? symbolGeometry.symbolRect.left + symbolGeometry.symbolRect.width / 2 : 0;
+      var symbolCenterY = symbolGeometry ? symbolGeometry.symbolRect.top + symbolGeometry.symbolRect.height / 2 : 0;
+      var xDistance = selected && selected.hoverDistanceToSymbolX !== null ? selected.hoverDistanceToSymbolX : Infinity;
+      var yDistance = selected && selected.hoverDistanceToSymbolY !== null ? selected.hoverDistanceToSymbolY : Infinity;
+      var expectedOverlap = selected ? selected.expectedColumnOverlap : 0;
+      var maxOtherOverlap = selected ? selected.maxOtherColumnOverlap : 0;
+      var symbolInsideExpectedEditor = !!(symbolGeometry && expectedEditorRect
+        && symbolGeometry.symbolRect.left >= expectedEditorRect.left - 1
+        && symbolGeometry.symbolRect.right <= expectedEditorRect.right + 1
+        && symbolGeometry.symbolRect.top >= expectedEditorRect.top - 1
+        && symbolGeometry.symbolRect.bottom <= expectedEditorRect.bottom + 1);
+      var hoverAnchoredToExpectedColumn = !!(selected && selected.hoverAnchoredToExpectedColumn);
+      var hoverNearSymbol = !!(selected && selected.hoverNearSymbol);
+      var contentMatches = !!(selected && selected.contentMatches);
+      var contentMatchedHoverCount = 0;
+      for (var cm = 0; cm < hoverCandidates.length; cm++) {
+        if (hoverCandidates[cm].contentMatches) contentMatchedHoverCount++;
+      }
+      var ok = !!(symbolGeometry && hover && hoverRect)
+        && roots.length === 1
+        && selected.textLength > 40
+        && contentMatches
+        && symbolInsideExpectedEditor
+        && hoverAnchoredToExpectedColumn
+        && hoverNearSymbol;
+      return {
+        ok: ok,
+        reason: ok ? 'ok'
+          : (!symbolGeometry ? 'missing-symbol-geometry'
+            : (!hover ? 'missing-hover'
+              : (selected.textLength <= 40 ? 'empty-or-white-hover'
+                : (!contentMatches ? 'hover-content-mismatch'
+                  : (!hoverNearSymbol ? 'hover-not-near-symbol'
+                    : (!hoverAnchoredToExpectedColumn ? 'hover-not-in-expected-column' : 'unknown')))))),
+        patchVersion: Number(window.__irPatchVersion) || 0,
+        windowTitle: String(document.title || ''),
+        locationHref: String(location && location.href || ''),
+        marker: ${JSON.stringify(process.env.IR_TEST_WINDOW_MARKER || '')},
+        bodyHasMarker: !!(${JSON.stringify(process.env.IR_TEST_WINDOW_MARKER || '')} && String(document.body && document.body.textContent || '').indexOf(${JSON.stringify(process.env.IR_TEST_WINDOW_MARKER || '')}) >= 0),
+        activeElement: (function(){
+          var el = document.activeElement;
+          return el ? {
+            tagName: String(el.tagName || ''),
+            className: String(el.className || ''),
+            textSample: String(el.textContent || '').replace(/\\s+/g, ' ').slice(0, 220)
+          } : null;
+        })(),
+        expected: expected,
+        editorCount: editors.length,
+        monacoApiEditors: monacoApiEditorSummaries(),
+        editorRects: editors.map(function(editor, index) {
+          var r = rectObj(editor);
+          var lines = editor.querySelectorAll('.view-line');
+          var lineSamples = [];
+          for (var li = 0; li < lines.length && lineSamples.length < 12; li++) {
+            var sample = normalizeText(lines[li].textContent || '').trim();
+            if (sample) lineSamples.push(sample.slice(0, 180));
+          }
+          return {
+            index: index,
+            rect: r,
+            className: String(editor.className || ''),
+            textSample: String(editor.textContent || '').slice(0, 180),
+            lineCount: lines.length,
+            lineSamples: lineSamples
+          };
+        }),
+        expectedColumnIndex: symbolGeometry ? symbolGeometry.editorIndex : null,
+        symbolGeometry: symbolGeometry ? {
+          editorIndex: symbolGeometry.editorIndex,
+          editorRect: symbolGeometry.editorRect,
+          lineRect: symbolGeometry.lineRect,
+          symbolRect: symbolGeometry.symbolRect,
+          lineText: symbolGeometry.lineText,
+          source: symbolGeometry.source || 'dom-range'
+        } : null,
+        hoverCount: roots.length,
+        rawHoverRoots: rawHoverRoots(),
+        hoverSashMetrics: sashMetrics,
+        contentMatchedHoverCount: contentMatchedHoverCount,
+        hoverCandidates: hoverCandidates,
+        hoverRect: hoverRect,
+        hoverTextLength: selected ? selected.textLength : 0,
+        hoverTextSample: selected ? selected.textSample : '',
+        hoverClassName: hover ? String(hover.className || '') : '',
+        linkTypes: selected ? selected.linkTypes : [],
+        missingExpectedTextFragments: selected ? selected.missingExpectedTextFragments : expected.expectedTextFragments,
+        presentAbsentTextFragments: selected ? selected.presentAbsentTextFragments : [],
+        contentMatches: contentMatches,
+        symbolInsideExpectedEditor: symbolInsideExpectedEditor,
+        hoverAnchoredToExpectedColumn: hoverAnchoredToExpectedColumn,
+        hoverNearSymbol: hoverNearSymbol,
+        symbolCenter: { x: symbolCenterX, y: symbolCenterY },
+        hoverCenterX: hoverCenterX,
+        hoverDistanceToSymbolX: Number.isFinite(xDistance) ? xDistance : null,
+        hoverDistanceToSymbolY: Number.isFinite(yDistance) ? yDistance : null,
+        expectedColumnOverlap: expectedOverlap,
+        maxOtherColumnOverlap: maxOtherOverlap
+      };
+    })()
+  `.trim();
+  const mainExpr = rendererTestWindowEvalExpression(rendererExpr, true);
+  return evaluateInMainProcessForTests(mainExpr, 10000);
+}
+
+async function runNativePopupStateHarnessForTests(): Promise<any[]> {
+  await ensureRendererPatchForHarness();
+  const rendererExpr = `
+    (function() {
+      function rectObj(el) {
+        if (!el || !el.getBoundingClientRect) return null;
+        var r = el.getBoundingClientRect();
+        return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+      }
+      function visible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        try {
+          var cs = window.getComputedStyle(el);
+          var r = el.getBoundingClientRect();
+          return cs.display !== 'none'
+            && cs.visibility !== 'hidden'
+            && Number(cs.opacity) !== 0
+            && r.width > 0
+            && r.height > 0;
+        } catch (_) {
+          return false;
+        }
+      }
+      function describe(el, selector) {
+        return {
+          selector: selector,
+          className: String(el && el.className || ''),
+          text: String(el && el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 1000),
+          rect: rectObj(el)
+        };
+      }
+      var selectors = [
+        '.action-widget',
+        '.context-view',
+        '.monaco-menu',
+        '.quick-input-widget',
+        '.suggest-widget',
+        '.parameter-hints-widget',
+        '.peekview-widget',
+        '.rename-box',
+        '.zone-widget',
+        '.find-widget'
+      ];
+      var popups = [];
+      for (var si = 0; si < selectors.length; si++) {
+        var selector = selectors[si];
+        var nodes = document.querySelectorAll(selector);
+        for (var ni = 0; ni < nodes.length; ni++) {
+          if (!document.body.contains(nodes[ni]) || !visible(nodes[ni])) continue;
+          popups.push(describe(nodes[ni], selector));
+        }
+      }
+      var active = window.__irActiveHoverEl && document.body.contains(window.__irActiveHoverEl)
+        ? window.__irActiveHoverEl
+        : null;
+      return {
+        ok: popups.length > 0,
+        reason: popups.length > 0 ? 'ok' : 'no-native-popup',
+        patchVersion: Number(window.__irPatchVersion) || 0,
+        popupCount: popups.length,
+        popups: popups.slice(0, 20),
+        activeHover: active ? {
+          className: String(active.className || ''),
+          textLength: String(active.textContent || '').trim().length,
+          rect: rectObj(active),
+          connected: true
+        } : null
+      };
+    })()
+  `.trim();
+  const mainExpr = rendererTestWindowEvalExpression(rendererExpr, true);
+  return evaluateInMainProcessForTests(mainExpr, 5000);
+}
+
+async function cleanupNativeHoverInteractionStateForTests(reason?: string): Promise<any> {
+  await ensureRendererPatchForHarness();
+  const safeReason = JSON.stringify(String(reason || 'test-cleanup').slice(0, 120));
+  const rendererExpr = `
+    (function() {
+      function rectObj(el) {
+        if (!el || !el.getBoundingClientRect) return null;
+        try {
+          var r = el.getBoundingClientRect();
+          return {
+            left: Math.round(r.left),
+            top: Math.round(r.top),
+            right: Math.round(r.right),
+            bottom: Math.round(r.bottom),
+            width: Math.round(r.width),
+            height: Math.round(r.height)
+          };
+        } catch (_) { return null; }
+      }
+      function visible(el) {
+        try {
+          var cs = window.getComputedStyle(el);
+          var r = el.getBoundingClientRect();
+          return cs.display !== 'none'
+            && cs.visibility !== 'hidden'
+            && Number(cs.opacity) !== 0
+            && r.width > 1
+            && r.height > 1;
+        } catch (_) { return false; }
+      }
+      function brief(el) {
+        return {
+          className: String(el && el.className || ''),
+          text: String(el && el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 160),
+          rect: rectObj(el),
+          visible: visible(el),
+          active: el === window.__irActiveHoverEl
+        };
+      }
+      var roots = Array.prototype.slice.call(document.querySelectorAll('.monaco-hover, .monaco-editor-hover'));
+      var before = roots.map(brief).slice(0, 12);
+      var removed = 0;
+      var retainedNative = 0;
+      var releasedHiddenActive = false;
+      try { window.__irNativeHoverRefireUntil = 0; } catch (_) {}
+      try { window.__irPointActiveLink = null; } catch (_) {}
+      try { window.__irLastPreviewTarget = null; } catch (_) {}
+      try { if (typeof window.__irCdpMouseProbeCleanup === 'function') window.__irCdpMouseProbeCleanup(); } catch (_) {}
+      try {
+        if (typeof irDisposeHiddenActiveHover === 'function') {
+          releasedHiddenActive = !!irDisposeHiddenActiveHover(${safeReason});
+        }
+      } catch (_) {}
+      roots = Array.prototype.slice.call(document.querySelectorAll('.monaco-hover, .monaco-editor-hover'));
+      for (var i = 0; i < roots.length; i++) {
+        var root = roots[i];
+        if (!root || !document.body.contains(root)) continue;
+        if (root.classList && (root.classList.contains('ir-e2e-hover') || root.classList.contains('ir-test-seeded-hover'))) continue;
+        var isHidden = !visible(root)
+          || (root.classList && (root.classList.contains('hidden') || root.classList.contains('ir-stale-hover')))
+          || (root.getAttribute && root.getAttribute('aria-hidden') === 'true');
+        if (!isHidden) continue;
+        try {
+          var forcedHover = root.getAttribute && root.getAttribute('data-ir-forced-hover') === '1';
+          if (!forcedHover) {
+            var rootText = String(root.textContent || '').trim();
+            var rootRect = root.getBoundingClientRect ? root.getBoundingClientRect() : null;
+            var emptyNativeShell = !rootText
+              && (!rootRect || rootRect.width <= 3 || rootRect.height <= 3);
+            if (emptyNativeShell) {
+              if (root === window.__irActiveHoverEl) window.__irActiveHoverEl = null;
+              try {
+                if (root.__irReleaseRemoveTimer) {
+                  clearTimeout(root.__irReleaseRemoveTimer);
+                  root.__irReleaseRemoveTimer = null;
+                }
+                root.__irReleasedAt = 0;
+                root.__irReleasedText = '';
+                if (root.classList) {
+                  root.classList.remove('ir-native-released-hover', 'ir-scrollable', 'ir-sticky', 'ir-size-small', 'ir-size-medium', 'ir-size-large', 'ir-keepalive', 'ir-empty-hover-root');
+                }
+                if (root.removeAttribute) {
+                  root.removeAttribute('data-ir-native-released-hover');
+                  root.removeAttribute('data-ir-empty-hover-root');
+                }
+                if (root.classList) {
+                  root.classList.add('hidden');
+                }
+                if (root.style) {
+                  root.style.removeProperty('pointer-events');
+                  root.style.removeProperty('display');
+                  root.style.removeProperty('visibility');
+                  root.style.removeProperty('opacity');
+                }
+              } catch (_) {}
+              retainedNative++;
+              continue;
+            }
+            if (rootText) {
+              if (root === window.__irActiveHoverEl) window.__irActiveHoverEl = null;
+              try {
+                if (root.__irReleaseRemoveTimer) {
+                  clearTimeout(root.__irReleaseRemoveTimer);
+                  root.__irReleaseRemoveTimer = null;
+                }
+                root.__irReleasedAt = 0;
+                root.__irReleasedText = '';
+                root.__irPrimaryPreviewTarget = null;
+                root.__irPreviewAppliedAt = 0;
+                root.__irStickyUntil = 0;
+                root.__irLastInsideAt = 0;
+                if (root.classList) {
+                  root.classList.remove('ir-native-released-hover', 'ir-scrollable', 'ir-sticky', 'ir-size-small', 'ir-size-medium', 'ir-size-large', 'ir-keepalive', 'ir-empty-hover-root');
+                  root.classList.add('hidden');
+                }
+                if (root.removeAttribute) {
+                  root.removeAttribute('data-ir-native-released-hover');
+                  root.removeAttribute('data-ir-empty-hover-root');
+                }
+                if (root.style) {
+                  root.style.removeProperty('pointer-events');
+                  root.style.removeProperty('display');
+                  root.style.removeProperty('visibility');
+                  root.style.removeProperty('opacity');
+                }
+              } catch (_) {}
+              retainedNative++;
+              continue;
+            }
+            if (root === window.__irActiveHoverEl) window.__irActiveHoverEl = null;
+            if (window.__irHistoryFor === root) {
+              window.__irHistoryFor = null;
+              window.__irHistory = [];
+              window.__irHistoryCurrent = null;
+            }
+            if (window.__irOriginalHoverSnapshot && window.__irOriginalHoverSnapshot.hoverEl === root) {
+              window.__irOriginalHoverSnapshot = null;
+            }
+            try {
+              if (root.__irReleaseRemoveTimer) {
+                clearTimeout(root.__irReleaseRemoveTimer);
+                root.__irReleaseRemoveTimer = null;
+              }
+            } catch (_) {}
+            if (root.classList) {
+              root.classList.remove('ir-scrollable', 'ir-sticky', 'ir-size-small', 'ir-size-medium', 'ir-size-large', 'ir-keepalive', 'ir-empty-hover-root', 'ir-native-released-hover');
+            }
+            if (root.removeAttribute) {
+              root.removeAttribute('data-ir-empty-hover-root');
+              root.removeAttribute('data-ir-native-released-hover');
+            }
+            try {
+              root.__irReleasedAt = 0;
+              root.__irReleasedText = '';
+              root.__irPrimaryPreviewTarget = null;
+              root.__irPreviewAppliedAt = 0;
+              root.__irStickyUntil = 0;
+              root.__irLastInsideAt = 0;
+            } catch (_) {}
+            if (root.style) {
+              var retainedRootProps = ['--ir-hover-width', '--ir-hover-height', 'width', 'height', 'max-width', 'max-height', 'min-width', 'min-height', 'overflow', 'overflow-x', 'overflow-y', 'box-sizing', 'margin-left', 'margin-top', 'pointer-events', 'display', 'visibility', 'opacity'];
+              for (var rrp = 0; rrp < retainedRootProps.length; rrp++) root.style.removeProperty(retainedRootProps[rrp]);
+            }
+            try {
+              var retainedNodes = root.querySelectorAll ? root.querySelectorAll('.monaco-scrollable-element,.monaco-hover-content,.hover-row,.hover-row-contents,.hover-contents,.markdown-hover,.rendered-markdown') : [];
+              var retainedProps = ['width', 'height', 'max-width', 'max-height', 'min-width', 'min-height', 'overflow', 'overflow-x', 'overflow-y', 'scrollbar-width', 'scrollbar-color', 'overscroll-behavior', 'position', 'box-sizing', 'transform', 'top', 'left'];
+              for (var rni = 0; rni < retainedNodes.length; rni++) {
+                for (var rpi = 0; rpi < retainedProps.length; rpi++) retainedNodes[rni].style.removeProperty(retainedProps[rpi]);
+              }
+            } catch (_) {}
+            retainedNative++;
+            continue;
+          }
+          if (root === window.__irActiveHoverEl) window.__irActiveHoverEl = null;
+          if (window.__irHistoryFor === root) {
+            window.__irHistoryFor = null;
+            window.__irHistory = [];
+            window.__irHistoryCurrent = null;
+          }
+          if (window.__irOriginalHoverSnapshot && window.__irOriginalHoverSnapshot.hoverEl === root) {
+            window.__irOriginalHoverSnapshot = null;
+          }
+          if (root.classList) {
+            root.classList.remove('ir-scrollable', 'ir-sticky', 'ir-size-small', 'ir-size-medium', 'ir-size-large', 'ir-keepalive', 'ir-empty-hover-root', 'ir-native-released-hover');
+          }
+          if (root.removeAttribute) {
+            root.removeAttribute('data-ir-empty-hover-root');
+            root.removeAttribute('data-ir-native-released-hover');
+          }
+          try {
+            root.__irReleasedAt = 0;
+            root.__irReleasedText = '';
+            root.__irPrimaryPreviewTarget = null;
+            root.__irPreviewAppliedAt = 0;
+            root.__irStickyUntil = 0;
+            root.__irLastInsideAt = 0;
+          } catch (_) {}
+          if (root.style) {
+            var rootProps = ['--ir-hover-width', '--ir-hover-height', 'width', 'height', 'max-width', 'max-height', 'min-width', 'min-height', 'overflow', 'overflow-x', 'overflow-y', 'box-sizing', 'margin-left', 'margin-top', 'pointer-events', 'display', 'visibility', 'opacity'];
+            for (var rp = 0; rp < rootProps.length; rp++) root.style.removeProperty(rootProps[rp]);
+          }
+          try {
+            var nodes = root.querySelectorAll ? root.querySelectorAll('.monaco-scrollable-element,.monaco-hover-content,.hover-row,.hover-row-contents,.hover-contents,.markdown-hover,.rendered-markdown') : [];
+            var props = ['width', 'height', 'max-width', 'max-height', 'min-width', 'min-height', 'overflow', 'overflow-x', 'overflow-y', 'scrollbar-width', 'scrollbar-color', 'overscroll-behavior', 'position', 'box-sizing', 'transform', 'top', 'left'];
+            for (var ni = 0; ni < nodes.length; ni++) {
+              for (var pi = 0; pi < props.length; pi++) nodes[ni].style.removeProperty(props[pi]);
+            }
+          } catch (_) {}
+          if (root.parentNode) root.parentNode.removeChild(root);
+          removed++;
+        } catch (_) {}
+      }
+      var afterRoots = Array.prototype.slice.call(document.querySelectorAll('.monaco-hover, .monaco-editor-hover'));
+      return {
+        ok: true,
+        reason: ${safeReason},
+        patchVersion: Number(window.__irPatchVersion) || 0,
+        releasedHiddenActive: releasedHiddenActive,
+        removed: removed,
+        retainedNative: retainedNative,
+        before: before,
+        after: afterRoots.map(brief).slice(0, 12),
+        activeHover: window.__irActiveHoverEl && document.body.contains(window.__irActiveHoverEl)
+          ? brief(window.__irActiveHoverEl)
+          : null
+      };
+    })()
+  `.trim();
+  const mainExpr = rendererTestWindowEvalExpression(rendererExpr, true);
+  const rows = await evaluateInMainProcessForTests(mainExpr, 5000);
+  return Array.isArray(rows)
+    ? rows.map((row: any) => row?.value).find(Boolean) || rows
+    : rows;
+}
+
+async function dismissNativeKeybindingRecorderForTests(): Promise<any> {
+  await ensureRendererPatchForHarness();
+  const rendererExpr = `
+    (function() {
+      var needle = 'Press desired key combination and then press ENTER.';
+      function text(el) {
+        return String(el && el.textContent || '').replace(/\\s+/g, ' ').trim();
+      }
+      function rectObj(el) {
+        if (!el || !el.getBoundingClientRect) return null;
+        try {
+          var r = el.getBoundingClientRect();
+          return { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height };
+        } catch (_) {
+          return null;
+        }
+      }
+      function brief(el) {
+        return {
+          tagName: String(el && el.tagName || ''),
+          className: String(el && el.className || ''),
+          text: text(el).slice(0, 180),
+          viewLineCount: el && el.querySelectorAll ? el.querySelectorAll('.view-line').length : 0,
+          rect: rectObj(el)
+        };
+      }
+      var all = Array.prototype.slice.call(document.querySelectorAll('.monaco-editor, .quick-input-widget, .context-view, .monaco-dialog-box, .monaco-inputbox'));
+      var removed = 0;
+      var hidden = 0;
+      var matched = [];
+      for (var i = 0; i < all.length; i++) {
+        var el = all[i];
+        var elText = text(el);
+        if (elText.indexOf(needle) < 0) continue;
+        matched.push(brief(el));
+        try {
+          if (el.classList && el.classList.contains('monaco-editor')) {
+            var viewLines = el.querySelectorAll ? el.querySelectorAll('.view-line').length : 0;
+            var isRecorderOnlyEditor = viewLines === 0
+              && text(el).indexOf(needle) >= 0
+              && !(el.closest && el.closest('.monaco-hover,.monaco-editor-hover,.suggest-widget'));
+            if (isRecorderOnlyEditor) {
+              if (el.parentNode) {
+                el.parentNode.removeChild(el);
+                removed++;
+                continue;
+              }
+              if (el.style) {
+                el.style.display = 'none';
+                el.style.pointerEvents = 'none';
+                hidden++;
+              }
+            }
+            continue;
+          }
+          var removable = el.closest && (
+            el.closest('.quick-input-widget')
+            || el.closest('.context-view')
+            || el.closest('.monaco-dialog-box')
+          ) || el;
+          if (removable && removable !== el && removable.parentNode) {
+            removable.parentNode.removeChild(removable);
+            removed++;
+          }
+        } catch (_) {
+          try { if (el.style && !el.classList.contains('monaco-editor')) { el.style.display = 'none'; hidden++; } } catch (_) {}
+        }
+      }
+      try { document.body && document.body.focus && document.body.focus(); } catch (_) {}
+      return {
+        ok: true,
+        patchVersion: Number(window.__irPatchVersion) || 0,
+        removed: removed,
+        hidden: hidden,
+        matched: matched.slice(0, 8)
+      };
+    })()
+  `.trim();
+  const mainExpr = rendererTestWindowEvalExpression(rendererExpr, true);
+  const rows = await evaluateInMainProcessForTests(mainExpr, 5000);
+  return Array.isArray(rows)
+    ? rows.map((row: any) => row?.value).find(Boolean) || rows
+    : rows;
+}
+
+async function dispatchRendererMouseMoveForTests(input?: {
+  x?: number;
+  y?: number;
+  clickBeforeMove?: boolean;
+}): Promise<any> {
+  await ensureRendererPatchForHarness();
+  const x = Number(input?.x);
+  const y = Number(input?.y);
+  if (!Number.isFinite(x) || !Number.isFinite(y) || x < 0 || y < 0) {
+    return { ok: false, reason: 'invalid-coordinates', x, y };
+  }
+  const points = [
+    { x: Math.max(1, x - 18), y },
+    { x: Math.max(1, x - 7), y },
+    { x, y },
+  ].map(point => ({
+    x: Math.round(point.x * 100) / 100,
+    y: Math.round(point.y * 100) / 100,
+  }));
+  if (mainWsRef && mainWsRef.readyState === WebSocket.OPEN && (isTestRendererDebugMode() || mainWsRefIsRendererTarget)) {
+    try {
+      return await withRendererInputCdpSessionForTests(async (cdpWs, inputMode) => {
+    await cdpRequest(cdpWs, 'Page.enable', {}, 1000).catch(() => undefined);
+    await cdpRequest(cdpWs, 'Page.bringToFront', {}, 1000).catch(() => undefined);
+    await cdpRequest(cdpWs, 'Runtime.evaluate', {
+      expression: 'try{window.focus();document.body&&document.body.focus&&document.body.focus();true}catch(_){false}',
+      returnByValue: true,
+    }, 1000).catch(() => undefined);
+    await cdpRequest(cdpWs, 'Runtime.evaluate', {
+      expression: `(function(){
+        window.__irLastCdpMouseProbe = [];
+        var types = ['pointerover','mouseover','pointerenter','mouseenter','pointermove','mousemove','mousedown','mouseup','click'];
+        if (window.__irCdpMouseProbeCleanup) { try { window.__irCdpMouseProbeCleanup(); } catch (_) {} }
+        var listeners = [];
+        function describe(t) {
+          var el = t && (t.nodeType === 1 ? t : t.parentElement);
+          return el ? {
+            tag: String(el.tagName || ''),
+            className: String(el.className || ''),
+            text: String(el.textContent || '').slice(0, 80)
+          } : null;
+        }
+        for (var i = 0; i < types.length; i++) {
+          (function(type) {
+            var fn = function(ev) {
+              try {
+                window.__irLastCdpMouseProbe.push({
+                  type: type,
+                  target: describe(ev.target),
+                  activeElement: describe(document.activeElement)
+                });
+              } catch (_) {}
+            };
+            document.addEventListener(type, fn, true);
+            listeners.push({ type: type, fn: fn });
+          })(types[i]);
+        }
+        window.__irCdpMouseProbeCleanup = function() {
+          for (var j = 0; j < listeners.length; j++) {
+            try { document.removeEventListener(listeners[j].type, listeners[j].fn, true); } catch (_) {}
+          }
+          listeners = [];
+        };
+        return true;
+      })()`,
+      returnByValue: true,
+    }, 1000).catch(() => undefined);
+    const targetProbe = await cdpRequest(cdpWs, 'Runtime.evaluate', {
+      expression: `(function(){var x=${JSON.stringify(Math.round(x * 100) / 100)},y=${JSON.stringify(Math.round(y * 100) / 100)};var el=document.elementFromPoint(x,y);return el?{className:String(el.className||''),text:String(el.textContent||'').slice(0,160)}:null})()`,
+      returnByValue: true,
+    }, 1000).catch(() => undefined);
+    const focusBefore = await cdpRequest(cdpWs, 'Runtime.evaluate', {
+      expression: `(function(){
+        var x=${JSON.stringify(Math.round(x * 100) / 100)}, y=${JSON.stringify(Math.round(y * 100) / 100)};
+        function describe(el) {
+          return el ? {
+            tag: String(el.tagName || ''),
+            className: String(el.className || ''),
+            text: String(el.textContent || '').slice(0, 120)
+          } : null;
+        }
+        var el = document.elementFromPoint(x, y);
+        var editor = el && el.closest ? el.closest('.monaco-editor') : null;
+        var input = editor && editor.querySelector ? editor.querySelector('textarea.inputarea, textarea') : null;
+        try { if (input && typeof input.focus === 'function') input.focus(); } catch (_) {}
+        return {
+          target: describe(el),
+          editorClassName: editor ? String(editor.className || '') : '',
+          focusedInput: !!input,
+          activeElement: describe(document.activeElement)
+        };
+      })()`,
+      returnByValue: true,
+    }, 1000).catch(() => undefined);
+    const dispatchMouse = async (event: any) => {
+      try {
+        await cdpRequest(cdpWs, 'Input.dispatchMouseEvent', event, 8000);
+        return null;
+      } catch (err) {
+        return err instanceof Error ? err.message : String(err);
+      }
+    };
+    if (input?.clickBeforeMove) {
+      const pressError = await dispatchMouse({
+        type: 'mousePressed',
+        x: Math.round(x * 100) / 100,
+        y: Math.round(y * 100) / 100,
+        button: 'left',
+        buttons: 1,
+        clickCount: 1,
+        pointerType: 'mouse',
+      });
+      if (pressError) {
+        return {
+          ok: false,
+          mode: 'cdp-renderer',
+          inputMode,
+          reason: 'mouse-dispatch-failed',
+          error: pressError,
+          points,
+          clicked: !!input?.clickBeforeMove,
+          targetAtPoint: targetProbe?.result?.value || null,
+          focusBefore: focusBefore?.result?.value || null,
+        };
+      }
+      const releaseError = await dispatchMouse({
+        type: 'mouseReleased',
+        x: Math.round(x * 100) / 100,
+        y: Math.round(y * 100) / 100,
+        button: 'left',
+        buttons: 0,
+        clickCount: 1,
+        pointerType: 'mouse',
+      });
+      if (releaseError) {
+        return {
+          ok: false,
+          mode: 'cdp-renderer',
+          inputMode,
+          reason: 'mouse-dispatch-failed',
+          error: releaseError,
+          points,
+          clicked: !!input?.clickBeforeMove,
+          targetAtPoint: targetProbe?.result?.value || null,
+          focusBefore: focusBefore?.result?.value || null,
+        };
+      }
+      await new Promise(resolve => setTimeout(resolve, 80));
+    }
+    const focusAfterClick = await cdpRequest(cdpWs, 'Runtime.evaluate', {
+      expression: `(function(){
+        var x=${JSON.stringify(Math.round(x * 100) / 100)}, y=${JSON.stringify(Math.round(y * 100) / 100)};
+        function describe(el) {
+          return el ? {
+            tag: String(el.tagName || ''),
+            className: String(el.className || ''),
+            text: String(el.textContent || '').slice(0, 120)
+          } : null;
+        }
+        var el = document.elementFromPoint(x, y);
+        var editor = el && el.closest ? el.closest('.monaco-editor') : null;
+        var input = editor && editor.querySelector ? editor.querySelector('textarea.inputarea, textarea') : null;
+        try { if (input && typeof input.focus === 'function') input.focus(); } catch (_) {}
+        return {
+          target: describe(el),
+          editorClassName: editor ? String(editor.className || '') : '',
+          focusedInput: !!input,
+          activeElement: describe(document.activeElement)
+        };
+      })()`,
+      returnByValue: true,
+    }, 1000).catch(() => undefined);
+    for (const point of points) {
+      const moveError = await dispatchMouse({
+        type: 'mouseMoved',
+        x: point.x,
+        y: point.y,
+        button: 'none',
+        buttons: 0,
+        clickCount: 0,
+        pointerType: 'mouse',
+      });
+      if (moveError) {
+        return {
+          ok: false,
+          mode: 'cdp-renderer',
+          inputMode,
+          reason: 'mouse-dispatch-failed',
+          error: moveError,
+          points,
+          clicked: !!input?.clickBeforeMove,
+          targetAtPoint: targetProbe?.result?.value || null,
+          focusBefore: focusBefore?.result?.value || null,
+          focusAfterClick: focusAfterClick?.result?.value || null,
+        };
+      }
+      await new Promise(resolve => setTimeout(resolve, 35));
+    }
+    const mouseProbe = await cdpRequest(cdpWs, 'Runtime.evaluate', {
+      expression: `(function(){
+        var rows = (window.__irLastCdpMouseProbe || []).slice(-40);
+        if (window.__irCdpMouseProbeCleanup) { try { window.__irCdpMouseProbeCleanup(); } catch (_) {} }
+        window.__irCdpMouseProbeCleanup = null;
+        return rows;
+      })()`,
+      returnByValue: true,
+    }, 1000).catch(() => undefined);
+    return {
+      ok: true,
+      mode: 'cdp-renderer',
+      inputMode,
+      points,
+      clicked: !!input?.clickBeforeMove,
+      targetAtPoint: targetProbe?.result?.value || null,
+      focusBefore: focusBefore?.result?.value || null,
+      focusAfterClick: focusAfterClick?.result?.value || null,
+      mouseEvents: mouseProbe?.result?.value || [],
+    };
+      });
+    } catch (err) {
+      return {
+        ok: false,
+        mode: 'cdp-renderer',
+        reason: 'cdp-session-failed',
+        error: err instanceof Error ? err.message : String(err),
+        points,
+      };
+    }
+  }
+
+  const rendererExpr = `
+    (function() {
+      var points = ${JSON.stringify(points)};
+      var fired = [];
+      function fireAt(type, Ctor, x, y) {
+        var target = document.elementFromPoint(x, y);
+        if (!target) return { ok: false, type: type, x: x, y: y, reason: 'no-target' };
+        try {
+          target.dispatchEvent(new (Ctor || window.MouseEvent)(type, {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            view: window,
+            clientX: x,
+            clientY: y,
+            screenX: x,
+            screenY: y,
+            buttons: 0,
+            button: 0,
+            pointerType: 'mouse'
+          }));
+        } catch (_) {
+          var ev = document.createEvent('MouseEvents');
+          ev.initMouseEvent(type, true, true, window, 0, x, y, x, y, false, false, false, false, 0, null);
+          target.dispatchEvent(ev);
+        }
+        return {
+          ok: true,
+          type: type,
+          x: x,
+          y: y,
+          targetClassName: String(target.className || ''),
+          targetText: String(target.textContent || '').slice(0, 120)
+        };
+      }
+      for (var i = 0; i < points.length; i++) {
+        var p = points[i];
+        fired.push(fireAt('pointerover', window.PointerEvent || window.MouseEvent, p.x, p.y));
+        fired.push(fireAt('mouseover', window.MouseEvent, p.x, p.y));
+        fired.push(fireAt('pointermove', window.PointerEvent || window.MouseEvent, p.x, p.y));
+        fired.push(fireAt('mousemove', window.MouseEvent, p.x, p.y));
+      }
+      return { ok: fired.some(function(item) { return item && item.ok; }), mode: 'dom-dispatch', points: points, fired: fired };
+    })()
+  `.trim();
+  const rows = await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpr, true), 3000);
+  const value = (rows || []).map((row: any) => row?.value).find(Boolean);
+  return value || { ok: false, reason: 'no-renderer-result', rows };
+}
+
+async function dispatchRendererKeyForTests(input?: {
+  key?: string;
+  code?: string;
+  windowsVirtualKeyCode?: number;
+  nativeVirtualKeyCode?: number;
+}): Promise<any> {
+  const key = String(input?.key || 'Escape');
+  const code = String(input?.code || key);
+  const windowsVirtualKeyCode = Number.isFinite(Number(input?.windowsVirtualKeyCode))
+    ? Number(input!.windowsVirtualKeyCode)
+    : (key === 'Escape' ? 27 : 0);
+  const nativeVirtualKeyCode = Number.isFinite(Number(input?.nativeVirtualKeyCode))
+    ? Number(input!.nativeVirtualKeyCode)
+    : (key === 'Escape' ? 53 : windowsVirtualKeyCode);
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN || !(isTestRendererDebugMode() || mainWsRefIsRendererTarget)) {
+    return { ok: false, reason: 'renderer-cdp-unavailable', key, code };
+  }
+  try {
+    return await withRendererInputCdpSessionForTests(async (cdpWs, inputMode) => {
+      await cdpRequest(cdpWs, 'Page.enable', {}, 1000).catch(() => undefined);
+      await cdpRequest(cdpWs, 'Page.bringToFront', {}, 1000).catch(() => undefined);
+      const text = '';
+      const baseEvent = {
+        key,
+        code,
+        windowsVirtualKeyCode,
+        nativeVirtualKeyCode,
+        text,
+        unmodifiedText: text,
+      };
+      await cdpRequest(cdpWs, 'Input.dispatchKeyEvent', {
+        ...baseEvent,
+        type: 'rawKeyDown',
+      }, 3000);
+      await cdpRequest(cdpWs, 'Input.dispatchKeyEvent', {
+        ...baseEvent,
+        type: 'keyDown',
+      }, 3000);
+      if (text) {
+        await cdpRequest(cdpWs, 'Input.dispatchKeyEvent', {
+          ...baseEvent,
+          type: 'char',
+        }, 3000).catch(() => undefined);
+      }
+      await cdpRequest(cdpWs, 'Input.dispatchKeyEvent', {
+        ...baseEvent,
+        type: 'keyUp',
+      }, 3000);
+      return { ok: true, mode: 'cdp-renderer', inputMode, key, code, windowsVirtualKeyCode, nativeVirtualKeyCode };
+    });
+  } catch (err) {
+    return {
+      ok: false,
+      mode: 'cdp-renderer',
+      reason: 'key-dispatch-failed',
+      key,
+      code,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
 }
 
 async function runHoverLinkClickHarnessForTests(typeName: string): Promise<any[]> {
   await ensureRendererPatchForHarness();
   const targetName = String(typeName || '');
+  const useNativeMouseClick = !!(mainWsRef
+    && mainWsRef.readyState === WebSocket.OPEN
+    && (isTestRendererDebugMode() || mainWsRefIsRendererTarget));
   const rendererExpr = `
     (async function() {
       var targetName = ${JSON.stringify(targetName)};
+      var useNativeMouseClick = ${JSON.stringify(useNativeMouseClick)};
       var hooks = window.__irTestHooks;
       function wait(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
+      function visible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        try {
+          var cs = window.getComputedStyle(el);
+          var r = el.getBoundingClientRect();
+          return cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity) !== 0 && r.width > 0 && r.height > 0;
+        } catch (_) { return false; }
+      }
+      function visibleHover(root) {
+        if (visible(root)) return true;
+        if (!root || String(root.textContent || '').trim().length === 0) return false;
+        var nodes = root.querySelectorAll ? root.querySelectorAll('.monaco-hover-content,.hover-row,.hover-row-contents,.hover-contents,.markdown-hover,.rendered-markdown') : [];
+        for (var ni = 0; ni < nodes.length; ni++) {
+          if (visible(nodes[ni])) return true;
+        }
+        return false;
+      }
       function isActualHover(el) {
         return !!el
           && !el.classList.contains('ir-e2e-hover')
@@ -4102,7 +7484,7 @@ async function runHoverLinkClickHarnessForTests(typeName: string): Promise<any[]
       function seededHoverRoot() {
         var seeded = document.querySelectorAll('.ir-test-seeded-hover');
         for (var si = seeded.length - 1; si >= 0; si--) {
-          if (document.body.contains(seeded[si]) && isActualHover(seeded[si])) return seeded[si];
+          if (document.body.contains(seeded[si]) && isActualHover(seeded[si]) && visible(seeded[si])) return seeded[si];
         }
         return null;
       }
@@ -4112,7 +7494,7 @@ async function runHoverLinkClickHarnessForTests(typeName: string): Promise<any[]
         var out = [];
         var roots = document.querySelectorAll('.monaco-hover, .monaco-editor-hover');
         for (var i = 0; i < roots.length; i++) {
-          if (document.body.contains(roots[i]) && isActualHover(roots[i])) out.push(roots[i]);
+          if (document.body.contains(roots[i]) && isActualHover(roots[i]) && visibleHover(roots[i])) out.push(roots[i]);
         }
         return out;
       }
@@ -4120,7 +7502,7 @@ async function runHoverLinkClickHarnessForTests(typeName: string): Promise<any[]
         var seeded = seededHoverRoot();
         if (seeded) return seeded;
         var active = window.__irActiveHoverEl;
-        if (active && document.body.contains(active) && isActualHover(active)) return active;
+        if (active && document.body.contains(active) && isActualHover(active) && visibleHover(active)) return active;
         var roots = hoverRoots();
         var best = null;
         var bestText = -1;
@@ -4142,6 +7524,14 @@ async function runHoverLinkClickHarnessForTests(typeName: string): Promise<any[]
         }
         return out;
       }
+      function primaryScrollTop(root) {
+        try {
+          var sc = root && root.querySelector ? root.querySelector('.monaco-scrollable-element') : null;
+          return sc ? sc.scrollTop : (root ? root.scrollTop : 0);
+        } catch (_) {
+          return 0;
+        }
+      }
       function hoverDomState() {
         var roots = hoverRoots();
         var root = activeHoverRoot();
@@ -4160,18 +7550,37 @@ async function runHoverLinkClickHarnessForTests(typeName: string): Promise<any[]
           activeTextLength: text.trim().length,
           activeText: text.slice(0, 8000),
           activeRect: rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : null,
+          activeScrollTop: primaryScrollTop(root),
           linkTypes: collectLinkTypes(root),
           patchVersion: Number(window.__irPatchVersion) || 0
         };
+      }
+      function linkVisibleAtPoint(root, link) {
+        try {
+          if (!root || !link) return false;
+          var rr = root.getBoundingClientRect();
+          var lr = link.getBoundingClientRect();
+          if (!rr || !lr || lr.width <= 0 || lr.height <= 0) return false;
+          var x = Math.max(lr.left + 1, Math.min(lr.right - 1, lr.left + lr.width / 2));
+          var y = Math.max(lr.top + 1, Math.min(lr.bottom - 1, lr.top + lr.height / 2));
+          if (x < rr.left || x > rr.right || y < rr.top || y > rr.bottom) return false;
+          var hit = document.elementFromPoint(x, y);
+          return !!(hit && (hit === link || (hit.closest && hit.closest('.ir-type-link') === link)));
+        } catch (_) {
+          return false;
+        }
       }
       function findTargetLink() {
         var root = activeHoverRoot();
         if (!root) return null;
         var links = root.querySelectorAll('.ir-type-link');
+        var first = null;
         for (var i = 0; i < links.length; i++) {
-          if ((links[i].getAttribute('data-type') || '') === targetName) return links[i];
+          if ((links[i].getAttribute('data-type') || '') !== targetName) continue;
+          if (!first) first = links[i];
+          if (linkVisibleAtPoint(root, links[i])) return links[i];
         }
-        return null;
+        return first;
       }
       function textNodeInsideLink(node, root) {
         var cur = node && node.parentNode;
@@ -4269,11 +7678,22 @@ async function runHoverLinkClickHarnessForTests(typeName: string): Promise<any[]
         var y = Math.max(rect.top + 1, Math.min(rect.bottom - 1, rect.top + rect.height / 2));
         var target = document.elementFromPoint(x, y) || match.node.parentElement || activeHoverRoot();
         eventAt('pointerover', window.PointerEvent || window.MouseEvent, target, x, y);
+        await Promise.resolve();
+        var wrapped = findTargetLink();
+        if (wrapped) target = wrapped;
         eventAt('mouseover', window.MouseEvent, target, x, y);
+        wrapped = findTargetLink();
+        if (wrapped) target = wrapped;
         eventAt('pointermove', window.PointerEvent || window.MouseEvent, target, x, y);
+        wrapped = findTargetLink();
+        if (wrapped) target = wrapped;
         eventAt('mousemove', window.MouseEvent, target, x, y);
-        await wait(80);
+        await Promise.resolve();
         var link = findTargetLink();
+        if (link) {
+          eventAt('pointerover', window.PointerEvent || window.MouseEvent, link, x, y);
+          eventAt('mouseover', window.MouseEvent, link, x, y);
+        }
         var style = link ? window.getComputedStyle(link) : null;
         return {
           ok: !!link,
@@ -4297,6 +7717,7 @@ async function runHoverLinkClickHarnessForTests(typeName: string): Promise<any[]
         if (!dom.hoverCount) break;
         link = findTargetLink();
         if (link) break;
+        if (findTargetTextNode()) break;
         await wait(80);
       }
       linkAlreadyExisted = !!link;
@@ -4317,6 +7738,77 @@ async function runHoverLinkClickHarnessForTests(typeName: string): Promise<any[]
       linkAlreadyExisted = linkAlreadyExisted && !pointWrap;
       var hover = link.closest('.monaco-hover, .monaco-editor-hover');
       var beforeText = hover ? String(hover.textContent || '').length : 0;
+      async function ensureLinkVisibleForNativeClick() {
+        if (!useNativeMouseClick) return;
+        try {
+          var root = activeHoverRoot();
+          if (linkVisibleAtPoint(root, link)) return;
+          if (link && link.scrollIntoView) link.scrollIntoView({ block: 'center', inline: 'nearest' });
+          await wait(120);
+          var visible = findTargetLink();
+          if (visible) link = visible;
+        } catch (_) {}
+      }
+      function linkClickPoint() {
+        try {
+          var rect = link.getBoundingClientRect();
+          if (!rect || rect.width <= 0 || rect.height <= 0) return null;
+          var x = Math.max(rect.left + 1, Math.min(rect.right - 1, rect.left + rect.width / 2));
+          var y = Math.max(rect.top + 1, Math.min(rect.bottom - 1, rect.top + rect.height / 2));
+          var pointTarget = document.elementFromPoint(x, y);
+          return {
+            x: Math.round(x * 100) / 100,
+            y: Math.round(y * 100) / 100,
+            targetClassName: pointTarget ? String(pointTarget.className || '') : '',
+            targetText: pointTarget ? String(pointTarget.textContent || '').slice(0, 120) : '',
+            elementFromPointIsLink: !!(pointTarget && (pointTarget === link || (pointTarget.closest && pointTarget.closest('.ir-type-link') === link)))
+          };
+        } catch (_) {
+          return null;
+        }
+      }
+      await ensureLinkVisibleForNativeClick();
+      hover = link.closest('.monaco-hover, .monaco-editor-hover');
+      beforeText = hover ? String(hover.textContent || '').length : beforeText;
+      var clickPoint = linkClickPoint();
+      if (useNativeMouseClick) {
+        var clickPointIsLink = !!(clickPoint && clickPoint.elementFromPointIsLink);
+        try {
+          window.__irHarnessClickPayloads = [];
+          if (!window.__irHarnessClickOriginalGoToType) {
+            window.__irHarnessClickOriginalGoToType = window.irGoToType;
+          }
+          window.irGoToType = function(payload) {
+            try { window.__irHarnessClickPayloads.push(String(payload)); } catch (_) {}
+            var original = window.__irHarnessClickOriginalGoToType;
+            if (typeof original === 'function') {
+              try { return original.apply(window, arguments); } catch (_) {}
+            }
+            return undefined;
+          };
+        } catch (_) {}
+        return {
+          ok: clickPointIsLink,
+          reason: !clickPoint ? 'missing-link-click-point' : (clickPointIsLink ? 'native-mouse-click-pending' : 'native-mouse-point-target-not-link'),
+          scheduledClick: targetName,
+          syntheticHover: false,
+          nativeMouseClick: true,
+          patchVersion: Number(window.__irPatchVersion) || 0,
+          linkText: String(link.textContent || ''),
+          linkAlreadyExisted: linkAlreadyExisted,
+          pointWrap: pointWrap,
+          pointActive: !!(link.classList && link.classList.contains('ir-point-active')),
+          clickPoint: clickPoint,
+          textDecorationLine: (function() {
+            try {
+              var cs = window.getComputedStyle(link);
+              return cs.textDecorationLine || cs.textDecoration || '';
+            } catch (_) { return ''; }
+          })(),
+          hoverTextLengthBeforeClick: beforeText,
+          domBefore: dom || hoverDomState()
+        };
+      }
       function fire(type, Ctor) {
         try {
           link.dispatchEvent(new Ctor(type, { bubbles: true, cancelable: true, view: window }));
@@ -4342,6 +7834,7 @@ async function runHoverLinkClickHarnessForTests(typeName: string): Promise<any[]
         linkAlreadyExisted: linkAlreadyExisted,
         pointWrap: pointWrap,
         pointActive: !!(link.classList && link.classList.contains('ir-point-active')),
+        clickPoint: clickPoint,
         textDecorationLine: (function() {
           try {
             var cs = window.getComputedStyle(link);
@@ -4353,8 +7846,206 @@ async function runHoverLinkClickHarnessForTests(typeName: string): Promise<any[]
       };
     })()
   `.trim();
-  const mainExpr = rendererTestWindowEvalExpression(rendererExpr);
-  return evaluateInMainProcessForTests(mainExpr, 12000);
+  const mainExpr = rendererTestWindowEvalExpression(rendererExpr, true);
+  const rows = await evaluateInMainProcessForTests(mainExpr, 12000);
+  const clickRow = (rows || []).find((row: any) => row?.value?.ok && row.value.nativeMouseClick && row.value.clickPoint);
+  if (useNativeMouseClick && clickRow?.value?.clickPoint && mainWsRef && mainWsRef.readyState === WebSocket.OPEN) {
+    const point = clickRow.value.clickPoint;
+    const x = Number(point.x);
+    const y = Number(point.y);
+    try {
+      await withRendererInputCdpSessionForTests(async (inputWs, inputMode) => {
+        clickRow.value.nativeMouseInputMode = inputMode;
+        clickRow.value.nativeMouseDispatchEvents = [];
+        await cdpRequest(inputWs, 'Page.enable', {}, 1500).catch(() => undefined);
+        await cdpRequest(inputWs, 'Page.bringToFront', {}, 1500).catch(() => undefined);
+        const dispatchMouse = async (event: any) => {
+          clickRow.value.nativeMouseLastDispatch = event.type;
+          clickRow.value.nativeMouseDispatchEvents.push(event.type);
+          await cdpRequest(inputWs, 'Input.dispatchMouseEvent', event, 6000);
+        };
+        await dispatchMouse({
+          type: 'mouseMoved',
+          x,
+          y,
+          button: 'none',
+          buttons: 0,
+          clickCount: 0,
+          pointerType: 'mouse',
+        });
+        await dispatchMouse({
+          type: 'mousePressed',
+          x,
+          y,
+          button: 'left',
+          buttons: 1,
+          clickCount: 1,
+          pointerType: 'mouse',
+        });
+        await dispatchMouse({
+          type: 'mouseReleased',
+          x,
+          y,
+          button: 'left',
+          buttons: 0,
+          clickCount: 1,
+          pointerType: 'mouse',
+        });
+      });
+      clickRow.value.nativeMouseDispatched = true;
+      await new Promise(resolve => setTimeout(resolve, 260));
+      const payloadRows = await evaluateInMainProcessForTests(`
+        (function(){
+          var payloads = [];
+          try { payloads = (window.__irHarnessClickPayloads || []).slice(); } catch (_) {}
+          try {
+            if (window.__irHarnessClickOriginalGoToType) {
+              window.irGoToType = window.__irHarnessClickOriginalGoToType;
+              window.__irHarnessClickOriginalGoToType = null;
+            }
+            window.__irHarnessClickPayloads = [];
+          } catch (_) {}
+          return payloads;
+        })()
+      `.trim(), 3000).catch(() => []);
+      const payloads = (payloadRows || []).map((row: any) => row?.value).find(Array.isArray) || [];
+      clickRow.value.payloads = payloads;
+      clickRow.value.previewPayloadSeen = payloads.includes(`PREVIEW:${targetName}`);
+      if (!clickRow.value.previewPayloadSeen) {
+        clickRow.value.ok = false;
+        clickRow.value.reason = 'native-mouse-click-no-preview-payload';
+      }
+    } catch (err) {
+      const dispatchError = err instanceof Error ? err.message : String(err);
+      clickRow.value.ok = false;
+      clickRow.value.reason = 'native-mouse-dispatch-failed';
+      clickRow.value.error = dispatchError;
+      let fallbackOk = false;
+      try {
+        const fallbackRows = await evaluateInMainProcessForTests(`
+          (async function(){
+            var targetName=${JSON.stringify(targetName)};
+            var x=${JSON.stringify(point?.x)};
+            var y=${JSON.stringify(point?.y)};
+            var payloads=[];
+            function describe(el){
+              return el?{
+                tag:String(el.tagName||''),
+                className:String(el.className||''),
+                text:String(el.textContent||'').slice(0,160),
+                dataType:el.getAttribute?String(el.getAttribute('data-type')||''):''
+              }:null;
+            }
+            function fire(type,Ctor,target){
+              try{
+                target.dispatchEvent(new (Ctor||window.MouseEvent)(type,{
+                  bubbles:true,
+                  cancelable:true,
+                  composed:true,
+                  view:window,
+                  clientX:x,
+                  clientY:y,
+                  screenX:x,
+                  screenY:y,
+                  button:type==='mouseMoved'||type==='pointermove'||type==='mousemove'?0:0,
+                  buttons:type==='pointerdown'||type==='mousedown'?1:0,
+                  pointerId:1,
+                  pointerType:'mouse',
+                  isPrimary:true
+                }));
+                return true;
+              }catch(_){}
+              try{
+                var ev=document.createEvent('MouseEvents');
+                ev.initMouseEvent(type,true,true,window,1,x,y,x,y,false,false,false,false,0,null);
+                target.dispatchEvent(ev);
+                return true;
+              }catch(_){}
+              return false;
+            }
+            var target=document.elementFromPoint(x,y);
+            var link=target&&target.closest?target.closest('.ir-type-link'):null;
+            if(!link||String(link.getAttribute('data-type')||'')!==targetName){
+              return {
+                ok:false,
+                reason:'hit-test-target-not-link',
+                target:describe(target),
+                link:describe(link),
+                point:{x:x,y:y}
+              };
+            }
+            var original=window.irGoToType;
+            try{
+              window.irGoToType=function(payload){
+                try{payloads.push(String(payload));}catch(_){}
+                if(typeof original==='function'){
+                  try{return original.apply(window,arguments);}catch(_){}
+                }
+                return undefined;
+              };
+              fire('pointerover',window.PointerEvent||window.MouseEvent,link);
+              fire('mouseover',window.MouseEvent,link);
+              fire('pointermove',window.PointerEvent||window.MouseEvent,link);
+              fire('mousemove',window.MouseEvent,link);
+              fire('pointerdown',window.PointerEvent||window.MouseEvent,link);
+              fire('mousedown',window.MouseEvent,link);
+              fire('mouseup',window.MouseEvent,link);
+              fire('click',window.MouseEvent,link);
+              await new Promise(function(resolve){setTimeout(resolve,260);});
+            }finally{
+              try{window.irGoToType=original;}catch(_){}
+              try{
+                if(window.__irHarnessClickOriginalGoToType){
+                  window.irGoToType=window.__irHarnessClickOriginalGoToType;
+                  window.__irHarnessClickOriginalGoToType=null;
+                }
+              }catch(_){}
+              try{window.__irHarnessClickPayloads=[];}catch(_){}
+            }
+            return {
+              ok:payloads.indexOf('PREVIEW:'+targetName)>=0,
+              reason:payloads.indexOf('PREVIEW:'+targetName)>=0?'ok':'no-preview-payload',
+              payloads:payloads,
+              target:describe(target),
+              link:describe(link),
+              point:{x:x,y:y},
+              textDecorationLine:(function(){try{var cs=window.getComputedStyle(link);return cs.textDecorationLine||cs.textDecoration||'';}catch(_){return '';}})()
+            };
+          })()
+        `.trim(), 4000);
+        const fallback = (fallbackRows || []).map((row: any) => row?.value).find(Boolean);
+        clickRow.value.hitTestDomClickFallback = fallback || null;
+        if (fallback?.ok) {
+          fallbackOk = true;
+          clickRow.value.ok = true;
+          clickRow.value.reason = 'native-mouse-dispatch-failed-hit-test-dom-click-used';
+          clickRow.value.nativeMouseDispatched = false;
+          clickRow.value.hitTestDomClickDispatched = true;
+          clickRow.value.payloads = fallback.payloads || [];
+          clickRow.value.previewPayloadSeen = true;
+        }
+      } catch (fallbackErr) {
+        clickRow.value.hitTestDomClickFallbackError = fallbackErr instanceof Error ? fallbackErr.message : String(fallbackErr);
+      }
+      if (!fallbackOk) {
+        try {
+        await evaluateInMainProcessForTests(`
+          (function(){
+            try {
+              if (window.__irHarnessClickOriginalGoToType) {
+                window.irGoToType = window.__irHarnessClickOriginalGoToType;
+                window.__irHarnessClickOriginalGoToType = null;
+              }
+              window.__irHarnessClickPayloads = [];
+            } catch (_) {}
+            return true;
+          })()
+        `.trim(), 3000).catch(() => undefined);
+        } catch {}
+      }
+    }
+  }
+  return rows;
 }
 
 async function runHoverScrollHarnessForTests(scrollTop?: number): Promise<any[]> {
@@ -4365,6 +8056,14 @@ async function runHoverScrollHarnessForTests(scrollTop?: number): Promise<any[]>
       var targetTop = ${JSON.stringify(targetTop)};
       var hooks = window.__irTestHooks;
       function wait(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
+      function visible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        try {
+          var cs = window.getComputedStyle(el);
+          var r = el.getBoundingClientRect();
+          return cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity) !== 0 && r.width > 0 && r.height > 0;
+        } catch (_) { return false; }
+      }
       function isActualHover(el) {
         return !!el
           && !el.classList.contains('ir-e2e-hover')
@@ -4373,12 +8072,12 @@ async function runHoverScrollHarnessForTests(scrollTop?: number): Promise<any[]>
       }
       function activeHoverRoot() {
         var active = window.__irActiveHoverEl;
-        if (active && document.body.contains(active) && isActualHover(active)) return active;
+        if (active && document.body.contains(active) && isActualHover(active) && visible(active)) return active;
         var roots = document.querySelectorAll('.monaco-hover, .monaco-editor-hover');
         var best = null;
         var bestText = -1;
         for (var i = 0; i < roots.length; i++) {
-          if (!document.body.contains(roots[i]) || !isActualHover(roots[i])) continue;
+          if (!document.body.contains(roots[i]) || !isActualHover(roots[i]) || !visible(roots[i])) continue;
           var len = String(roots[i].textContent || '').trim().length;
           if (len >= bestText) { best = roots[i]; bestText = len; }
         }
@@ -4417,7 +8116,7 @@ async function runHoverScrollHarnessForTests(scrollTop?: number): Promise<any[]>
       };
     })()
   `.trim();
-  const mainExpr = rendererTestWindowEvalExpression(rendererExpr);
+  const mainExpr = rendererTestWindowEvalExpression(rendererExpr, true);
   return evaluateInMainProcessForTests(mainExpr, 12000);
 }
 
@@ -4426,6 +8125,14 @@ async function runHoverBackButtonClickHarnessForTests(): Promise<any[]> {
   const rendererExpr = `
     (async function() {
       function wait(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
+      function visible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        try {
+          var cs = window.getComputedStyle(el);
+          var r = el.getBoundingClientRect();
+          return cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity) !== 0 && r.width > 0 && r.height > 0;
+        } catch (_) { return false; }
+      }
       function isActualHover(el) {
         return !!el
           && !el.classList.contains('ir-e2e-hover')
@@ -4435,7 +8142,7 @@ async function runHoverBackButtonClickHarnessForTests(): Promise<any[]> {
       function seededHoverRoot() {
         var seeded = document.querySelectorAll('.ir-test-seeded-hover');
         for (var si = seeded.length - 1; si >= 0; si--) {
-          if (document.body.contains(seeded[si]) && isActualHover(seeded[si])) return seeded[si];
+          if (document.body.contains(seeded[si]) && isActualHover(seeded[si]) && visible(seeded[si])) return seeded[si];
         }
         return null;
       }
@@ -4443,12 +8150,12 @@ async function runHoverBackButtonClickHarnessForTests(): Promise<any[]> {
         var seeded = seededHoverRoot();
         if (seeded) return seeded;
         var active = window.__irActiveHoverEl;
-        if (active && document.body.contains(active) && isActualHover(active)) return active;
+        if (active && document.body.contains(active) && isActualHover(active) && visible(active)) return active;
         var roots = document.querySelectorAll('.monaco-hover, .monaco-editor-hover');
         var best = null;
         var bestText = -1;
         for (var i = 0; i < roots.length; i++) {
-          if (!document.body.contains(roots[i]) || !isActualHover(roots[i])) continue;
+          if (!document.body.contains(roots[i]) || !isActualHover(roots[i]) || !visible(roots[i])) continue;
           var len = String(roots[i].textContent || '').trim().length;
           if (len >= bestText) {
             best = roots[i];
@@ -4492,7 +8199,7 @@ async function runHoverBackButtonClickHarnessForTests(): Promise<any[]> {
       };
     })()
   `.trim();
-  const mainExpr = rendererTestWindowEvalExpression(rendererExpr);
+  const mainExpr = rendererTestWindowEvalExpression(rendererExpr, true);
   return evaluateInMainProcessForTests(mainExpr, 12000);
 }
 
@@ -4509,7 +8216,17 @@ async function runHoverDomStateHarnessForTests(expectedTypes?: string[] | string
       var expected = ${JSON.stringify(expected)};
       var includeMetrics = ${JSON.stringify(includeMetrics)};
       var hooks = window.__irTestHooks;
-      function wait(ms) { return new Promise(function(resolve) { setTimeout(resolve, ms); }); }
+      function wait(ms) {
+        return new Promise(function(resolve) { setTimeout(resolve, ms); });
+      }
+      function visible(el) {
+        if (!el || !el.getBoundingClientRect) return false;
+        try {
+          var cs = window.getComputedStyle(el);
+          var r = el.getBoundingClientRect();
+          return cs.display !== 'none' && cs.visibility !== 'hidden' && Number(cs.opacity) !== 0 && r.width > 0 && r.height > 0;
+        } catch (_) { return false; }
+      }
       function isActualHover(el) {
         return !!el
           && !el.classList.contains('ir-e2e-hover')
@@ -4519,7 +8236,7 @@ async function runHoverDomStateHarnessForTests(expectedTypes?: string[] | string
       function seededHoverRoot() {
         var seeded = document.querySelectorAll('.ir-test-seeded-hover');
         for (var si = seeded.length - 1; si >= 0; si--) {
-          if (document.body.contains(seeded[si]) && isActualHover(seeded[si])) return seeded[si];
+          if (document.body.contains(seeded[si]) && isActualHover(seeded[si]) && visible(seeded[si])) return seeded[si];
         }
         return null;
       }
@@ -4529,7 +8246,7 @@ async function runHoverDomStateHarnessForTests(expectedTypes?: string[] | string
         var out = [];
         var roots = document.querySelectorAll('.monaco-hover, .monaco-editor-hover');
         for (var i = 0; i < roots.length; i++) {
-          if (document.body.contains(roots[i]) && isActualHover(roots[i])) out.push(roots[i]);
+          if (document.body.contains(roots[i]) && isActualHover(roots[i]) && visible(roots[i])) out.push(roots[i]);
         }
         return out;
       }
@@ -4537,7 +8254,7 @@ async function runHoverDomStateHarnessForTests(expectedTypes?: string[] | string
         var seeded = seededHoverRoot();
         if (seeded) return seeded;
         var active = window.__irActiveHoverEl;
-        if (active && document.body.contains(active) && isActualHover(active)) return active;
+        if (active && document.body.contains(active) && isActualHover(active) && visible(active)) return active;
         var roots = hoverRoots();
         var best = null;
         var bestText = -1;
@@ -4623,6 +8340,7 @@ async function runHoverDomStateHarnessForTests(expectedTypes?: string[] | string
           tokenizedLinkTypes: tokenizedLinkTypes,
           tokenizedText: tokenizedText.slice(0, 8000),
           tokenizedInlineStyle: firstTokenized ? (firstTokenized.getAttribute('style') || '') : '',
+          tokenizedWhiteSpace: tokenStyle ? tokenStyle.whiteSpace : '',
           tokenizedFontFamily: tokenStyle ? tokenStyle.fontFamily : '',
           tokenizedFontSize: tokenStyle ? tokenStyle.fontSize : '',
           tokenizedLineHeight: tokenStyle ? tokenStyle.lineHeight : '',
@@ -4712,12 +8430,14 @@ async function runHoverDomStateHarnessForTests(expectedTypes?: string[] | string
           } catch (_) {}
         }
         return {
-          ok: roots.length > 0 && text.trim().length > 0 && missing.length === 0,
-          reason: roots.length === 0 ? 'no-hover' : (text.trim().length === 0 ? 'empty-hover' : (missing.length ? 'missing-links' : 'ok')),
+          ok: roots.length > 0 && text.trim().length > 0 && missing.length === 0 && emptyRoots === 0,
+          reason: roots.length === 0 ? 'no-hover' : (text.trim().length === 0 ? 'empty-hover' : (emptyRoots ? 'stale-empty-hover' : (missing.length ? 'missing-links' : 'ok'))),
           patchVersion: Number(window.__irPatchVersion) || 0,
           hoverCount: roots.length,
           populatedHoverCount: populatedRoots,
           emptyHoverCount: emptyRoots,
+          forcedHover: !!(root && root.getAttribute && root.getAttribute('data-ir-forced-hover') === '1'),
+          activeClassName: root ? String(root.className || '') : '',
           activeTextLength: text.trim().length,
           activeText: text.slice(0, 8000),
           activeRect: rect ? { left: rect.left, top: rect.top, width: rect.width, height: rect.height } : null,
@@ -4725,6 +8445,7 @@ async function runHoverDomStateHarnessForTests(expectedTypes?: string[] | string
           expectedTypes: expected,
           missingExpectedTypes: missing,
           tokenizedSourceCount: syntax.tokenizedSourceCount,
+          fallbackTokenizedSourceCount: syntax.fallbackTokenizedSourceCount,
           mtkSpanCount: syntax.mtkSpanCount,
           mtkClassCount: syntax.mtkClassCount,
           irTkSpanCount: syntax.irTkSpanCount,
@@ -4763,6 +8484,7 @@ async function runHoverDomStateHarnessForTests(expectedTypes?: string[] | string
       }
       var state = null;
       for (var attempt = 0; attempt < 25; attempt++) {
+        try { hooks.scanRenderedMarkdown(); } catch (_) {}
         state = collectState();
         if (!state.hoverCount) break;
         if (state.ok) break;
@@ -4771,19 +8493,25 @@ async function runHoverDomStateHarnessForTests(expectedTypes?: string[] | string
       return state || collectState();
     })()
   `.trim();
-  const mainExpr = rendererTestWindowEvalExpression(rendererExpr);
+  const mainExpr = rendererTestWindowEvalExpression(rendererExpr, true);
   return evaluateInMainProcessForTests(mainExpr, 12000);
 }
 
-async function runHoverSeedPreviewHarnessForTests(typeName: string, markdown: string): Promise<any[]> {
+async function runHoverSeedPreviewHarnessForTests(
+  typeName: string,
+  markdown: string,
+  asOriginal = false,
+): Promise<any[]> {
   await ensureRendererPatchForHarness();
   await cleanupRendererTestArtifactsAcrossWindowsForTests();
   const safeId = jsonStringifyAscii(String(typeName || ''));
   const safeMd = jsonStringifyAscii(String(markdown || ''));
+  const safeAsOriginal = JSON.stringify(!!asOriginal);
   const rendererExpr = `
     (async function() {
       var typeName = ${safeId};
       var markdown = ${safeMd};
+      var asOriginal = ${safeAsOriginal};
       var hooks = window.__irTestHooks;
       if (!hooks || typeof hooks.makeHoverScrollable !== 'function') {
         return { ok: false, reason: 'missing-hooks', patchVersion: Number(window.__irPatchVersion) || 0 };
@@ -4821,8 +8549,28 @@ async function runHoverSeedPreviewHarnessForTests(typeName: string, markdown: st
           ? window.irApplyPreview(typeName, markdown, false) !== false
           : false;
       } catch (_) {}
+      if (asOriginal) {
+        Array.prototype.slice.call(hover.querySelectorAll('.ir-back-btn')).forEach(function(btn) {
+          try { btn.parentNode && btn.parentNode.removeChild(btn); } catch (_) {}
+        });
+        window.__irHistoryFor = hover;
+        window.__irHistory = [];
+        window.__irHistoryCurrent = null;
+        window.__irLastPreviewTarget = md;
+      }
       try { hooks.makeHoverScrollable(hover, true, (hover.textContent || '').length); } catch (_) {}
       try { hooks.scanRenderedMarkdown(); } catch (_) {}
+      if (asOriginal) {
+        try {
+          window.__irOriginalHoverSnapshot = {
+            hoverEl: hover,
+            clone: hover.cloneNode(true),
+            className: String(hover.className || ''),
+            styleText: String(hover.getAttribute('style') || ''),
+            scroll: null
+          };
+        } catch (_) {}
+      }
       return {
         ok: applied && String(hover.textContent || '').trim().length > 0,
         applied: applied,
@@ -4834,7 +8582,7 @@ async function runHoverSeedPreviewHarnessForTests(typeName: string, markdown: st
       };
     })()
   `.trim();
-  const mainExpr = rendererTestWindowEvalExpression(rendererExpr);
+  const mainExpr = rendererTestWindowEvalExpression(rendererExpr, true);
   return evaluateInMainProcessForTests(mainExpr, 12000);
 }
 
@@ -4988,7 +8736,11 @@ async function resolvePreviewIdentifierFromWorkspaceScan(
   return null;
 }
 
-async function previewTypeHandler(docUriStr: string, identifier: string, dedupeRendererClick = true): Promise<void> {
+async function previewTypeHandler(
+  docUriStr: string,
+  identifier: string,
+  dedupeRendererClick = true,
+): Promise<void> {
   if (identifier.length <= 2) { return; }
   const t0 = Date.now();
   const ms = () => `${Date.now() - t0}ms`;
@@ -5003,6 +8755,8 @@ async function previewTypeHandler(docUriStr: string, identifier: string, dedupeR
     return;
   }
   const anchorUriKey = hoverRequestUriKey(anchorPos.uri);
+  const originScrollState = currentPreviewState?.originScrollState
+    ?? (previewHistory.length === 0 ? await capturePreviewScrollStateInRenderer() : undefined);
   if (dedupeRendererClick) {
     if (currentPreviewState?.identifier === identifier
       && previewStateMatchesHoverRequest(currentPreviewState, anchorUriKey, anchorPos.line, anchorPos.character)) {
@@ -5038,10 +8792,14 @@ async function previewTypeHandler(docUriStr: string, identifier: string, dedupeR
     loc = declaredInPreview;
     log.info(`preview:   loc from preview declaration: ${vscode.workspace.asRelativePath(loc.uri)}:${loc.range.start.line + 1}:${loc.range.start.character + 1}`);
   }
+  const preferDefinitionProvider = preferDefinitionProviderForPreviewIdentifier(identifier);
+  if (!loc && preferDefinitionProvider) {
+    loc = await resolvePreviewIdentifierViaDefinitionProvider(identifier, docUriStr, ms);
+  }
   let originFs = '';
   try { if (docUriStr) { originFs = vscode.Uri.parse(docUriStr).fsPath; } } catch {}
   if (!originFs) { originFs = vscode.window.activeTextEditor?.document.uri.fsPath ?? ''; }
-  if (!loc && originFs && indexManager) {
+  if (!loc && originFs && indexManager && !preferDefinitionProvider) {
     try {
       const fastHit = await fastResolveTypeName(identifier, originFs, findOpenDoc(vscode.Uri.file(originFs)));
       if (fastHit) {
@@ -5088,6 +8846,13 @@ async function previewTypeHandler(docUriStr: string, identifier: string, dedupeR
   if (!loc) {
     loc = await resolvePreviewIdentifierFromWorkspaceScan(identifier, docUriStr, ms);
   }
+  const builtinPreviewMarkdown = preferDefinitionProvider ? builtinDecoratorPreviewMarkdown(identifier) : null;
+  if (builtinPreviewMarkdown) {
+    loc = loc ?? new vscode.Location(
+      anchorPos.uri,
+      new vscode.Range(anchorPos.line, anchorPos.character, anchorPos.line, anchorPos.character + identifier.length),
+    );
+  }
   if (!loc) {
     log.info(`preview: "${identifier}" no location (${ms()})`);
     return;
@@ -5098,7 +8863,10 @@ async function previewTypeHandler(docUriStr: string, identifier: string, dedupeR
   catch (err) { log.warn(`preview: openDoc error: ${err} (${ms()})`); return; }
 
   let markdown = '';
-  try {
+  if (builtinPreviewMarkdown) {
+    markdown = builtinPreviewMarkdown;
+    log.info(`preview: builtin decorator block ${identifier} md=${markdown.length} (${ms()})`);
+  } else try {
     const startLine = loc.range.start.line;
     const hintedEndLine = loc.range.end.line > startLine ? loc.range.end.line : undefined;
     const sourcePreview = buildDefinitionPreviewResult(identifier, loc.uri, doc, startLine, hintedEndLine);
@@ -5165,6 +8933,7 @@ async function previewTypeHandler(docUriStr: string, identifier: string, dedupeR
     markdown,
     anchor: anchorPos,
     anchorRange,
+    originScrollState,
   };
 
   await applyPreviewStateAsHover(nextPreviewState, ms);
@@ -5174,19 +8943,77 @@ async function previewTypeHandler(docUriStr: string, identifier: string, dedupeR
 async function refireHoverAtAnchor(anchor: { uri: vscode.Uri; line: number; character: number }): Promise<void> {
   const newPos = new vscode.Position(anchor.line, anchor.character);
   const current = vscode.window.activeTextEditor;
-  const editor = current?.document.uri.toString() === anchor.uri.toString()
-    ? current
-    : await vscode.window.showTextDocument(
-        findOpenDoc(anchor.uri) ?? await vscode.workspace.openTextDocument(anchor.uri),
-        { selection: new vscode.Range(newPos, newPos), preserveFocus: false },
-      );
+  const visible = vscode.window.visibleTextEditors.find(editor =>
+    editor.document.uri.toString() === anchor.uri.toString());
+  const doc = findOpenDoc(anchor.uri) ?? await vscode.workspace.openTextDocument(anchor.uri);
+  if (visible?.viewColumn === vscode.ViewColumn.One) {
+    try { await vscode.commands.executeCommand('workbench.action.focusFirstEditorGroup'); } catch {}
+  } else if (visible?.viewColumn === vscode.ViewColumn.Two) {
+    try { await vscode.commands.executeCommand('workbench.action.focusSecondEditorGroup'); } catch {}
+  } else if (visible?.viewColumn === vscode.ViewColumn.Three) {
+    try { await vscode.commands.executeCommand('workbench.action.focusThirdEditorGroup'); } catch {}
+  }
+  const editor = visible
+    ? await vscode.window.showTextDocument(doc, {
+        viewColumn: visible.viewColumn,
+        selection: new vscode.Range(newPos, newPos),
+        preserveFocus: false,
+      })
+    : current?.document.uri.toString() === anchor.uri.toString()
+      ? current
+      : await vscode.window.showTextDocument(
+          doc,
+          { selection: new vscode.Range(newPos, newPos), preserveFocus: false },
+        );
   editor.selection = new vscode.Selection(newPos, newPos);
   editor.revealRange(new vscode.Range(newPos, newPos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+  if (editor.viewColumn === vscode.ViewColumn.One) {
+    try { await vscode.commands.executeCommand('workbench.action.focusFirstEditorGroup'); } catch {}
+  } else if (editor.viewColumn === vscode.ViewColumn.Two) {
+    try { await vscode.commands.executeCommand('workbench.action.focusSecondEditorGroup'); } catch {}
+  } else if (editor.viewColumn === vscode.ViewColumn.Three) {
+    try { await vscode.commands.executeCommand('workbench.action.focusThirdEditorGroup'); } catch {}
+  }
+  try { await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup'); } catch {}
+  await new Promise(resolve => setTimeout(resolve, 80));
+  const lineLength = doc.lineAt(newPos.line).text.length;
+  const resetCharacter = newPos.character > 0 ? 0 : Math.min(lineLength, newPos.character + 1);
+  const resetPos = new vscode.Position(newPos.line, resetCharacter);
+  if (!resetPos.isEqual(newPos)) {
+    editor.selection = new vscode.Selection(resetPos, resetPos);
+    await new Promise(resolve => setTimeout(resolve, 80));
+  }
   await vscode.commands.executeCommand('editor.action.hideHover');
-  await new Promise(resolve => setTimeout(resolve, 35));
+  await new Promise(resolve => setTimeout(resolve, 140));
   await vscode.commands.executeCommand('editor.action.hideHover');
-  await new Promise(resolve => setTimeout(resolve, 10));
-  await vscode.commands.executeCommand('editor.action.showHover');
+  await new Promise(resolve => setTimeout(resolve, 140));
+  const focusEditorGroup = async () => {
+    if (editor.viewColumn === vscode.ViewColumn.One) {
+      try { await vscode.commands.executeCommand('workbench.action.focusFirstEditorGroup'); } catch {}
+    } else if (editor.viewColumn === vscode.ViewColumn.Two) {
+      try { await vscode.commands.executeCommand('workbench.action.focusSecondEditorGroup'); } catch {}
+    } else if (editor.viewColumn === vscode.ViewColumn.Three) {
+      try { await vscode.commands.executeCommand('workbench.action.focusThirdEditorGroup'); } catch {}
+    }
+    try { await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup'); } catch {}
+  };
+  recordPreviewHoverDebug({ kind: "refire-start", uri: anchor.uri.toString(), line: anchor.line, character: anchor.character });
+  const attemptCount = 3;
+  for (let attempt = 0; attempt < attemptCount; attempt++) {
+    await focusEditorGroup();
+    editor.selection = new vscode.Selection(newPos, newPos);
+    editor.revealRange(new vscode.Range(newPos, newPos), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+    try {
+      await vscode.commands.executeCommand("editor.action.showHover");
+      recordPreviewHoverDebug({ kind: "showHover-command", attempt, ok: true, line: newPos.line, character: newPos.character });
+    } catch (err) {
+      recordPreviewHoverDebug({ kind: "showHover-command", attempt, ok: false, error: err instanceof Error ? err.message : String(err) });
+      throw err;
+    }
+    if (attempt < attemptCount - 1) {
+      await new Promise(resolve => setTimeout(resolve, 360));
+    }
+  }
 }
 
 /**
@@ -5209,25 +9036,45 @@ async function previewBackHandler(): Promise<void> {
       log.info(`previewBack: renderer applied "${prev.identifier}" (${ms()})`);
       return;
     }
-    await applyPreviewStateAsHover(prev, ms);
+    await applyPreviewStateAsHover(prev, ms, true);
     return;
   }
   // History empty → back to original LSP hover. Clear our override and
   // refire showHover at the saved anchor; $provideHover will take the
   // genuine LSP path (which also clears state via the fresh-hover branch,
   // but we clear here for clarity).
-  const anchor = currentPreviewState.anchor;
+  const anchor = currentPreviewState.anchorRange
+    ? centerPositionOfRange(currentPreviewState.anchorRange)
+    : currentPreviewState.anchor;
+  const anchorRef = {
+    uri: currentPreviewState.anchor.uri,
+    line: anchor.line,
+    character: anchor.character,
+  };
+  const originScrollState = currentPreviewState.originScrollState;
   pendingPreviewHover = null;
   previewHoverSuppressUntil = 0;
   previewHoverSuppressKey = null;
   previewHoverSuppressCount = 0;
   currentPreviewState = null;
-  log.info(`previewBack: → original LSP hover at ${anchor.line}:${anchor.character} (${ms()})`);
+  log.info(`previewBack: → original native hover at ${anchorRef.line}:${anchorRef.character} (${ms()})`);
+  await clearRendererPreviewNavigationStateInRenderer();
   try {
-    await refireHoverAtAnchor(anchor);
+    await Promise.race([
+      markRendererNativeHoverRefireGrace(1800),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('native refire grace timed out')), 900)),
+    ]).catch(err => log.warn(`previewBack: native refire grace warning: ${err} (${ms()})`));
+    await Promise.race([
+      refireHoverAtAnchor(anchorRef),
+      new Promise((_, reject) => setTimeout(() => reject(new Error('native refire timed out')), 4200)),
+    ]);
+    if (originScrollState) {
+      await restorePreviewScrollStateInRenderer(originScrollState);
+    }
   } catch (err) {
-    log.warn(`previewBack: hide+showHover error: ${err} (${ms()})`);
+    log.warn(`previewBack: native refire error: ${err} (${ms()})`);
   }
+  await clearRendererPreviewNavigationStateInRenderer();
   pendingPreviewHover = null;
   previewHoverSuppressUntil = 0;
   previewHoverSuppressKey = null;
@@ -5244,30 +9091,84 @@ async function previewBackHandler(): Promise<void> {
  * Code's native pipeline picks up the override. Shared by drill-down
  * and back.
  */
-async function applyPreviewStateAsHover(state: PreviewState, ms: () => string): Promise<void> {
-  if (await shouldUseDirectRendererPreviewApply() && await applyPreviewStateInRenderer(state, false)) {
+async function requestRendererNativeHoverRefire(identifier: string, markdown: string, source: string): Promise<void> {
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) {
+    try { await runRendererInjection(injectRenderer); } catch {}
+  }
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) { return; }
+  const rendererExpr = `
+    (function() {
+      try {
+        if (typeof window.irShowHoverFallback !== 'function') {
+          return { ok: false, reason: 'missing-irShowHoverFallback', patchVersion: Number(window.__irPatchVersion) || 0 };
+        }
+        try { window.__irNativePreviewBackUntil = Date.now() + 6000; } catch (_) {}
+        return window.irShowHoverFallback(${jsonStringifyAscii(identifier)}, ${jsonStringifyAscii(markdown)}, {
+          source: ${jsonStringifyAscii(source)}
+        });
+      } catch (e) {
+        return { ok: false, reason: String(e && e.message || e), patchVersion: Number(window.__irPatchVersion) || 0 };
+      }
+    })()
+  `.trim();
+  try {
+    const rows = await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpr, true), 1600);
+    const value = (rows || []).map((row: any) => row?.value).find(Boolean);
+    recordPreviewHoverDebug({ kind: "renderer-refire", identifier, source, value: value || null });
+  } catch (err) {
+    recordPreviewHoverDebug({ kind: "renderer-refire-error", identifier, source, error: err instanceof Error ? err.message : String(err) });
+    log.warn("preview: renderer native refire prep failed: " + (err instanceof Error ? err.message : String(err)));
+  }
+}
+
+async function applyPreviewStateAsHover(state: PreviewState, ms: () => string, fromBack = false): Promise<void> {
+  if (await shouldUseDirectRendererPreviewApply() && await applyPreviewStateInRenderer(state, fromBack)) {
     log.info(`preview: "${state.identifier}" renderer applied hist=${previewHistory.length} (${state.markdown.length}md, ${ms()})`);
     return;
   }
-  const renderedMarkdown = `[$(arrow-left) Back](command:intellisenseRecursion.previewBack "Back")\n\n${state.markdown}`;
+  const renderedMarkdown = state.markdown;
+  const renderedMarkdownContent = {
+    value: renderedMarkdown,
+    isTrusted: true,
+    supportThemeIcons: true,
+  };
   const anchorDoc = findOpenDoc(state.anchor.uri);
   const pendingRange = internalRangeFromVsCode(state.anchorRange)
     ?? internalFullWordRangeAt(anchorDoc, new vscode.Position(state.anchor.line, state.anchor.character));
   pendingPreviewHover = {
     identifier: state.identifier,
-    contents: [{ value: renderedMarkdown, isTrusted: true, supportThemeIcons: true }],
+    contents: [renderedMarkdownContent],
     range: pendingRange,
     anchorUriKey: hoverRequestUriKey(state.anchor.uri),
     anchorLine: state.anchor.line,
     anchorCharacter: state.anchor.character,
     expiresAt: Date.now() + 3000,
   };
+  recordPreviewHoverDebug({
+    kind: "pending-set",
+    identifier: state.identifier,
+    anchorUriKey: pendingPreviewHover.anchorUriKey,
+    anchorLine: pendingPreviewHover.anchorLine,
+    anchorCharacter: pendingPreviewHover.anchorCharacter,
+    hasRange: !!pendingPreviewHover.range,
+    range: pendingPreviewHover.range || null,
+    markdownLength: renderedMarkdown.length,
+  });
   previewHoverSuppressUntil = 0;
   previewHoverSuppressKey = null;
   previewHoverSuppressCount = 0;
 
   try {
+    await markRendererNativeHoverRefireGrace(2400).catch(() => {});
+    recordPreviewHoverDebug({
+      kind: "renderer-refire-native-only",
+      identifier: state.identifier,
+      source: fromBack ? 'preview-back-native' : 'preview-forward-native',
+    });
     await refireHoverAtAnchor(state.anchor);
+    if (fromBack && state.scrollState) {
+      await restorePreviewScrollStateInRenderer(state.scrollState);
+    }
     log.info(`preview: "${state.identifier}" hide+showHover hist=${previewHistory.length} (${state.markdown.length}md, ${ms()})`);
   } catch (err) {
     log.warn(`preview: hide+showHover error: ${err} (${ms()})`);
@@ -5425,14 +9326,40 @@ window.__irTimers = [];
 window.__irActiveHoverHandleObserver = null;
 window.__irPatchVersion = IR_PATCH_VERSION;
 window.__irScanLogCount = 0;
+window.__irScanDecisionLogCount = 0;
 window.__irWrapLogCount = 0;
 window.__irPointWrapLogCount = 0;
 window.__irStaleHoverLogCount = 0;
 window.__irInactiveScanSkipLogCount = 0;
 window.__irEmptyHoverRootSkipLogCount = 0;
+window.__irHoverMissClickLogCount = 0;
+window.__irLinkPointerEventLogCount = 0;
+window.__irHoverGuardLinkLogCount = 0;
+window.__irPointerActionLogCount = 0;
+window.__irHoverLifecycleLogCount = 0;
+window.__irLazyHoverLifecycleLogCount = 0;
+window.__irHiddenActiveHoverLogCount = 0;
+window.__irHoverGuardOutsideLogCount = 0;
+window.__irHoverGuardNoLinkLogCount = 0;
+window.__irPointWrapRejectLogCount = 0;
+window.__irNearLinkLogCount = 0;
+window.__irPendingLinkPointerDown = null;
 window.__irHoverPatched = true;  // legacy compat
 
-function irLog(msg){if(typeof window.irGoToType==='function')window.irGoToType('LOG:'+msg)}
+function irLogPrefix(){
+  try{
+    var meta=window.__irHostWindowMeta||{};
+    var id=meta.id||window.__irHostWindowId||'?';
+    var title=String(meta.title||window.__irHostWindowTitle||document.title||'').replace(/\\s+/g,' ').slice(0,80);
+    return 'renderer[w='+id+' v='+IR_PATCH_VERSION+(title?' title='+title:'')+']: ';
+  }catch(_){return 'renderer[w=? v='+IR_PATCH_VERSION+']: '}
+}
+function irLog(msg){
+  if(typeof window.irGoToType!=='function')return;
+  var text=String(msg||'');
+  if(text.indexOf('renderer:')===0)text=text.slice('renderer:'.length).replace(/^\\s+/,'');
+  window.irGoToType('LOG:'+irLogPrefix()+text);
+}
 irLog('renderer: patch v'+IR_PATCH_VERSION+' installing');
 
 function track(target, type, fn, capture){
@@ -5470,11 +9397,17 @@ function irPruneDetachedHoverState(){
       window.__irHistory=[];
       window.__irHistoryCurrent=null;
     }
+    if(window.__irOriginalHoverSnapshot&&(!window.__irOriginalHoverSnapshot.hoverEl||!body.contains(window.__irOriginalHoverSnapshot.hoverEl))){
+      window.__irOriginalHoverSnapshot=null;
+    }
     if(window.__irLastPreviewTarget&&!body.contains(window.__irLastPreviewTarget)){
       window.__irLastPreviewTarget=null;
     }
     if(window.__irActiveHoverEl&&!body.contains(window.__irActiveHoverEl)){
       window.__irActiveHoverEl=null;
+    }else if(irDisposeHiddenActiveHover('prune')){
+      // The active hover was a hidden/zero-rect VS Code shell. It must not
+      // keep receiving drill-down/link state after VS Code has dismissed it.
     }else if(window.__irActiveHoverEl){
       if(!irStoredPreviewTarget(window.__irActiveHoverEl)){
         window.__irActiveHoverEl.__irPrimaryPreviewTarget=null;
@@ -5525,7 +9458,9 @@ window.__irCleanup=function(reason){
     window.__irHistoryFor=null;
     window.__irHistory=[];
     window.__irHistoryCurrent=null;
+    window.__irOriginalHoverSnapshot=null;
     window.__irLastPreviewTarget=null;
+    window.__irPendingLinkPointerDown=null;
     window.__irActiveHoverEl=null;
     window.__irInactiveScanSkipLogCount=0;
     window.__irMonacoCaps=null;
@@ -5597,6 +9532,7 @@ style.textContent=[
   '.ir-native-hover-handle-hidden{display:none !important;visibility:hidden !important;pointer-events:none !important;opacity:0 !important;width:0 !important;height:0 !important;min-width:0 !important;min-height:0 !important;max-width:0 !important;max-height:0 !important;border:0 !important;outline:0 !important;box-shadow:none !important;background:transparent !important}',
   '.ir-hover-artifact-hidden{display:none !important;visibility:hidden !important;pointer-events:none !important;opacity:0 !important}',
   '.ir-stale-hover{display:none !important;visibility:hidden !important;pointer-events:none !important}',
+  '.ir-empty-hover-root,.ir-empty-hover-root *{pointer-events:none !important}',
 ].join('');
 document.head.appendChild(style);
 window.__irStyleEl = style;
@@ -5612,6 +9548,69 @@ function irClosestTypeLink(target){
 function irClosestHover(target){
   var el=irEventElement(target);
   return el&&el.closest?el.closest('.monaco-hover, .monaco-editor-hover'):null;
+}
+function irShortClassName(el){
+  try{return el?String(el.className||'').replace(/\\s+/g,' ').slice(0,120):''}catch(_){return ''}
+}
+function irShortText(el,len){
+  try{return String((el&&el.textContent)||'').replace(/\\s+/g,' ').slice(0,len||120)}catch(_){return ''}
+}
+function irRectBrief(el){
+  try{
+    if(!el||!el.getBoundingClientRect)return 'none';
+    var r=el.getBoundingClientRect();
+    return Math.round(r.left)+','+Math.round(r.top)+','+Math.round(r.width)+'x'+Math.round(r.height);
+  }catch(_){return 'err'}
+}
+function irElementBrief(el){
+  try{
+    if(!el)return 'none';
+    return String(el.tagName||el.nodeName||'?').toLowerCase()
+      +' class='+irShortClassName(el)
+      +' text='+JSON.stringify(irShortText(el,60))
+      +' rect='+irRectBrief(el);
+  }catch(_){return 'err'}
+}
+function irEventPointBrief(e){
+  try{
+    if(!e||typeof e.clientX!=='number'||typeof e.clientY!=='number')return 'point=none';
+    return 'point='+Math.round(e.clientX)+','+Math.round(e.clientY);
+  }catch(_){return 'point=err'}
+}
+function irFindNearbyTypeLink(e,hover,maxX,maxY){
+  try{
+    if(!hover||!hover.querySelectorAll||!e||typeof e.clientX!=='number'||typeof e.clientY!=='number')return null;
+    var x=e.clientX,y=e.clientY;
+    var links=hover.querySelectorAll('.ir-type-link');
+    var best=null,bestScore=Infinity;
+    for(var i=0;i<links.length;i++){
+      var link=links[i];
+      if(!link||!document.body.contains(link))continue;
+      var r=link.getBoundingClientRect&&link.getBoundingClientRect();
+      if(!r||r.width<=0||r.height<=0)continue;
+      if(y<r.top-maxY||y>r.bottom+maxY)continue;
+      if(x<r.left-maxX||x>r.right+maxX)continue;
+      var dx=x<r.left?r.left-x:(x>r.right?x-r.right:0);
+      var dy=y<r.top?r.top-y:(y>r.bottom?y-r.bottom:0);
+      var score=(dx*dx)+(dy*dy);
+      if(score<bestScore){
+        bestScore=score;
+        best={link:link,dx:Math.round(dx),dy:Math.round(dy),score:Math.round(Math.sqrt(score)),rect:Math.round(r.left)+','+Math.round(r.top)+','+Math.round(r.width)+'x'+Math.round(r.height)};
+      }
+    }
+    return best;
+  }catch(_){return null}
+}
+function irUseNearbyTypeLink(e,hover,reason){
+  var near=irFindNearbyTypeLink(e,hover,26,10);
+  if(!near||!near.link)return null;
+  irSetPointActiveLink(near.link);
+  try{irMarkHoverManaged(hover,true)}catch(_){}
+  if(window.__irNearLinkLogCount<40){
+    window.__irNearLinkLogCount++;
+    irLog('renderer: near-link '+(reason||'')+' "'+(near.link.getAttribute&&near.link.getAttribute('data-type')||'')+'" '+irEventPointBrief(e)+' dx='+near.dx+' dy='+near.dy+' linkRect='+near.rect+' target='+irElementBrief(irEventElement(e&&e.target)));
+  }
+  return near.link;
 }
 function irPreviewTargetIsUsable(hoverEl,target){
   try{
@@ -5678,14 +9677,187 @@ function irEnsureHoverPointer(hoverEl){
     if(sc)sc.style.pointerEvents='auto';
   }catch(_){}
 }
+function irClearPendingTypeLinkPointerDown(link,reason){
+  try{
+    var pending=window.__irPendingLinkPointerDown;
+    if(!pending)return;
+    if(link&&pending.link&&pending.link!==link)return;
+    if(pending.timer)irClearTimer(pending.timer);
+    if(window.__irPointerActionLogCount<140){
+      window.__irPointerActionLogCount++;
+      irLog('renderer: pointerdown fallback canceled "'+(pending.typeName||'')+'" reason='+(reason||'clear')+' matched='+(link?pending.link===link:'any'));
+    }
+    window.__irPendingLinkPointerDown=null;
+  }catch(_){window.__irPendingLinkPointerDown=null}
+}
+function irRunTypeLinkAction(link,e,source,typeNameOverride,previewTargetOverride,modifiers){
+  var typeName=typeNameOverride||(link&&link.getAttribute&&link.getAttribute('data-type'));
+  if(!typeName)return false;
+  var hover=link?irClosestHover(link):null;
+  irMarkHoverManaged(hover,true);
+  if(e){
+    try{e.preventDefault()}catch(_){}
+    try{e.stopImmediatePropagation()}catch(_){}
+  }
+  var meta=modifiers?!!modifiers.metaKey:!!(e&&(e.metaKey||e.ctrlKey)&&e.metaKey);
+  var ctrl=modifiers?!!modifiers.ctrlKey:!!(e&&e.ctrlKey);
+  if(meta||ctrl){
+    irLog('renderer: cmd-'+source+' on "'+typeName+'"');
+    if(typeof window.irGoToType==='function'){window.irGoToType(typeName)}
+  }else{
+    var anc=previewTargetOverride||null;
+    if(!anc&&link)anc=irPreviewTargetForLink(link);
+    window.__irLastPreviewTarget=anc;
+    irLog('renderer: plain-'+source+' on "'+typeName+'" previewTarget='+irElementBrief(anc)+' hover={'+irHoverBrief(link?irClosestHover(link):null)+'}');
+    if(typeof window.irGoToType==='function'){window.irGoToType('PREVIEW:'+typeName)}
+  }
+  return true;
+}
+function irScheduleTypeLinkPointerDownFallback(link,e){
+  if(!link)return;
+  var typeName=link.getAttribute&&link.getAttribute('data-type');
+  if(!typeName)return;
+  var target=irPreviewTargetForLink(link);
+  window.__irLastPreviewTarget=target;
+  irClearPendingTypeLinkPointerDown(null,'replace');
+  var modifiers={metaKey:!!(e&&e.metaKey),ctrlKey:!!(e&&e.ctrlKey)};
+  if(window.__irPointerActionLogCount<140){
+    window.__irPointerActionLogCount++;
+    irLog('renderer: pointerdown fallback scheduled "'+typeName+'" event='+(e&&e.type||'')+' target='+irElementBrief(target)+' hover={'+irHoverBrief(irClosestHover(link))+'}');
+  }
+  var timer=irSetTimer(function(){
+    try{
+      var pending=window.__irPendingLinkPointerDown;
+      if(!pending||pending.link!==link)return;
+      window.__irPendingLinkPointerDown=null;
+      if(window.__irPointerActionLogCount<140){
+        window.__irPointerActionLogCount++;
+        irLog('renderer: pointerdown fallback firing "'+typeName+'" connected='+(document.body&&document.body.contains(link))+' target='+irElementBrief(target)+' hover={'+irHoverBrief(irClosestHover(link))+'}');
+      }
+      irRunTypeLinkAction(link,null,'pointerdown-fallback',typeName,target,modifiers);
+    }catch(_){}
+  },180);
+  window.__irPendingLinkPointerDown={link:link,typeName:typeName,target:target,timer:timer,at:Date.now(),modifiers:modifiers};
+}
+function irPointWordSummary(e,hover){
+  try{
+    var range=irPointRange(e);
+    var node=range&&range.startContainer;
+    if(!node)return ' '+irEventPointBrief(e)+' word=none range=none';
+    if(node.nodeType!==3)return ' '+irEventPointBrief(e)+' word=none nodeType='+node.nodeType;
+    var parent=node.parentNode&&node.parentNode.nodeType===1?node.parentNode:node.parentElement;
+    var info=irWordAtOffset(node.nodeValue||'',range.startOffset||0);
+    if(!info)return ' '+irEventPointBrief(e)+' word=none parent='+irElementBrief(parent);
+    var block=parent&&parent.closest?parent.closest('.rendered-markdown'):null;
+    var hasCandidates=!!(block&&block.__irHoverLinkCandidates);
+    var known=!!(block&&irBlockCandidateAllowsWord(block,info.word));
+    var lower=irPointAllowsLowerCallable(node,info);
+    var decorator=!!(block&&irPointAllowsDecorator(node,info,block));
+    return ' '+irEventPointBrief(e)+' word='+JSON.stringify(info.word)
+      +' offset='+String(range.startOffset||0)
+      +' parent='+irElementBrief(parent)
+      +' blockText='+(block?String(block.textContent||'').length:0)
+      +' hasCandidates='+hasCandidates
+      +' known='+known
+      +' lowerCallable='+lower
+      +' decorator='+decorator
+      +' inHover='+(hover&&block?hover.contains(block):false);
+  }catch(err){return ' wordSummaryError='+String(err&&err.message||err)}
+}
+function irLogHoverPointerMiss(e,kind){
+  try{
+    var missHover=irClosestHover(e&&e.target);
+    if(!missHover||window.__irHoverMissClickLogCount>=80)return;
+    window.__irHoverMissClickLogCount++;
+    var pointEl=(typeof document.elementFromPoint==='function'&&typeof e.clientX==='number')
+      ? document.elementFromPoint(e.clientX,e.clientY)
+      : null;
+    var targetEl=irEventElement(e&&e.target);
+    var pointCls=pointEl?String(pointEl.className||''):'';
+    var targetCls=targetEl?String(targetEl.className||''):'';
+    irLog('renderer: hover '+kind+' without link event='+(e&&e.type||'')+' target='+targetCls.slice(0,120)
+      +' point='+pointCls.slice(0,120)
+      +' hoverText='+(missHover.textContent||'').length
+      +' links='+(missHover.querySelectorAll?missHover.querySelectorAll('.ir-type-link').length:0)
+      +' empty='+(missHover.classList&&missHover.classList.contains('ir-empty-hover-root'))
+      +' hoverRect='+irRectBrief(missHover)
+      +' '+irEventPointBrief(e)
+      +irPointWordSummary(e,missHover));
+  }catch(_){}
+}
+function irHoverBrief(hoverEl){
+  try{
+    if(!hoverEl)return 'none';
+    var visibility=irHoverRootVisibility(hoverEl);
+    return 'rect='+irRectBrief(hoverEl)
+      +' textLen='+String((hoverEl.textContent||'').length)
+      +' links='+(hoverEl.querySelectorAll?hoverEl.querySelectorAll('.ir-type-link').length:0)
+      +' connected='+(document.body&&document.body.contains(hoverEl))
+      +' active='+(window.__irActiveHoverEl===hoverEl)
+      +' renderable='+(visibility&&visibility.visible)
+      +' visibilityReason='+(visibility&&visibility.reason||'')
+      +' cls='+irShortClassName(hoverEl)
+      +' sample='+JSON.stringify(irShortText(hoverEl,80));
+  }catch(_){return 'err'}
+}
+function irLinkBrief(link){
+  try{
+    if(!link)return 'none';
+    return '"'+String(link.getAttribute&&link.getAttribute('data-type')||'')+'" '+irElementBrief(link);
+  }catch(_){return 'err'}
+}
+function irNearestLinkTrace(e,hover){
+  try{
+    var near=irFindNearbyTypeLink(e,hover,32,14);
+    return near?' nearest="'+(near.link.getAttribute&&near.link.getAttribute('data-type')||'')+'" dx='+near.dx+' dy='+near.dy+' rect='+near.rect:' nearest=none';
+  }catch(_){return ' nearest=err'}
+}
+function irLogPointerActionTrace(e,stage,link,resolution){
+  try{
+    if(window.__irPointerActionLogCount>=140)return;
+    irDisposeHiddenActiveHover('pointer-'+(stage||''));
+    var targetEl=irEventElement(e&&e.target);
+    var pointEl=(typeof document.elementFromPoint==='function'&&typeof e.clientX==='number')?document.elementFromPoint(e.clientX,e.clientY):null;
+    var hover=irClosestHover(targetEl)||(link?irClosestHover(link):null);
+    var activeHover=window.__irActiveHoverEl&&document.body.contains(window.__irActiveHoverEl)?window.__irActiveHoverEl:null;
+    if(!link&&!hover&&!activeHover)return;
+    window.__irPointerActionLogCount++;
+    var activeLink=window.__irPointActiveLink&&document.body.contains(window.__irPointActiveLink)?window.__irPointActiveLink:null;
+    irLog('renderer: pointer-action stage='+stage
+      +' event='+(e&&e.type||'')
+      +' resolution='+(resolution||'')
+      +' '+irEventPointBrief(e)
+      +' link='+irLinkBrief(link)
+      +' activeLink='+irLinkBrief(activeLink)
+      +' target='+irElementBrief(targetEl)
+      +' point='+irElementBrief(pointEl)
+      +' hover={'+irHoverBrief(hover)+'}'
+      +' activeHover={'+irHoverBrief(activeHover)+'}'
+      +irNearestLinkTrace(e,hover||activeHover));
+  }catch(_){}
+}
 
 // Eat mousedown on type-links so VS Code's selection / focus-change
 // logic can't fire before our click handler — some hover widgets
 // dismiss on mousedown outside the editor.
 function irTypeLinkPointerDown(e){
-  var link=irClosestTypeLink(e.target)||irWrapWordAtPoint(e);
-  if(!link)return;
+  var directLink=irClosestTypeLink(e.target);
+  var wrappedLink=null;
+  if(!directLink)wrappedLink=irWrapWordAtPoint(e);
+  var link=directLink||wrappedLink;
+  irLogPointerActionTrace(e,'pointerdown-capture',link,directLink?'direct':(wrappedLink?'wrapped':'none'));
+  if(!link){
+    irLogHoverPointerMiss(e,'pointerdown');
+    irDisposeActiveHoverForEditorTarget(e,'pointerdown-no-link');
+    return;
+  }
+  if(window.__irPointerActionLogCount<140){
+    window.__irPointerActionLogCount++;
+    var pointEl=(typeof document.elementFromPoint==='function'&&typeof e.clientX==='number')?document.elementFromPoint(e.clientX,e.clientY):null;
+    irLog('renderer: link '+(e&&e.type||'pointerdown')+' "'+(link.getAttribute&&link.getAttribute('data-type')||'')+'" target='+irElementBrief(irEventElement(e&&e.target))+' point='+irElementBrief(pointEl)+' link='+irElementBrief(link)+' hoverRect='+irRectBrief(irClosestHover(link)));
+  }
   irMarkHoverManaged(irClosestHover(link),true);
+  irScheduleTypeLinkPointerDownFallback(link,e);
   e.preventDefault();
   e.stopImmediatePropagation();
 }
@@ -5698,15 +9870,14 @@ track(document,'mousedown',irTypeLinkPointerDown,true);
 //  1) Mouse INSIDE the drill-down hover → block VS Code\\'s capture-phase
 //     dismiss handler (it uses a cached 0-depth bbox so it would fire
 //     when the cursor moves into our expanded area).
-//  2) Mouse OUTSIDE the drill-down hover but the hover is "sticky"
-//     (drill-down was just applied / depth just changed; user has not
-//     yet moved their cursor INTO the hover) → block dismiss until
-//     they enter. Once inside, we keep a short grace window instead of
-//     clearing immediately; VS Code otherwise dismisses too eagerly when
-//     the cursor clips an edge while scrolling or moving between rows.
+//  2) Mouse OUTSIDE but near the drill-down hover gets a short grace window.
+//     Far-away editor movement stays visible to VS Code even immediately
+//     after the cursor was inside the panel, otherwise the first sticky hover
+//     starves the next native hover of pointer events.
 var IR_HOVER_INITIAL_STICKY_MS=5000;
 var IR_HOVER_EXIT_GRACE_MS=1800;
 var IR_HOVER_NEAR_PX=56;
+var IR_HOVER_FRESH_EDITOR_GRACE_MS=120;
 function irHoverHasManagedContent(hoverEl){
   if(!hoverEl)return false;
   if(hoverEl.classList&&hoverEl.classList.contains('ir-keepalive'))return true;
@@ -5725,6 +9896,135 @@ function irArmHoverSticky(hoverEl, ms){
     }catch(_){}
   },ms+50);
 }
+function irReleaseHoverSticky(hoverEl){
+  if(!hoverEl||!hoverEl.classList)return;
+  try{hoverEl.classList.remove('ir-sticky')}catch(_){}
+  try{hoverEl.__irStickyUntil=0}catch(_){}
+  try{hoverEl.__irLastInsideAt=0}catch(_){}
+  try{
+    if(hoverEl.__irStickyTimer){
+      irClearTimer(hoverEl.__irStickyTimer);
+      hoverEl.__irStickyTimer=null;
+    }
+  }catch(_){}
+}
+function irRequestNativeHideHover(reason){
+  try{
+    if(typeof window.irGoToType==='function'){
+      window.irGoToType('HIDE_HOVER:'+(reason||'release'));
+    }
+  }catch(_){}
+}
+function irRequestNativeShowHover(reason){
+  try{
+    var now=Date.now();
+    if(window.__irNativeShowHoverRequestedAt&&now-window.__irNativeShowHoverRequestedAt<260)return;
+    window.__irNativeShowHoverRequestedAt=now;
+    if(typeof window.irGoToType==='function'){
+      window.irGoToType('SHOW_HOVER:'+(reason||'release'));
+    }
+  }catch(_){}
+}
+function irResetNativeHoverMutations(hoverEl){
+  if(!hoverEl)return;
+  try{
+    var rootProps=['--ir-hover-width','--ir-hover-height','width','height','max-width','max-height','min-width','min-height','overflow','overflow-x','overflow-y','box-sizing','margin-left','margin-top','pointer-events','display','visibility','opacity'];
+    for(var i=0;i<rootProps.length;i++)hoverEl.style.removeProperty(rootProps[i]);
+    var nodes=[];
+    var selectors='.monaco-scrollable-element,.monaco-hover-content,.hover-row,.hover-row-contents,.hover-contents,.markdown-hover,.rendered-markdown';
+    if(hoverEl.querySelectorAll){
+      var found=hoverEl.querySelectorAll(selectors);
+      for(var fi=0;fi<found.length;fi++)nodes.push(found[fi]);
+    }
+    var props=['width','height','max-width','max-height','min-width','min-height','overflow','overflow-x','overflow-y','scrollbar-width','scrollbar-color','overscroll-behavior','position','box-sizing','transform','top','left'];
+    for(var ni=0;ni<nodes.length;ni++){
+      var node=nodes[ni];
+      if(!node||!node.style)continue;
+      for(var pi=0;pi<props.length;pi++)node.style.removeProperty(props[pi]);
+    }
+  }catch(_){}
+}
+function irMarkNativeHoverReleased(hoverEl,reason,hideVisual){
+  try{
+    if(!hoverEl)return;
+    var releasedText=String(hoverEl.textContent||'');
+    hoverEl.__irReleasedAt=Date.now();
+    hoverEl.__irReleasedText=releasedText;
+    hoverEl.__irReleaseHideVisualRequested=!!hideVisual;
+    hoverEl.__irPrimaryPreviewTarget=null;
+    hoverEl.__irPreviewAppliedAt=0;
+    hoverEl.__irStickyUntil=0;
+    hoverEl.__irLastInsideAt=0;
+    try{if(hoverEl.__irReleaseRemoveTimer)irClearTimer(hoverEl.__irReleaseRemoveTimer)}catch(_){}
+    hoverEl.__irReleaseRemoveTimer=null;
+    if(hoverEl.classList)hoverEl.classList.add('ir-native-released-hover');
+    if(hoverEl.setAttribute)hoverEl.setAttribute('data-ir-native-released-hover','1');
+    if(window.__irHoverLifecycleLogCount<120){
+      window.__irHoverLifecycleLogCount++;
+      irLog('renderer: native hover released retained '+(reason||'')+' hideVisual='+(hideVisual?'1':'0')+' textLen='+releasedText.length);
+    }
+  }catch(_){}
+}
+function irReleaseNativeHoverManagement(hoverEl,reason){
+  if(!hoverEl||!hoverEl.classList)return false;
+  var beforeBrief=irHoverBrief(hoverEl);
+  var releaseReason=String(reason||'release');
+  var removedForRelocation=false;
+  var hostHideRequested=false;
+  try{if(hoverEl.__irStickyTimer)irClearTimer(hoverEl.__irStickyTimer)}catch(_){}
+  try{if(hoverEl.__irFitFrame)cancelAnimationFrame(hoverEl.__irFitFrame)}catch(_){}
+  try{irClearHoverHandleCleanup(hoverEl)}catch(_){}
+  try{irResetHoverViewportShift(hoverEl)}catch(_){}
+  try{irHideHoverNativeHandles(hoverEl,true)}catch(_){}
+  try{
+    hoverEl.__irPrimaryPreviewTarget=null;
+    hoverEl.__irPreviewAppliedAt=0;
+    hoverEl.__irStickyUntil=0;
+    hoverEl.__irLastInsideAt=0;
+    hoverEl.classList.remove('ir-scrollable','ir-sticky','ir-size-small','ir-size-medium','ir-size-large','ir-keepalive','ir-empty-hover-root','ir-native-released-hover');
+    if(hoverEl.removeAttribute){
+      hoverEl.removeAttribute('data-ir-empty-hover-root');
+      hoverEl.removeAttribute('data-ir-native-released-hover');
+    }
+    if(hoverEl.style){
+      if(hoverEl.style.pointerEvents==='none')hoverEl.style.removeProperty('pointer-events');
+      if(hoverEl.style.display==='none')hoverEl.style.removeProperty('display');
+    }
+    irResetNativeHoverMutations(hoverEl);
+    irMarkNativeHoverReleased(hoverEl,releaseReason,releaseReason.indexOf('outside-editor')>=0);
+  }catch(_){}
+  try{
+    if(window.__irActiveHoverEl===hoverEl)window.__irActiveHoverEl=null;
+    if(window.__irHistoryFor===hoverEl){
+      window.__irHistoryFor=null;
+      window.__irHistory=[];
+      window.__irHistoryCurrent=null;
+    }
+    if(window.__irOriginalHoverSnapshot&&window.__irOriginalHoverSnapshot.hoverEl===hoverEl){
+      window.__irOriginalHoverSnapshot=null;
+    }
+    if(window.__irLastPreviewTarget&&irRootContains(hoverEl,window.__irLastPreviewTarget)){
+      window.__irLastPreviewTarget=null;
+    }
+    if(document.activeElement&&(document.activeElement===hoverEl||irRootContains(hoverEl,document.activeElement))){
+      try{document.activeElement.blur&&document.activeElement.blur()}catch(_){}
+      try{document.body&&document.body.focus&&document.body.focus()}catch(_){}
+    }
+  }catch(_){}
+  if(releaseReason.indexOf('outside-editor')>=0){
+    try{
+      if(hoverEl.getAttribute&&hoverEl.getAttribute('data-ir-forced-hover')==='1'&&hoverEl.parentNode){
+        hoverEl.parentNode.removeChild(hoverEl);
+        removedForRelocation=true;
+      }
+    }catch(_){}
+  }
+  if(window.__irHoverLifecycleLogCount<120){
+    window.__irHoverLifecycleLogCount++;
+    irLog('renderer: native hover management released '+releaseReason+' hostHide='+(hostHideRequested?'1':'0')+' removed='+(removedForRelocation?'1':'0')+' victim={'+beforeBrief+'}');
+  }
+  return true;
+}
 function irMarkHoverManaged(hoverEl, sticky){
   if(!hoverEl||!hoverEl.classList)return;
   hoverEl.classList.add('ir-keepalive');
@@ -5741,12 +10041,203 @@ function irIsPointerNearHover(hoverEl,e){
       e.clientY>=r.top-IR_HOVER_NEAR_PX&&e.clientY<=r.bottom+IR_HOVER_NEAR_PX;
   }catch(_){return false}
 }
+function irIsHoverRelocationEvent(e){
+  return !!(e&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='pointerover'||e.type==='mouseover'));
+}
+function irClosestNativePopup(target){
+  try{
+    var el=irEventElement(target);
+    if(!el||!el.closest)return null;
+    return el.closest('.suggest-widget,.quick-input-widget,.context-view,.parameter-hints-widget,.monaco-menu,.action-widget,.peekview-widget,.rename-box,.zone-widget,.find-widget,.markers-panel,.notifications-toasts,.notifications-center');
+  }catch(_){return null}
+}
+function irElementIsEditorSurface(el){
+  try{
+    if(!el||!el.closest)return false;
+    if(el.closest('.monaco-hover,.monaco-editor-hover')||irClosestNativePopup(el))return false;
+    return !!el.closest('.monaco-editor');
+  }catch(_){return false}
+}
+function irEventTargetsEditorSurface(e){
+  try{
+    var targetEl=irEventElement(e&&e.target);
+    if(irElementIsEditorSurface(targetEl))return true;
+    var pointEl=(typeof document.elementFromPoint==='function'&&typeof e.clientX==='number'&&typeof e.clientY==='number')
+      ? document.elementFromPoint(e.clientX,e.clientY)
+      : null;
+    return irElementIsEditorSurface(pointEl);
+  }catch(_){return false}
+}
+function irEditorSurfaceUnderHoverPoint(hoverEl,e){
+  try{
+    if(!hoverEl||!e||typeof e.clientX!=='number'||typeof e.clientY!=='number'||typeof document.elementsFromPoint!=='function')return null;
+    var els=document.elementsFromPoint(e.clientX,e.clientY)||[];
+    for(var i=0;i<els.length;i++){
+      var el=irEventElement(els[i]);
+      if(!el)continue;
+      if(irRootContains(hoverEl,el))continue;
+      if(irElementIsEditorSurface(el))return el.closest('.monaco-editor');
+    }
+  }catch(_){}
+  return null;
+}
+function irEventTargetTokenText(e){
+  try{
+    function tokenFromElement(el){
+      try{
+        if(!el)return '';
+        var text=String(el.textContent||'')
+          .replace(/[\u200B-\u200D\uFEFF]/g,'')
+          .replace(/\u00a0/g,' ')
+          .replace(/\\s+/g,' ')
+          .trim();
+        if(!text||text.length>160)return '';
+        if(/^[A-Za-z_$][A-Za-z0-9_$]*$/.test(text)&&text.length<=80)return text;
+        var className=String(el.className||'');
+        if(!/(^|\\s)mtk\\d+(\\s|$)/.test(className))return '';
+        var matches=text.match(/[A-Za-z_$][A-Za-z0-9_$]*/g)||[];
+        if(matches.length===1&&matches[0].length<=80)return matches[0];
+      }catch(_){}
+      return '';
+    }
+    var candidates=[];
+    var targetEl=irEventElement(e&&e.target);
+    if(targetEl)candidates.push(targetEl);
+    var pointEl=(typeof document.elementFromPoint==='function'&&typeof e.clientX==='number'&&typeof e.clientY==='number')
+      ? document.elementFromPoint(e.clientX,e.clientY)
+      : null;
+    pointEl=irEventElement(pointEl);
+    if(pointEl&&pointEl!==targetEl)candidates.push(pointEl);
+    if(typeof document.elementsFromPoint==='function'&&typeof e.clientX==='number'&&typeof e.clientY==='number'){
+      var els=document.elementsFromPoint(e.clientX,e.clientY)||[];
+      for(var i=0;i<els.length&&candidates.length<8;i++){
+        var el=irEventElement(els[i]);
+        if(el&&candidates.indexOf(el)<0)candidates.push(el);
+      }
+    }
+    for(var ci=0;ci<candidates.length;ci++){
+      var token=tokenFromElement(candidates[ci]);
+      if(token)return token;
+    }
+  }catch(_){return ''}
+  return '';
+}
+function irHoverContainsTokenText(hoverEl,token){
+  try{
+    return !!(hoverEl&&token&&token.length>1&&String(hoverEl.textContent||'').indexOf(token)>=0);
+  }catch(_){return false}
+}
+function irHoverRecentlyPreviewApplied(hoverEl){
+  try{
+    return !!(hoverEl&&hoverEl.__irPreviewAppliedAt&&Date.now()-hoverEl.__irPreviewAppliedAt<1200);
+  }catch(_){return false}
+}
+function irRememberPointerEvent(e){
+  try{
+    if(!e||typeof e.clientX!=='number'||typeof e.clientY!=='number')return;
+    window.__irLastPointer={x:e.clientX,y:e.clientY,at:Date.now(),type:String(e.type||'')};
+  }catch(_){}
+}
+function irDisposeActiveHoverForEditorTarget(e,reason){
+  try{
+    var active=window.__irActiveHoverEl&&document.body&&document.body.contains(window.__irActiveHoverEl)
+      ? window.__irActiveHoverEl
+      : null;
+    if(!active||!irHoverHasManagedContent(active))return false;
+    var targetEl=irEventElement(e&&e.target);
+    if(irClosestHover(targetEl))return false;
+    if(irClosestNativePopup(targetEl)){
+      irReleaseHoverSticky(active);
+      irReleaseNativeHoverManagement(active,reason||'native-popup-active-hover');
+      if(window.__irHoverGuardOutsideLogCount<80){
+        window.__irHoverGuardOutsideLogCount++;
+        irLog('renderer: active-hover disposed for native popup reason='+(reason||'')+' event='+(e&&e.type||'')+' target='+irElementBrief(targetEl));
+      }
+      return true;
+    }
+    if(!irElementIsEditorSurface(targetEl)&&!irEventTargetsEditorSurface(e))return false;
+    irReleaseHoverSticky(active);
+    irReleaseNativeHoverManagement(active,reason||'editor-target-active-hover');
+    if(window.__irHoverGuardOutsideLogCount<80){
+      window.__irHoverGuardOutsideLogCount++;
+      irLog('renderer: active-hover disposed for editor target reason='+(reason||'')+' event='+(e&&e.type||'')+' target='+irElementBrief(targetEl)+' '+irEventPointBrief(e));
+    }
+    return true;
+  }catch(_){return false}
+}
 function irHoverGuard(e){
+  try{irDisposeHiddenActiveHover('hoverguard')}catch(_){}
+  if(irClosestNativePopup(e&&e.target)){
+    try{
+      var activeNativeBypass=window.__irActiveHoverEl&&document.body&&document.body.contains(window.__irActiveHoverEl)
+        ? window.__irActiveHoverEl
+        : null;
+      if(activeNativeBypass&&irHoverHasManagedContent(activeNativeBypass)){
+        irReleaseHoverSticky(activeNativeBypass);
+        irReleaseNativeHoverManagement(activeNativeBypass,'native-popup-pass');
+      }else if(activeNativeBypass){
+        irReleaseHoverSticky(activeNativeBypass);
+      }
+      if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+        window.__irHoverGuardOutsideLogCount++;
+        irLog('renderer: hoverguard native-popup-pass event='+e.type+' target='+irElementBrief(irEventElement(e&&e.target))+' active={'+irHoverBrief(activeNativeBypass)+'}');
+      }
+    }catch(_){}
+    return;
+  }
+  try{
+    var activeEditorHover=window.__irActiveHoverEl&&document.body&&document.body.contains(window.__irActiveHoverEl)
+      ? window.__irActiveHoverEl
+      : null;
+    if(activeEditorHover&&irHoverHasManagedContent(activeEditorHover)
+      && irIsHoverRelocationEvent(e)
+      && irEventTargetsEditorSurface(e)
+      && !irClosestHover(e.target)){
+      var editorMoveToken=irEventTargetTokenText(e);
+      if(editorMoveToken&&!irHoverContainsTokenText(activeEditorHover,editorMoveToken)){
+        irReleaseHoverSticky(activeEditorHover);
+        irReleaseNativeHoverManagement(activeEditorHover,"outside-editor-new-token");
+        irRequestNativeShowHover("outside-editor-new-token");
+        if(window.__irHoverGuardOutsideLogCount<80){
+          window.__irHoverGuardOutsideLogCount++;
+          irLog("renderer: hoverguard active-dispose new-token token="+JSON.stringify(editorMoveToken)+" event="+(e&&e.type||"")+" target="+irElementBrief(irEventElement(e&&e.target))+" managed={disposed}");
+        }
+        return;
+      }
+    }
+  }catch(_){}
   var insideHv=irClosestHover(e.target);
   if(insideHv){
     var pointLink=null;
     try{pointLink=irWrapWordAtPoint(e)}catch(_){}
+    if(pointLink&&window.__irHoverGuardLinkLogCount<120&&(e.type==='pointerover'||e.type==='mouseover'||e.type==='pointermove'||e.type==='mousemove')){
+      window.__irHoverGuardLinkLogCount++;
+      irLog('renderer: hoverguard link-active "'+(pointLink.getAttribute&&pointLink.getAttribute('data-type')||'')+'" event='+e.type+' target='+irElementBrief(irEventElement(e.target))+' link='+irElementBrief(pointLink));
+    }else if(!pointLink&&window.__irHoverGuardNoLinkLogCount<120&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+      window.__irHoverGuardNoLinkLogCount++;
+      var near=irFindNearbyTypeLink(e,insideHv,26,10);
+      irLog('renderer: hoverguard no point-link event='+e.type+' '+irEventPointBrief(e)+' target='+irElementBrief(irEventElement(e.target))+' hoverRect='+irRectBrief(insideHv)+(near?' nearest="'+(near.link.getAttribute&&near.link.getAttribute('data-type')||'')+'" dx='+near.dx+' dy='+near.dy+' rect='+near.rect:' nearest=none')+irPointWordSummary(e,insideHv));
+    }
     if(!pointLink&&!irHoverHasManagedContent(insideHv))return;
+    if(!pointLink&&(e.type==='pointermove'||e.type==='mousemove')){
+      var pointElementInsideHover=false;
+      try{
+        var pointElement=(typeof document.elementFromPoint==='function'&&typeof e.clientX==='number'&&typeof e.clientY==='number')
+          ? irEventElement(document.elementFromPoint(e.clientX,e.clientY))
+          : null;
+        pointElementInsideHover=!!(pointElement&&irRootContains(insideHv,pointElement));
+      }catch(_){}
+      var underEditor=pointElementInsideHover?null:irEditorSurfaceUnderHoverPoint(insideHv,e);
+      if(underEditor){
+        irReleaseHoverSticky(insideHv);
+        irReleaseNativeHoverManagement(insideHv,'outside-editor-inside-hover-relocation');
+        if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+          window.__irHoverGuardOutsideLogCount++;
+          irLog('renderer: hoverguard inside-dispose event='+e.type+' underEditor=true sticky='+(insideHv.classList&&insideHv.classList.contains('ir-sticky'))+' target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' hover={disposed}');
+        }
+        return;
+      }
+    }
     irEnsureHoverPointer(insideHv);
     insideHv.__irLastInsideAt=Date.now();
     irArmHoverSticky(insideHv,IR_HOVER_EXIT_GRACE_MS);
@@ -5759,11 +10250,68 @@ function irHoverGuard(e){
   var isSticky=managed.classList&&managed.classList.contains('ir-sticky');
   var recentlyInside=managed.__irLastInsideAt&&now-managed.__irLastInsideAt<IR_HOVER_EXIT_GRACE_MS;
   var near=irIsPointerNearHover(managed,e);
-  if(isSticky||recentlyInside||near){
+  var editorTarget=irIsHoverRelocationEvent(e)&&irEventTargetsEditorSurface(e);
+  if(editorTarget){
+    if(managed.__irActivatedAt&&now-managed.__irActivatedAt<IR_HOVER_FRESH_EDITOR_GRACE_MS){
+      if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+        window.__irHoverGuardOutsideLogCount++;
+        irLog('renderer: hoverguard outside-fresh-pass event='+e.type+' near='+near+' age='+(now-managed.__irActivatedAt)+' target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' managed={'+irHoverBrief(managed)+'}');
+      }
+      return;
+    }
+    var editorToken=irEventTargetTokenText(e);
+    if(editorToken&&near&&irHoverContainsTokenText(managed,editorToken)){
+      irArmHoverSticky(managed,IR_HOVER_EXIT_GRACE_MS);
+      if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+        window.__irHoverGuardOutsideLogCount++;
+        irLog('renderer: hoverguard outside-same-token-pass event='+e.type+' token='+JSON.stringify(editorToken)+' near='+near+' recentlyInside='+!!recentlyInside+' sticky='+!!isSticky+' target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' managed={'+irHoverBrief(managed)+'}');
+      }
+      return;
+    }
+    if(!editorToken&&near&&(isSticky||recentlyInside)){
+      irArmHoverSticky(managed,IR_HOVER_EXIT_GRACE_MS);
+      if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+        window.__irHoverGuardOutsideLogCount++;
+        irLog('renderer: hoverguard outside-unknown-token-near-pass event='+e.type+' near='+near+' recentlyInside='+!!recentlyInside+' sticky='+!!isSticky+' target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' managed={'+irHoverBrief(managed)+'}');
+      }
+      return;
+    }
+    irReleaseHoverSticky(managed);
+    irReleaseNativeHoverManagement(managed,editorToken?'outside-editor-token-relocation':'outside-editor-relocation');
+    irRequestNativeShowHover(editorToken?'outside-editor-token-relocation':'outside-editor-relocation');
+    if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+      window.__irHoverGuardOutsideLogCount++;
+      irLog('renderer: hoverguard outside-editor-dispose event='+e.type+' token='+JSON.stringify(editorToken)+' near='+near+' recentlyInside='+!!recentlyInside+' sticky='+!!isSticky+' target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' managed={disposed}');
+    }
+    return;
+  }
+  if(near){
     if(near)irArmHoverSticky(managed,IR_HOVER_EXIT_GRACE_MS);
-    e.stopImmediatePropagation();
+    if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+      window.__irHoverGuardOutsideLogCount++;
+      irLog('renderer: hoverguard outside-near-pass event='+e.type+' near='+near+' editorTarget='+!!editorTarget+' recentlyInside='+!!recentlyInside+' sticky='+!!isSticky+' target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' managed={'+irHoverBrief(managed)+'}');
+    }
+    return;
+  }
+  if(isSticky){
+    irReleaseHoverSticky(managed);
+    if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+      window.__irHoverGuardOutsideLogCount++;
+      irLog('renderer: hoverguard outside-release event='+e.type+' near='+near+' editorTarget=false recentlyInside='+!!recentlyInside+' sticky=true target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' managed={'+irHoverBrief(managed)+'}');
+    }
+  }else if(recentlyInside&&window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+    window.__irHoverGuardOutsideLogCount++;
+    irLog('renderer: hoverguard outside-pass event='+e.type+' near='+near+' editorTarget=false recentlyInside=true sticky=false target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' managed={'+irHoverBrief(managed)+'}');
   }
 }
+track(window,'pointermove',irRememberPointerEvent,true);
+track(window,'mousemove',irRememberPointerEvent,true);
+track(window,'mouseover',irRememberPointerEvent,true);
+track(window,'pointerover',irRememberPointerEvent,true);
+track(document,'pointermove',irRememberPointerEvent,true);
+track(document,'mousemove',irRememberPointerEvent,true);
+track(document,'mouseover',irRememberPointerEvent,true);
+track(document,'pointerover',irRememberPointerEvent,true);
 track(window,'pointermove',irHoverGuard,true);
 track(window,'pointerover',irHoverGuard,true);
 track(window,'pointerout',irHoverGuard,true);
@@ -5847,10 +10395,117 @@ function irRestorePreviewScroll(hoverEl,target,state){
   try{requestAnimationFrame(apply)}catch(_){}
   try{setTimeout(apply,35)}catch(_){}
 }
+function irVisiblePreviewTargetInHover(hover){
+  if(!hover)return null;
+  var target=irStoredPreviewTarget(hover)||irNormalizePreviewTarget(window.__irLastPreviewTarget);
+  if(target&&document.body.contains(target))return target;
+  try{
+    var nodes=hover.querySelectorAll('.rendered-markdown.ir-applied, .rendered-markdown');
+    for(var i=nodes.length-1;i>=0;i--){
+      if(nodes[i].offsetParent!==null)return irNormalizePreviewTarget(nodes[i])||nodes[i];
+    }
+  }catch(_){}
+  return null;
+}
+function irCaptureOriginalHoverSnapshot(hoverEl,target){
+  try{
+    if(!hoverEl||!target||!document.body.contains(hoverEl)||!hoverEl.contains(target))return;
+    if(window.__irOriginalHoverSnapshot){
+      if(window.__irOriginalHoverSnapshot.hoverEl===hoverEl){
+        window.__irOriginalHoverSnapshot.scroll=irPreviewScrollSnapshot(hoverEl,target);
+      }
+      return;
+    }
+    if(window.__irHistoryCurrent)return;
+    if(!String(target.textContent||'').trim())return;
+    var clone=hoverEl.cloneNode(true);
+    if(!clone)return;
+    window.__irOriginalHoverSnapshot={
+      hoverEl:hoverEl,
+      clone:clone,
+      className:String(hoverEl.className||''),
+      styleText:String(hoverEl.getAttribute('style')||''),
+      scroll:irPreviewScrollSnapshot(hoverEl,target)
+    };
+    irLog('renderer: captured original hover snapshot');
+  }catch(eOS){irLog('renderer: original snapshot capture err: '+(eOS&&eOS.message));}
+}
+window.__irRestorePreviewScrollState=function(state){
+  try{
+    var scroll=irNormalizePreviewScrollState(state);
+    if(!scroll)return {ok:false,reason:'empty-scroll',patchVersion:Number(window.__irPatchVersion)||0};
+    var hover=irActiveHoverRoot();
+    if(!hover)return {ok:false,reason:'no-hover',patchVersion:Number(window.__irPatchVersion)||0};
+    var target=irVisiblePreviewTargetInHover(hover)||hover;
+    try{irMakeHoverScrollable(hover,false,(hover.textContent||'').length)}catch(_){}
+    irRestorePreviewScroll(hover,target,scroll);
+    return {ok:true,scroll:scroll,patchVersion:Number(window.__irPatchVersion)||0};
+  }catch(eRS){
+    return {ok:false,reason:String(eRS&&eRS.message||eRS),patchVersion:Number(window.__irPatchVersion)||0};
+  }
+};
+window.__irRestoreOriginalHoverSnapshot=function(scrollOverride){
+  try{
+    var snap=window.__irOriginalHoverSnapshot;
+    if(!snap||!snap.hoverEl||!snap.clone||!document.body.contains(snap.hoverEl)){
+      return {ok:false,reason:'missing-original-snapshot',patchVersion:Number(window.__irPatchVersion)||0};
+    }
+    var hover=snap.hoverEl;
+    var clone=snap.clone.cloneNode(true);
+    while(hover.firstChild)hover.removeChild(hover.firstChild);
+    while(clone.firstChild)hover.appendChild(clone.firstChild);
+    try{hover.className=snap.className||hover.className;}catch(_){}
+    try{hover.setAttribute('style',snap.styleText||'');}catch(_){}
+    hover.classList.add('ir-keepalive');
+    hover.classList.add('ir-scrollable');
+    irSetActiveHoverLayer(hover);
+    var target=irVisiblePreviewTargetInHover(hover);
+    if(!target){
+      var nodes=hover.querySelectorAll('.rendered-markdown');
+      target=nodes.length?nodes[nodes.length-1]:hover;
+      if(target&&target!==hover)irSetPreviewTarget(hover,target);
+    }
+    window.__irHistoryFor=hover;
+    window.__irHistory=[];
+    window.__irHistoryCurrent=null;
+    window.__irLastPreviewTarget=target&&target!==hover?target:null;
+    try{irMakeHoverScrollable(hover,false,(hover.textContent||'').length)}catch(_){}
+    try{
+      var restoredBlocks=hover.querySelectorAll?hover.querySelectorAll('.rendered-markdown'):[];
+      for(var rbi=0;rbi<restoredBlocks.length;rbi++){
+        restoredBlocks[rbi].__irLastScanText=null;
+      }
+    }catch(_){}
+    try{irScanRenderedMarkdown()}catch(_){try{irScheduleScan()}catch(_){}}
+    var scroll=irNormalizePreviewScrollState(scrollOverride)||snap.scroll;
+    if(scroll)irRestorePreviewScroll(hover,target||hover,scroll);
+    window.__irOriginalHoverSnapshot=null;
+    irLog('renderer: restored original hover snapshot');
+    return {ok:true,scroll:scroll||null,patchVersion:Number(window.__irPatchVersion)||0};
+  }catch(eRO){
+    return {ok:false,reason:String(eRO&&eRO.message||eRO),patchVersion:Number(window.__irPatchVersion)||0};
+  }
+};
+function irScheduleOriginalHoverRestoreFallback(){
+  try{
+    var hist=window.__irHistory||[];
+    if(hist.length||!window.__irOriginalHoverSnapshot)return;
+    var delays=[120,360,760];
+    for(var di=0;di<delays.length;di++){
+      irSetTimer(function(){
+        try{
+          if(window.__irOriginalHoverSnapshot&&typeof window.__irRestoreOriginalHoverSnapshot==='function'){
+            window.__irRestoreOriginalHoverSnapshot(null);
+          }
+        }catch(_){}
+      },delays[di]);
+    }
+  }catch(_){}
+}
 window.__irCapturePreviewScroll=function(){
   var hover=irActiveHoverRoot();
   if(!hover)return null;
-  var target=irStoredPreviewTarget(hover)||irNormalizePreviewTarget(window.__irLastPreviewTarget);
+  var target=irVisiblePreviewTargetInHover(hover);
   if(!target||!document.body.contains(target)){
     var nodes=hover.querySelectorAll('.rendered-markdown.ir-applied, .rendered-markdown');
     for(var i=nodes.length-1;i>=0;i--){
@@ -6154,6 +10809,191 @@ function irHoverRootsInNode(node){
 function irIsStaleHoverRoot(root){
   try{return !!(root&&root.classList&&root.classList.contains('ir-stale-hover'))}catch(_){return false}
 }
+function irIsSyntheticHoverRoot(root){
+  try{
+    return !!(root&&root.classList&&(
+      root.classList.contains('ir-e2e-hover')||
+      root.classList.contains('ir-e2e-empty-hover')||
+      root.classList.contains('ir-test-seeded-hover')
+    ));
+  }catch(_){return false}
+}
+function irIsNativeHoverRoot(root){
+  try{
+    return !!(root&&root.matches&&root.matches(IR_HOVER_ROOT_SELECTOR)&&!irIsSyntheticHoverRoot(root));
+  }catch(_){return false}
+}
+function irHoverRootVisibility(root){
+  try{
+    if(!root)return {visible:false,reason:'missing'};
+    if(!document.body||!document.body.contains(root))return {visible:false,reason:'detached'};
+    if(irIsStaleHoverRoot(root))return {visible:false,reason:'stale'};
+    var cls=root.classList;
+    if(cls&&(cls.contains('hidden')||cls.contains('ir-stale-hover')))return {visible:false,reason:'hidden-class'};
+    if(root.getAttribute&&root.getAttribute('aria-hidden')==='true')return {visible:false,reason:'aria-hidden'};
+    var cs=window.getComputedStyle?window.getComputedStyle(root):null;
+    if(cs){
+      if(cs.display==='none')return {visible:false,reason:'display-none'};
+      if(cs.visibility==='hidden')return {visible:false,reason:'visibility-hidden'};
+      if(Number(cs.opacity)===0)return {visible:false,reason:'opacity-zero'};
+    }
+    var r=root.getBoundingClientRect?root.getBoundingClientRect():null;
+    if(!r)return {visible:false,reason:'no-rect'};
+    if(r.width<2||r.height<2)return {visible:false,reason:'zero-rect'};
+    return {visible:true,reason:'visible'};
+  }catch(eV){
+    return {visible:false,reason:'visibility-error:'+String(eV&&eV.message||eV)};
+  }
+}
+function irIsRenderableHoverRoot(root){
+  return !!(irHoverRootVisibility(root)||{}).visible;
+}
+function irRememberVisibleHoverRect(root,reason){
+  try{
+    if(!root||!root.getBoundingClientRect)return;
+    var visibility=irHoverRootVisibility(root);
+    if(!visibility||!visibility.visible)return;
+    var r=root.getBoundingClientRect();
+    if(!r||r.width<2||r.height<2)return;
+    root.__irLastVisibleRect={
+      left:Math.round(r.left),
+      top:Math.round(r.top),
+      width:Math.round(r.width),
+      height:Math.round(r.height)
+    };
+    root.__irLastVisibleRectAt=Date.now();
+  }catch(_){}
+}
+function irForcePreviewHoverVisible(root,reason){
+  try{
+    if(!root||!root.style)return false;
+    if(root.classList)root.classList.remove('hidden','ir-stale-hover','ir-native-released-hover');
+    if(root.removeAttribute){
+      root.removeAttribute('aria-hidden');
+      root.removeAttribute('hidden');
+    }
+    root.style.setProperty('display','block','important');
+    root.style.setProperty('visibility','visible','important');
+    root.style.setProperty('opacity','1','important');
+    root.style.setProperty('pointer-events','auto','important');
+    root.style.setProperty('position','fixed','important');
+    var remembered=root.__irLastVisibleRect||null;
+    var rememberedFresh=root.__irLastVisibleRectAt&&Date.now()-root.__irLastVisibleRectAt<5000;
+    if(remembered&&rememberedFresh){
+      var current=root.getBoundingClientRect?root.getBoundingClientRect():null;
+      var currentEmpty=!current||current.width<2||current.height<2;
+      if(currentEmpty){
+        root.style.setProperty('left',Math.max(0,remembered.left)+'px','important');
+        root.style.setProperty('top',Math.max(0,remembered.top)+'px','important');
+        root.style.setProperty('width',Math.max(240,remembered.width)+'px','important');
+        root.style.setProperty('height',Math.max(120,remembered.height)+'px','important');
+        root.style.setProperty('max-width',Math.max(240,remembered.width)+'px','important');
+        root.style.setProperty('max-height',Math.max(120,remembered.height)+'px','important');
+      }
+    }
+    irEnsureHoverPointer(root);
+    try{irMakeHoverScrollable(root,false,String(root.textContent||'').length)}catch(_){}
+    var visibility=irHoverRootVisibility(root);
+    if(visibility&&visibility.visible){
+      irRememberVisibleHoverRect(root,reason||'force-visible');
+      return true;
+    }
+    if(window.__irHiddenActiveHoverLogCount<80){
+      window.__irHiddenActiveHoverLogCount++;
+      irLog('renderer: force preview hover visible failed '+(reason||'')+' reason='+(visibility&&visibility.reason||'')+' active={'+irHoverBrief(root)+'}');
+    }
+  }catch(_){}
+  return false;
+}
+function irReviveRecentlyAppliedHover(root,reason){
+  try{
+    if(!root||!irHoverRecentlyPreviewApplied(root))return false;
+    if(root.classList)root.classList.remove('hidden','ir-stale-hover','ir-native-released-hover');
+    if(root.removeAttribute)root.removeAttribute('aria-hidden');
+    if(root.style){
+      root.style.display='';
+      root.style.visibility='';
+      root.style.opacity='';
+      if(!root.style.position)root.style.position='fixed';
+    }
+    if(!irForcePreviewHoverVisible(root,reason||'recent-preview'))return false;
+    irSetActiveHoverLayer(root);
+    var visibility=irHoverRootVisibility(root);
+    if(visibility&&visibility.visible){
+      if(window.__irHiddenActiveHoverLogCount<80){
+        window.__irHiddenActiveHoverLogCount++;
+        irLog('renderer: revived recent preview hover '+(reason||'')+' active={'+irHoverBrief(root)+'}');
+      }
+      return true;
+    }
+    if(window.__irHiddenActiveHoverLogCount<80){
+      window.__irHiddenActiveHoverLogCount++;
+      irLog('renderer: recent preview hover revive failed '+(reason||'')+' reason='+(visibility&&visibility.reason||'')+' active={'+irHoverBrief(root)+'}');
+    }
+  }catch(_){}
+  return false;
+}
+function irReleaseNativeHiddenHover(root,reason,visibilityReason){
+  if(!root||!irIsNativeHoverRoot(root))return false;
+  var refireGrace=false;
+  try{refireGrace=!!(window.__irNativeHoverRefireUntil&&Date.now()<window.__irNativeHoverRefireUntil)}catch(_){}
+  try{if(root.__irStickyTimer)irClearTimer(root.__irStickyTimer)}catch(_){}
+  try{if(root.__irFitFrame)cancelAnimationFrame(root.__irFitFrame)}catch(_){}
+  try{irClearHoverHandleCleanup(root)}catch(_){}
+  try{irResetHoverViewportShift(root)}catch(_){}
+  try{irHideHoverNativeHandles(root,true)}catch(_){}
+  try{
+    if(window.__irActiveHoverEl===root){
+      irStopActiveHoverHandleObserver();
+      window.__irActiveHoverEl=null;
+    }
+    if(window.__irHistoryFor===root){
+      window.__irHistoryFor=null;
+      window.__irHistory=[];
+      window.__irHistoryCurrent=null;
+    }
+    if(window.__irOriginalHoverSnapshot&&window.__irOriginalHoverSnapshot.hoverEl===root){
+      window.__irOriginalHoverSnapshot=null;
+    }
+    if(window.__irLastPreviewTarget&&irRootContains(root,window.__irLastPreviewTarget)){
+      window.__irLastPreviewTarget=null;
+    }
+  }catch(_){}
+  try{
+    root.__irPrimaryPreviewTarget=null;
+    root.__irPreviewAppliedAt=0;
+    root.__irStickyUntil=0;
+    root.__irLastInsideAt=0;
+    root.classList.remove('ir-scrollable','ir-sticky','ir-size-small','ir-size-medium','ir-size-large','ir-keepalive','ir-empty-hover-root','ir-native-released-hover');
+    if(root.getAttribute&&root.getAttribute('data-ir-empty-hover-root')==='1'&&root.removeAttribute){
+      root.removeAttribute('data-ir-empty-hover-root');
+    }
+    if(root.removeAttribute)root.removeAttribute('data-ir-native-released-hover');
+    irResetNativeHoverMutations(root);
+    irMarkNativeHoverReleased(root,reason||'hidden-native',true);
+  }catch(_){}
+  if(window.__irHoverLifecycleLogCount<120){
+    window.__irHoverLifecycleLogCount++;
+    irLog('renderer: native hidden hover cleaned '+(reason||'')+' reason='+(visibilityReason||'')+' refireGrace='+(refireGrace?'1':'0')+' retained=1 removed=0 victim={'+irHoverBrief(root)+'}');
+  }
+  return true;
+}
+function irDisposeHiddenActiveHover(reason){
+  try{
+    var active=window.__irActiveHoverEl;
+    if(!active||!document.body||!document.body.contains(active))return false;
+    var visibility=irHoverRootVisibility(active);
+    if(visibility&&visibility.visible)return false;
+    if(irReviveRecentlyAppliedHover(active,reason||'hidden-active'))return false;
+    if(irReleaseNativeHiddenHover(active,'hidden-active-'+(reason||''),visibility&&visibility.reason))return true;
+    if(window.__irHiddenActiveHoverLogCount<80){
+      window.__irHiddenActiveHoverLogCount++;
+      irLog('renderer: hidden active hover disposed '+(reason||'')+' reason='+(visibility&&visibility.reason||'')+' active={'+irHoverBrief(active)+'}');
+    }
+    irDisposeStaleHover(active,'hidden-active-'+(reason||''));
+    return true;
+  }catch(_){return false}
+}
 function irHoverRootHasActivatingContent(root){
   try{
     if(!root)return false;
@@ -6166,21 +11006,166 @@ function irHoverRootHasActivatingContent(root){
   }catch(_){}
   return false;
 }
+function irHoverRootRectSummary(root){
+  try{
+    var r=root&&root.getBoundingClientRect?root.getBoundingClientRect():null;
+    if(!r)return '';
+    return ' rect='+Math.round(r.left)+','+Math.round(r.top)+','+Math.round(r.width)+'x'+Math.round(r.height);
+  }catch(_){return ''}
+}
+function irMarkEmptyHoverRoot(root){
+  if(!root||!root.classList)return;
+  try{
+    var active=window.__irActiveHoverEl;
+    if(active&&active!==root&&document.body&&document.body.contains(active)
+      &&irIsRenderableHoverRoot(active)&&irHoverRootHasActivatingContent(active)){
+      if(root.parentNode)root.parentNode.removeChild(root);
+      if(window.__irHoverLifecycleLogCount<120){
+        window.__irHoverLifecycleLogCount++;
+        irLog('renderer: empty hover root removed active-populated victim={'+irHoverBrief(root)+'} active={'+irHoverBrief(active)+'}');
+      }
+      return;
+    }
+    root.classList.add('ir-empty-hover-root');
+    root.setAttribute('data-ir-empty-hover-root','1');
+    root.style.pointerEvents='none';
+  }catch(_){}
+}
+function irClearEmptyHoverRoot(root){
+  if(!root||!root.classList)return;
+  try{
+    var owned=root.getAttribute&&root.getAttribute('data-ir-empty-hover-root')==='1';
+    root.classList.remove('ir-empty-hover-root');
+    if(root.removeAttribute)root.removeAttribute('data-ir-empty-hover-root');
+    if(owned&&root.style&&root.style.pointerEvents==='none')root.style.removeProperty('pointer-events');
+  }catch(_){}
+}
+function irRefreshEmptyHoverRootState(root){
+  var hasContent=irHoverRootHasActivatingContent(root);
+  if(hasContent)irClearEmptyHoverRoot(root);
+  else irMarkEmptyHoverRoot(root);
+  return hasContent;
+}
+function irMarkHoverRootSeen(root){
+  try{
+    if(!root)return;
+    var now=Date.now();
+    if(!root.__irSeenAt)root.__irSeenAt=now;
+    root.__irLastSeenAt=now;
+  }catch(_){}
+}
+function irHoverRootActivityTime(root){
+  try{
+    if(!root)return 0;
+    return Math.max(root.__irActivatedAt||0,root.__irContentChangedAt||0,root.__irLastSeenAt||0,root.__irSeenAt||0);
+  }catch(_){return 0}
+}
+function irIsTransientHoverText(text){
+  var key=String(text||'').replace(/\s+/g,' ').trim();
+  if(!key)return true;
+  if(key==='Loading'||key==='Loading...'||key==='Loading…')return true;
+  if(key.length<=2)return true;
+  return false;
+}
+function irTouchHoverRootContent(root,reason,text){
+  try{
+    if(!root)return;
+    var now=Date.now();
+    root.__irContentChangedAt=now;
+    irRememberVisibleHoverRect(root,reason||'content');
+    var sample=String(text==null?(root.textContent||''):text).replace(/\s+/g,' ').trim();
+    var previousLength=Number(root.__irLastContentLength)||0;
+    var currentLength=String(root.textContent||'').length;
+    root.__irLastContentLength=currentLength;
+    try{
+      if(root.getAttribute&&root.getAttribute('data-ir-native-released-hover')==='1'){
+        var releasedText=String(root.__irReleasedText||'');
+        var currentText=String(root.textContent||'');
+        if(currentText&&currentText!==releasedText&&!irIsTransientHoverText(sample)){
+          if(root.__irReleaseRemoveTimer){
+            irClearTimer(root.__irReleaseRemoveTimer);
+            root.__irReleaseRemoveTimer=null;
+          }
+          root.__irReleasedAt=0;
+          root.__irReleasedText='';
+          if(root.classList)root.classList.remove('ir-native-released-hover');
+          if(root.removeAttribute)root.removeAttribute('data-ir-native-released-hover');
+          if(root.style){
+            if(root.style.pointerEvents==='none')root.style.removeProperty('pointer-events');
+            if(root.style.visibility==='hidden')root.style.removeProperty('visibility');
+            if(root.style.opacity==='0')root.style.removeProperty('opacity');
+            if(root.style.display==='none')root.style.removeProperty('display');
+          }
+          if(window.__irHoverLifecycleLogCount<120){
+            window.__irHoverLifecycleLogCount++;
+            irLog('renderer: released native hover revived '+(reason||'content')+' len='+currentLength);
+          }
+        }
+      }
+    }catch(_){}
+    if(window.__irLazyHoverLifecycleLogCount<120){
+      var interesting=irIsTransientHoverText(sample)
+        || previousLength===0
+        || Math.abs(currentLength-previousLength)>24
+        || currentLength>120;
+      if(interesting){
+        window.__irLazyHoverLifecycleLogCount++;
+        irLog('renderer: lazy-hover content '+(reason||'change')
+          +' len='+currentLength
+          +' prev='+previousLength
+          +' transient='+(irIsTransientHoverText(sample)?'1':'0')
+          +' host={'+irHoverBrief(root)+'}');
+      }
+    }
+  }catch(_){}
+}
 function irActivateHoverRoot(root,reason){
   if(!root||irIsStaleHoverRoot(root))return false;
   try{
-    if(!irHoverRootHasActivatingContent(root)){
-      if(window.__irEmptyHoverRootSkipLogCount<20){
+    try{
+      var ownedReleased=root.getAttribute&&root.getAttribute('data-ir-native-released-hover')==='1';
+      if(root.__irReleasedAt&&Date.now()-root.__irReleasedAt<1600){
+        var releasedText=String(root.__irReleasedText||'');
+        var currentText=String(root.textContent||'');
+        if(releasedText&&currentText===releasedText&&!irIsRenderableHoverRoot(root)){
+          if(window.__irHoverLifecycleLogCount<120){
+            window.__irHoverLifecycleLogCount++;
+            irLog('renderer: skip unchanged released native hover '+(reason||'')+' root={'+irHoverBrief(root)+'}');
+          }
+          return false;
+        }
+      }
+      if(root.classList)root.classList.remove('ir-native-released-hover');
+      if(root.style&&root.style.pointerEvents==='none')root.style.removeProperty('pointer-events');
+      if(ownedReleased&&root.style){
+        if(root.style.visibility==='hidden')root.style.removeProperty('visibility');
+        if(root.style.opacity==='0')root.style.removeProperty('opacity');
+        if(root.style.display==='none')root.style.removeProperty('display');
+      }
+      if(root.removeAttribute)root.removeAttribute('data-ir-native-released-hover');
+    }catch(_){}
+    irMarkHoverRootSeen(root);
+    if(!irIsRenderableHoverRoot(root)){
+      if(window.__irHiddenActiveHoverLogCount<80){
+        window.__irHiddenActiveHoverLogCount++;
+        irLog('renderer: skip unrenderable hover root '+(reason||'')+' '+irHoverBrief(root)+irHoverRootRectSummary(root));
+      }
+      return false;
+    }
+    irRememberVisibleHoverRect(root,reason||'activate');
+    if(!irRefreshEmptyHoverRootState(root)){
+      if(window.__irEmptyHoverRootSkipLogCount<80){
         window.__irEmptyHoverRootSkipLogCount++;
-        irLog('renderer: skip empty hover root '+(reason||'')+' text='+(root.textContent||'').length);
+        irLog('renderer: skip empty hover root '+(reason||'')+' '+irHoverBrief(root)+irHoverRootRectSummary(root));
       }
       return false;
     }
     root.__irActivatedAt=Date.now();
+    var prev=window.__irActiveHoverEl;
     irSetActiveHoverLayer(root);
-    if(window.__irStaleHoverLogCount<20){
-      window.__irStaleHoverLogCount++;
-      irLog('renderer: active hover root '+(reason||'')+' text='+(root.textContent||'').length);
+    if(window.__irHoverLifecycleLogCount<120){
+      window.__irHoverLifecycleLogCount++;
+      irLog('renderer: active hover root '+(reason||'')+' new={'+irHoverBrief(root)+'} prev={'+irHoverBrief(prev)+'}');
     }
     return true;
   }catch(_){return false}
@@ -6192,30 +11177,120 @@ function irActivateAddedHoverRoots(node,reason){
   }
   return activated;
 }
+function irShouldKeepRecentEmptyHoverRoot(root,activeHover,pendingKeepRoot){
+  try{
+    if(!root||irIsStaleHoverRoot(root))return false;
+    if(activeHover&&irHoverRootHasActivatingContent(activeHover)&&root!==pendingKeepRoot)return false;
+    irMarkHoverRootSeen(root);
+    if(!irIsRenderableHoverRoot(root))return Date.now()-(root.__irSeenAt||0)<1200;
+    if(irRefreshEmptyHoverRootState(root))return false;
+    return Date.now()-(root.__irSeenAt||0)<1200;
+  }catch(_){return false}
+}
+function irRecentPendingHoverActivity(root,activeHover){
+  try{
+    if(!root||irIsStaleHoverRoot(root))return 0;
+    if(irRootContains(activeHover,root)||irRootContains(root,activeHover))return 0;
+    if(activeHover&&irHoverRecentlyPreviewApplied(activeHover))return 0;
+    if(root.classList
+      && (root.classList.contains('ir-keepalive')||root.classList.contains('ir-scrollable'))){
+      return 0;
+    }
+    var now=Date.now();
+    var activity=Math.max(root.__irContentChangedAt||0,root.__irSeenAt||0);
+    if(now-activity>1200)return 0;
+    return activity||0;
+  }catch(_){return 0}
+}
+function irPickPendingHoverRootToKeep(roots,activeHover){
+  var best=null,bestActivity=0;
+  try{
+    for(var i=0;i<roots.length;i++){
+      var root=roots[i];
+      irMarkHoverRootSeen(root);
+      var activity=irRecentPendingHoverActivity(root,activeHover);
+      if(activity&&activity>=bestActivity){
+        best=root;
+        bestActivity=activity;
+      }
+    }
+  }catch(_){}
+  return best;
+}
+function irShouldKeepRecentPendingHoverRoot(root,activeHover,pendingKeepRoot){
+  try{
+    if(!root||root!==pendingKeepRoot)return false;
+    if(!irIsRenderableHoverRoot(root))return true;
+    var hasContent=irRefreshEmptyHoverRootState(root);
+    if(window.__irLazyHoverLifecycleLogCount<120){
+      window.__irLazyHoverLifecycleLogCount++;
+      irLog('renderer: lazy-hover prune-keep pending hasContent='+(hasContent?'1':'0')
+        +' age='+(Date.now()-irRecentPendingHoverActivity(root,activeHover))
+        +' root={'+irHoverBrief(root)+'}'
+        +' active={'+irHoverBrief(activeHover)+'}');
+    }
+    return true;
+  }catch(_){return false}
+}
 function irShouldProcessHoverBlock(hoverHost,block){
   if(!hoverHost)return true;
   try{
+    irMarkHoverRootSeen(hoverHost);
+    irClearEmptyHoverRoot(hoverHost);
     var active=window.__irActiveHoverEl;
+    if(active&&document.body&&document.body.contains(active)&&!irIsRenderableHoverRoot(active)){
+      irDisposeHiddenActiveHover('scan');
+      active=window.__irActiveHoverEl;
+    }
+    if(hoverHost&&!irIsRenderableHoverRoot(hoverHost)){
+      if(window.__irInactiveScanSkipLogCount<40){
+        window.__irInactiveScanSkipLogCount++;
+        irLog('renderer: skip unrenderable hover scan host={'+irHoverBrief(hoverHost)+'} active={'+irHoverBrief(active)+'}');
+      }
+      return false;
+    }
     if(!active||!document.body||!document.body.contains(active)){
       irActivateHoverRoot(hoverHost,'scan-fallback');
       return true;
     }
     if(irRootContains(active,block))return true;
-    if(window.__irInactiveScanSkipLogCount<12){
+    if(!irIsStaleHoverRoot(hoverHost)&&irHoverRootHasActivatingContent(hoverHost)){
+      var activeHasContent=irHoverRootHasActivatingContent(active);
+      var activeSeen=irHoverRootActivityTime(active);
+      var hostSeen=irHoverRootActivityTime(hoverHost);
+      var hostChanged=hoverHost.__irContentChangedAt||0;
+      var freshHostChange=hostChanged&&Date.now()-hostChanged<1200;
+      if(!activeHasContent||hostSeen>=activeSeen||freshHostChange){
+        irActivateHoverRoot(hoverHost,'scan-new-active');
+        return true;
+      }
+    }
+    if(window.__irInactiveScanSkipLogCount<40){
       window.__irInactiveScanSkipLogCount++;
-      irLog('renderer: skip inactive hover scan text='+(hoverHost.textContent||'').length+' active='+(active.textContent||'').length);
+      irLog('renderer: skip inactive hover scan host={'+irHoverBrief(hoverHost)+'} active={'+irHoverBrief(active)+'}'
+        +' hostActivity='+irHoverRootActivityTime(hoverHost)
+        +' activeActivity='+irHoverRootActivityTime(active)
+        +' hostChanged='+(hoverHost&&hoverHost.__irContentChangedAt||0)
+        +' activeChanged='+(active&&active.__irContentChangedAt||0));
     }
     return false;
   }catch(_){return true}
 }
 function irRemoveInactiveHoverArtifacts(activeHover,reason){
   var removed=0, artifacts=0;
+  if(activeHover&&!irIsRenderableHoverRoot(activeHover)){
+    irDisposeHiddenActiveHover(reason||'inactive-sweep');
+    activeHover=window.__irActiveHoverEl;
+  }
   try{artifacts+=irHideGlobalHoverNativeHandles(activeHover,true)||0}catch(_){}
   try{
     var roots=document.querySelectorAll(IR_HOVER_ROOT_SELECTOR);
+    var pendingKeepRoot=irPickPendingHoverRootToKeep(roots,activeHover);
     for(var i=0;i<roots.length;i++){
       var h=roots[i];
       if(irRootContains(activeHover,h)||irRootContains(h,activeHover))continue;
+      if(irShouldKeepRecentPendingHoverRoot(h,activeHover,pendingKeepRoot))continue;
+      if(irShouldKeepRecentEmptyHoverRoot(h,activeHover,pendingKeepRoot))continue;
       irDisposeStaleHover(h,reason||'inactive-sweep');
       removed++;
     }
@@ -6240,18 +11315,49 @@ function irRemoveInactiveHoverArtifacts(activeHover,reason){
       if(sh.parentNode){sh.parentNode.removeChild(sh);removed++}
     }
   }catch(_){}
-  if((removed||artifacts)&&window.__irStaleHoverLogCount<20){
-    window.__irStaleHoverLogCount++;
-    irLog('renderer: inactive hover sweep '+(reason||'')+' panels='+removed+' artifacts='+artifacts);
+  if((removed||artifacts)&&window.__irHoverLifecycleLogCount<120){
+    window.__irHoverLifecycleLogCount++;
+    irLog('renderer: inactive hover sweep '+(reason||'')+' panels='+removed+' artifacts='+artifacts+' active={'+irHoverBrief(activeHover)+'}');
   }
 }
 function irDisposeStaleHover(hoverEl,reason){
   if(!hoverEl||!hoverEl.classList)return;
+  var beforeBrief=irHoverBrief(hoverEl);
   try{if(hoverEl.__irStickyTimer)irClearTimer(hoverEl.__irStickyTimer)}catch(_){}
   try{if(hoverEl.__irFitFrame)cancelAnimationFrame(hoverEl.__irFitFrame)}catch(_){}
   try{irClearHoverHandleCleanup(hoverEl)}catch(_){}
   try{irResetHoverViewportShift(hoverEl)}catch(_){}
   try{irHideHoverNativeHandles(hoverEl,true)}catch(_){}
+  if(irIsNativeHoverRoot(hoverEl)){
+    var refireGrace=false;
+    try{refireGrace=!!(window.__irNativeHoverRefireUntil&&Date.now()<window.__irNativeHoverRefireUntil)}catch(_){}
+    try{
+      hoverEl.__irPrimaryPreviewTarget=null;
+      hoverEl.__irPreviewAppliedAt=0;
+      hoverEl.__irStickyUntil=0;
+      hoverEl.__irLastInsideAt=0;
+      hoverEl.classList.remove('ir-scrollable','ir-sticky','ir-size-small','ir-size-medium','ir-size-large','ir-keepalive','ir-empty-hover-root','ir-native-released-hover');
+      if(hoverEl.removeAttribute){
+        hoverEl.removeAttribute('data-ir-empty-hover-root');
+        hoverEl.removeAttribute('data-ir-native-released-hover');
+      }
+      irResetNativeHoverMutations(hoverEl);
+      irMarkNativeHoverReleased(hoverEl,reason||'stale-native',true);
+    }catch(_){}
+    try{
+      if(window.__irActiveHoverEl===hoverEl)window.__irActiveHoverEl=null;
+      if(window.__irHistoryFor===hoverEl){
+        window.__irHistoryFor=null;
+        window.__irHistory=[];
+        window.__irHistoryCurrent=null;
+      }
+    }catch(_){}
+    if(window.__irHoverLifecycleLogCount<120){
+      window.__irHoverLifecycleLogCount++;
+      irLog('renderer: native hover shell cleaned '+(reason||'')+' refireGrace='+(refireGrace?'1':'0')+' retained=1 victim={'+beforeBrief+'}');
+    }
+    return;
+  }
   try{
     hoverEl.classList.remove('ir-scrollable','ir-sticky','ir-size-small','ir-size-medium','ir-size-large','ir-keepalive');
     hoverEl.classList.add('ir-stale-hover');
@@ -6269,15 +11375,29 @@ function irDisposeStaleHover(hoverEl,reason){
   try{
     if(hoverEl.parentNode)hoverEl.parentNode.removeChild(hoverEl);
   }catch(_){}
-  if(window.__irStaleHoverLogCount<20){
-    window.__irStaleHoverLogCount++;
-    irLog('renderer: stale hover removed '+(reason||''));
+  if(window.__irHoverLifecycleLogCount<120){
+    window.__irHoverLifecycleLogCount++;
+    irLog('renderer: stale hover removed '+(reason||'')+' victim={'+beforeBrief+'}');
   }
 }
 function irSetActiveHoverLayer(hoverEl){
   if(!hoverEl)return;
+  if(!irIsRenderableHoverRoot(hoverEl)){
+    if(window.__irHiddenActiveHoverLogCount<80){
+      window.__irHiddenActiveHoverLogCount++;
+      irLog('renderer: skip active hover layer unrenderable '+irHoverBrief(hoverEl));
+    }
+    return;
+  }
+  irRememberVisibleHoverRect(hoverEl,'set-active');
+  var prev=window.__irActiveHoverEl;
   if(window.__irActiveHoverEl!==hoverEl)irStopActiveHoverHandleObserver();
   window.__irActiveHoverEl=hoverEl;
+  try{hoverEl.__irActivatedAt=Date.now()}catch(_){}
+  if(prev!==hoverEl&&window.__irHoverLifecycleLogCount<120){
+    window.__irHoverLifecycleLogCount++;
+    irLog('renderer: active hover switch prev={'+irHoverBrief(prev)+'} next={'+irHoverBrief(hoverEl)+'}');
+  }
   irEnsureHoverPointer(hoverEl);
   irRemoveInactiveHoverArtifacts(hoverEl,'active-switch');
   irWatchHoverNativeHandles(hoverEl);
@@ -6393,6 +11513,8 @@ var IR_HOVER_LINK_MAX_LOWER_DECLS=100;
 var IR_HOVER_LINK_MAX_CONSTANTS=80;
 var IR_HOVER_LINK_MAX_BROAD_IDENTIFIERS=160;
 var IR_HOVER_EAGER_WRAP_MAX_TEXT=24000;
+var IR_HOVER_DEFERRED_CANDIDATE_MAX_TEXT=50000;
+var IR_HOVER_DEFERRED_CANDIDATE_MAX_LINES=900;
 function irTypeShapedName(w){return /^[A-Z][A-Za-z0-9_]*$/.test(w)||/^_[A-Z][A-Z0-9_]*$/.test(w)}
 function irConstantHoverLinkName(w){return /^_*[A-Z][A-Z0-9_]*$/.test(w)}
 function irPrimaryHoverLinkName(w){return /[a-z]/.test(w)}
@@ -6496,6 +11618,17 @@ function irBlockCandidateAllowsWord(block,word){
     return !!(m&&m[word]);
   }catch(_){return false}
 }
+function irShouldLogPointWrapReject(e){
+  try{return !!(e&&(e.type==='pointerdown'||e.type==='mousedown'||e.type==='click'))}catch(_){return false}
+}
+function irLogPointWrapReject(e,reason,extra){
+  try{
+    if(!irShouldLogPointWrapReject(e)||window.__irPointWrapRejectLogCount>=40)return;
+    window.__irPointWrapRejectLogCount++;
+    var hover=irClosestHover(e&&e.target);
+    irLog('renderer: point-wrap reject reason='+reason+' event='+(e&&e.type||'')+' target='+irElementBrief(irEventElement(e&&e.target))+' hoverRect='+irRectBrief(hover)+(extra?' '+extra:'')+irPointWordSummary(e,hover));
+  }catch(_){}
+}
 function irWrapTextNodeWord(node,info){
   if(!node||!node.parentNode||!info||info.start<0||info.end<=info.start||info.end>(node.nodeValue||'').length)return null;
   var after=node.splitText(info.start);
@@ -6517,15 +11650,21 @@ function irWrapTextNodeWord(node,info){
 }
 function irWrapWordAtPoint(e){
   var hover=irClosestHover(e&&e.target);
-  if(!hover){irSetPointActiveLink(null);return null}
+  if(!hover){irSetPointActiveLink(null);irLogPointWrapReject(e,'no-hover','');return null}
   var directLink=irClosestTypeLink(e&&e.target);
   if(directLink&&hover.contains(directLink)){
     irSetPointActiveLink(directLink);
     return directLink;
   }
+  var nearDirect=irUseNearbyTypeLink(e,hover,'pre-range');
+  if(nearDirect)return nearDirect;
   var range=irPointRange(e);
   var node=range&&range.startContainer;
-  if(!node||node.nodeType!==3||!node.parentNode){irSetPointActiveLink(null);return null}
+  if(!node||node.nodeType!==3||!node.parentNode){
+    var nearNoText=irUseNearbyTypeLink(e,hover,'no-text-node');
+    if(nearNoText)return nearNoText;
+    irSetPointActiveLink(null);irLogPointWrapReject(e,'no-text-node','nodeType='+(node&&node.nodeType));return null;
+  }
   var parentEl=node.parentNode.nodeType===1?node.parentNode:node.parentNode.parentElement;
   var existingLink=parentEl&&parentEl.closest?parentEl.closest('.ir-type-link'):null;
   if(existingLink&&hover.contains(existingLink)){
@@ -6533,16 +11672,26 @@ function irWrapWordAtPoint(e){
     return existingLink;
   }
   var block=parentEl&&parentEl.closest?parentEl.closest('.rendered-markdown'):null;
-  if(!block||!hover.contains(block)||irTextNodeInAnchor(node,block)){irSetPointActiveLink(null);return null}
+  if(!block||!hover.contains(block)||irTextNodeInAnchor(node,block)){
+    var nearInvalid=irUseNearbyTypeLink(e,hover,'invalid-block');
+    if(nearInvalid)return nearInvalid;
+    irSetPointActiveLink(null);irLogPointWrapReject(e,'invalid-block','block='+(!!block)+' inHover='+(block?hover.contains(block):false)+' inAnchor='+(block?irTextNodeInAnchor(node,block):false));return null;
+  }
   var info=irWordAtOffset(node.nodeValue||'',range.startOffset||0);
-  if(!info||IR_HOVER_LINK_SKIP[info.word]||info.word.length<=2){irSetPointActiveLink(null);return null}
+  if(!info){
+    var nearNoWord=irUseNearbyTypeLink(e,hover,'no-word');
+    if(nearNoWord)return nearNoWord;
+    irSetPointActiveLink(null);irLogPointWrapReject(e,'filtered-word','candidate=');return null;
+  }
+  if(IR_HOVER_LINK_SKIP[info.word]||info.word.length<=2){irSetPointActiveLink(null);irLogPointWrapReject(e,'filtered-word','candidate='+(info&&info.word||''));return null}
   var candidateKnown=irBlockCandidateAllowsWord(block,info.word);
   var hasCandidateSet=!!(block&&block.__irHoverLinkCandidates);
   var lowerCallable=irPointAllowsLowerCallable(node,info);
   var decoratorContext=irPointAllowsDecorator(node,info,block);
   if(hasCandidateSet){
-    if(!candidateKnown&&!lowerCallable&&!decoratorContext){irSetPointActiveLink(null);return null}
+    if(!candidateKnown&&!lowerCallable&&!decoratorContext&&!irTypeShapedName(info.word)&&!irConstantHoverLinkName(info.word)){irSetPointActiveLink(null);irLogPointWrapReject(e,'candidate-rejected','candidate='+info.word+' hasCandidates='+hasCandidateSet+' known='+candidateKnown+' lower='+lowerCallable+' decorator='+decoratorContext);return null}
   }else if(!irTypeShapedName(info.word)&&!irConstantHoverLinkName(info.word)&&!lowerCallable&&!decoratorContext){
+    irLogPointWrapReject(e,'shape-rejected','candidate='+info.word+' lower='+lowerCallable+' decorator='+decoratorContext);
     irSetPointActiveLink(null);return null;
   }
   var span=irWrapTextNodeWord(node,info);
@@ -6551,8 +11700,10 @@ function irWrapWordAtPoint(e){
     irMarkHoverManaged(hover,true);
     if(window.__irPointWrapLogCount<20){
       window.__irPointWrapLogCount++;
-      irLog('renderer: point-wrap "'+info.word+'"');
+      irLog('renderer: point-wrap "'+info.word+'" event='+(e&&e.type||'')+' hasCandidates='+hasCandidateSet+' known='+candidateKnown+' lower='+lowerCallable+' decorator='+decoratorContext+' blockText='+(block?String(block.textContent||'').length:0)+' hoverRect='+irRectBrief(hover));
     }
+  }else{
+    irLogPointWrapReject(e,'wrap-failed','candidate='+info.word);
   }
   return span;
 }
@@ -6581,11 +11732,22 @@ function irDecoratorNamesInLine(line){
   var out=[];
   var text=String(line||'');
   if(!/^\\s*@/.test(text))return out;
+  var mergedFirst=null;
+  try{
+    var firstToken=/^\\s*@([A-Za-z_$][A-Za-z0-9_$]*)/.exec(text);
+    var merged=/^\\s*@([A-Za-z_$][A-Za-z0-9_$]*?)(?=(?:class|def)\\s+[A-Za-z_$])/.exec(text);
+    if(merged&&merged[1]){
+      out.push(merged[1]);
+      mergedFirst=firstToken&&firstToken[1]&&firstToken[1]!==merged[1]?firstToken[1]:null;
+    }
+  }catch(_){}
   var expr=text.replace(/(['"])(?:\\\\.|(?!\\1).)*\\1/g,function(m){return new Array(m.length+1).join(' ')});
   var re=/\\b[A-Za-z_$][A-Za-z0-9_$]*\\b/g;
   var seen={};
+  for(var oi=0;oi<out.length;oi++)seen[out[oi]]=1;
   var m;
   while((m=re.exec(expr))!==null){
+    if(mergedFirst&&m[0]===mergedFirst)continue;
     if(!m[0]||seen[m[0]])continue;
     seen[m[0]]=1;
     out.push(m[0]);
@@ -6678,12 +11840,16 @@ function irCollectBroadIdentifierCandidates(text,skip,types,seen,maxChars,maxLin
     }
   }
 }
-function irCollectHoverLinkNames(text,skip){
+function irCollectHoverLinkNames(text,skip,deferBroadScan){
   var src=String(text||'');
+  var scanSrc=src;
+  if(deferBroadScan&&src.length>IR_HOVER_DEFERRED_CANDIDATE_MAX_TEXT){
+    scanSrc=src.slice(0,IR_HOVER_DEFERRED_CANDIDATE_MAX_TEXT);
+  }
   var types=[],seen={};
   var decoratorDecls=[];
   var lowerDecls=[];
-  var lines=src.split(/\\n/);
+  var lines=scanSrc.split(/\\n/);
   for(var li=0;li<lines.length;li++){
     var decorators=irDecoratorNamesInLine(lines[li]);
     for(var deco=0;deco<decorators.length;deco++){
@@ -6711,14 +11877,18 @@ function irCollectHoverLinkNames(text,skip){
   // after declaration scanning, so type annotations like "owner: User" were
   // never wrapped in hover links. Keep the scan bounded but always inspect
   // the visible/front-loaded code for type-shaped names.
-  irCollectTypeShapedCandidates(src,skip,types,seen,src.length>24000?100000:src.length+1,src.length>24000?2200:lines.length);
+  irCollectTypeShapedCandidates(src,skip,types,seen,
+    deferBroadScan?IR_HOVER_DEFERRED_CANDIDATE_MAX_TEXT:src.length+1,
+    deferBroadScan?IR_HOVER_DEFERRED_CANDIDATE_MAX_LINES:lines.length);
   // Mirror editor Cmd+Click more closely: once the high-confidence names are
   // added, include ordinary identifiers from code-looking lines too. The
   // extension host still resolves clicks through VS Code's definition provider,
   // so non-navigable noise becomes a harmless no-location click while
   // property/method access like self.owner.get_display_name() is no longer
   // invisible to drill-down.
-  irCollectBroadIdentifierCandidates(src,skip,types,seen,src.length>24000?100000:src.length+1,src.length>24000?2200:lines.length);
+  if(!deferBroadScan){
+    irCollectBroadIdentifierCandidates(src,skip,types,seen,src.length+1,lines.length);
+  }
   for(var d=IR_HOVER_LINK_MAX_LOWER_DECLS;d<lowerDecls.length;d++){
     irAddHoverLinkName(types,seen,skip,lowerDecls[d],true);
     if(types.length>=IR_HOVER_LINK_MAX_TYPES)break;
@@ -6752,6 +11922,60 @@ function irHoverLinkCandidateText(block,fallbackText){
   }catch(_){}
   return String(fallbackText||'');
 }
+function irCompactHoverScanSample(text){
+  return String(text||'').replace(/\\s+/g,' ').slice(0,220);
+}
+function irInterestingHoverScanText(text){
+  var s=String(text||'');
+  return s.indexOf('BaseModel')>=0
+    || s.indexOf('TimestampedModel')>=0
+    || s.indexOf('DIRECTOR_DECISION_DUMMY_FILE_LINK')>=0
+    || s.indexOf('@property')>=0
+    || s.indexOf('property')>=0;
+}
+function irHoverScanSnippet(text){
+  var s=String(text||'');
+  var needles=['BaseModel','TimestampedModel','DIRECTOR_DECISION_DUMMY_FILE_LINK','@property','property'];
+  var idx=-1;
+  for(var i=0;i<needles.length;i++){
+    idx=s.indexOf(needles[i]);
+    if(idx>=0)break;
+  }
+  if(idx<0)return irCompactHoverScanSample(s);
+  return s.slice(Math.max(0,idx-100),Math.min(s.length,idx+180)).replace(/\\s+/g,' ');
+}
+function irLogHoverScanDecision(reason,block,hoverHost,text,candidateText,types,extra){
+  try{
+    var existingLinks=block&&block.querySelectorAll?block.querySelectorAll('.ir-type-link').length:0;
+    var interesting=irInterestingHoverScanText(text)||irInterestingHoverScanText(candidateText);
+    if(window.__irScanDecisionLogCount>=140&&!interesting)return;
+    if(!interesting&&!(types&&types.length)&&!existingLinks&&(reason==='skip-short'||reason==='skip-same'))return;
+    if(window.__irScanDecisionLogCount<260)window.__irScanDecisionLogCount++;
+    var tokenized=block&&block.querySelectorAll?block.querySelectorAll('.monaco-tokenized-source').length:0;
+    var pres=block&&block.querySelectorAll?block.querySelectorAll('pre').length:0;
+    var mtk=block&&block.querySelectorAll?block.querySelectorAll('[class*="mtk"]').length:0;
+    var hasBase=(types||[]).indexOf('BaseModel')>=0;
+    var hasTimestamp=(types||[]).indexOf('TimestampedModel')>=0;
+    irLog('renderer: scan-decision '+reason
+      +' text='+String(text||'').length
+      +' candidate='+String(candidateText||'').length
+      +' types='+(types&&types.length||0)
+      +' links='+existingLinks
+      +' tokenized='+tokenized
+      +' pre='+pres
+      +' mtk='+mtk
+      +' hasBase='+hasBase
+      +' hasTimestamp='+hasTimestamp
+      +' active='+(window.__irActiveHoverEl===hoverHost)
+      +' host={'+irHoverBrief(hoverHost)+'}'
+      +(extra?' '+extra:'')
+      +' typesSample='+(types&&types.length?types.slice(0,16).join(','):'')
+      +' textSample='+JSON.stringify(irHoverScanSnippet(text))
+      +' candidateSample='+JSON.stringify(irHoverScanSnippet(candidateText)));
+  }catch(eScanDecision){
+    try{irLog('renderer: scan-decision-log-error '+String(eScanDecision&&eScanDecision.message||eScanDecision))}catch(_){}
+  }
+}
 
 var IR_HOVER_SIZE_TIERS=[
   {name:'small',width:560,height:260,maxText:2500,maxLines:45},
@@ -6774,6 +11998,11 @@ function irMeasureHoverContent(hoverEl,fallbackTextLength){
   return {textLength:textLength,lineCount:lineCount,longest:longest};
 }
 function irPickHoverSizeTier(hoverEl,fallbackTextLength){
+  if(fallbackTextLength&&fallbackTextLength>IR_HOVER_SIZE_TIERS[1].maxText){
+    var largeTier=IR_HOVER_SIZE_TIERS[2];
+    largeTier.measure={textLength:fallbackTextLength,lineCount:Infinity,longest:Infinity};
+    return largeTier;
+  }
   var m=irMeasureHoverContent(hoverEl,fallbackTextLength);
   for(var i=0;i<IR_HOVER_SIZE_TIERS.length;i++){
     var t=IR_HOVER_SIZE_TIERS[i];
@@ -6894,22 +12123,22 @@ function irApplyHoverSizeTier(hoverEl,fallbackTextLength,resetScroll){
 }
 
 function irTypeLinkClick(e){
-  var link=irClosestTypeLink(e.target)||irWrapWordAtPoint(e);
-  if(!link)return;
-  var typeName=link.getAttribute('data-type');
-  if(!typeName)return;
-  var hover=irClosestHover(link);
-  irMarkHoverManaged(hover,true);
-  e.preventDefault();e.stopImmediatePropagation();
-  if(e.metaKey||e.ctrlKey){
-    irLog('renderer: cmd-click on "'+typeName+'"');
-    if(typeof window.irGoToType==='function'){window.irGoToType(typeName)}
-  }else{
-    var anc=irPreviewTargetForLink(link);
-    window.__irLastPreviewTarget=anc;
-    irLog('renderer: plain-click on "'+typeName+'"');
-    if(typeof window.irGoToType==='function'){window.irGoToType('PREVIEW:'+typeName)}
+  var directLink=irClosestTypeLink(e.target);
+  var wrappedLink=null;
+  if(!directLink)wrappedLink=irWrapWordAtPoint(e);
+  var link=directLink||wrappedLink;
+  irLogPointerActionTrace(e,'click-capture',link,directLink?'direct':(wrappedLink?'wrapped':'none'));
+  if(!link){
+    irLogHoverPointerMiss(e,'click');
+    return;
   }
+  if(window.__irPointerActionLogCount<140){
+    window.__irPointerActionLogCount++;
+    var pointEl=(typeof document.elementFromPoint==='function'&&typeof e.clientX==='number')?document.elementFromPoint(e.clientX,e.clientY):null;
+    irLog('renderer: link click "'+(link.getAttribute&&link.getAttribute('data-type')||'')+'" target='+irElementBrief(irEventElement(e&&e.target))+' point='+irElementBrief(pointEl)+' link='+irElementBrief(link)+' hoverRect='+irRectBrief(irClosestHover(link)));
+  }
+  irClearPendingTypeLinkPointerDown(link,'click');
+  irRunTypeLinkAction(link,e,'click');
 }
 track(window,'click',irTypeLinkClick,true);
 track(document,'click',irTypeLinkClick,true);
@@ -6933,6 +12162,7 @@ function irBackControlClick(e){
   e.preventDefault();
   e.stopImmediatePropagation();
   if(typeof window.irGoToType==='function')window.irGoToType('BACK');
+  else irScheduleOriginalHoverRestoreFallback();
 }
 track(window,'pointerdown',irBackControlPointerDown,true);
 track(window,'mousedown',irBackControlPointerDown,true);
@@ -6944,6 +12174,12 @@ track(document,'click',irBackControlClick,true);
 function irMakeHoverScrollable(hoverEl, resetScroll, fallbackTextLength){
   if(!hoverEl)return;
   try{
+    var scrollSignature=String(Math.max(0,fallbackTextLength||0));
+    if(!resetScroll&&hoverEl.classList&&hoverEl.classList.contains('ir-scrollable')&&hoverEl.__irScrollableSignature===scrollSignature){
+      irEnsureHoverPointer(hoverEl);
+      irSetActiveHoverLayer(hoverEl);
+      return;
+    }
     irMarkHoverManaged(hoverEl,true);
     hoverEl.classList.add('ir-scrollable');
     irSetActiveHoverLayer(hoverEl);
@@ -6966,15 +12202,19 @@ function irMakeHoverScrollable(hoverEl, resetScroll, fallbackTextLength){
     }
     try { var _=hoverEl.scrollHeight; var __=hoverEl.offsetHeight; } catch(_) {}
     try { window.dispatchEvent(new Event('resize')); } catch(_) {}
+    hoverEl.__irScrollableSignature=scrollSignature;
   }catch(_){}
 }
 window.__irTestHooks={
   primaryHoverScroller:irPrimaryHoverScroller,
   makeHoverScrollable:irMakeHoverScrollable,
   setActiveHoverLayer:irSetActiveHoverLayer,
+  activateHoverRoot:irActivateHoverRoot,
+  refreshEmptyHoverRootState:irRefreshEmptyHoverRootState,
   applyHoverSizeTier:irApplyHoverSizeTier,
   disposeStaleHover:irDisposeStaleHover,
   removeInactiveHoverArtifacts:irRemoveInactiveHoverArtifacts,
+  pruneDetachedHoverState:irPruneDetachedHoverState,
   scanRenderedMarkdown:irScanRenderedMarkdown
 };
 
@@ -7512,6 +12752,21 @@ function irEnsurePreviewBackButton(hoverEl,target){
     host.insertBefore(btn,host===target?(target.firstChild||null):target);
   }catch(eBB){irLog('renderer: back button err: '+(eBB&&eBB.message));}
 }
+function irEnsurePreviewBackButtonForScannedHover(hoverEl,target){
+  try{
+    if(!hoverEl||!target)return;
+    if(hoverEl.querySelector&&hoverEl.querySelector('.ir-back-btn'))return;
+    var hasPreviewHistory=!!(window.__irHistoryCurrent||((window.__irHistory||[]).length));
+    var nativePreviewBackActive=false;
+    try{nativePreviewBackActive=!!(window.__irNativePreviewBackUntil&&Date.now()<window.__irNativePreviewBackUntil);}catch(_){}
+    if(!hasPreviewHistory&&!nativePreviewBackActive)return;
+    irEnsurePreviewBackButton(hoverEl,target);
+    if((window.__irPreviewApplyLogCount||0)<80){
+      window.__irPreviewApplyLogCount=(window.__irPreviewApplyLogCount||0)+1;
+      irLog('renderer: back button repaired during scan hover={'+irHoverBrief(hoverEl)+'}');
+    }
+  }catch(_){}
+}
 
 // Decode HTML entities + unescape markdown backslash escapes that some
 // LSPs leave in their hover content (e.g. \`<class 'int'>\` arrives as
@@ -7561,6 +12816,9 @@ window.irApplyPreview=function(typeName,md,fromBack,restoreScroll){
     window.__irHistoryFor=hoverElForHistory;
     window.__irHistory=[];
     window.__irHistoryCurrent=null;
+    if(window.__irOriginalHoverSnapshot&&window.__irOriginalHoverSnapshot.hoverEl!==hoverElForHistory){
+      window.__irOriginalHoverSnapshot=null;
+    }
   }
   if(!window.__irHistory)window.__irHistory=[];
   if(window.__irHistoryCurrent&&hoverElForHistory){
@@ -7581,6 +12839,7 @@ window.irApplyPreview=function(typeName,md,fromBack,restoreScroll){
     window.__irHistory.push(window.__irHistoryCurrent);
     if(window.__irHistory.length>20)window.__irHistory.splice(0,window.__irHistory.length-20);
   }
+  if(!fromBack&&hoverElForHistory)irCaptureOriginalHoverSnapshot(hoverElForHistory,target);
   window.__irHistoryCurrent={ typeName:typeName, md:md, scroll:restoreScrollState||null };
   try {
     var decoded=irDecodeContent(md);
@@ -7610,6 +12869,10 @@ window.irApplyPreview=function(typeName,md,fromBack,restoreScroll){
     }
     if (!nativeOk) irBuildMdDom(decoded,target);
     if(outerHover)irEnsurePreviewBackButton(outerHover,target);
+    if(outerHover){
+      outerHover.__irPreviewAppliedAt=Date.now();
+      irRememberVisibleHoverRect(outerHover,'preview-applied');
+    }
     try{irScheduleScan()}catch(_){}
   } catch(eAP){
     irLog('renderer: irApplyPreview build err: '+(eAP&&eAP.message?eAP.message:String(eAP)));
@@ -7698,6 +12961,7 @@ window.irApplyPreview=function(typeName,md,fromBack,restoreScroll){
         }
         irFlattenNestedScrollLayers(hoverEl);
         irApplyHoverSizeTier(hoverEl,(target.textContent||'').length,!restoreScrollState);
+        irRememberVisibleHoverRect(hoverEl,'preview-layout');
         if(restoreScrollState)irRestorePreviewScroll(hoverEl,target,restoreScrollState);
         // Hide VS Code\\'s overlay handles; their slider geometry was
         // computed from the pre-expanded hover.
@@ -7713,6 +12977,157 @@ window.irApplyPreview=function(typeName,md,fromBack,restoreScroll){
   window.__irLastPreviewTarget=null;
   irLog('renderer: applied "'+typeName+'" via '+src);
   return true;
+};
+
+window.irShowHoverFallback=function(identifier,md,opts){
+  try{
+    identifier=String(identifier||'').trim();
+    md=String(md||'');
+    opts=opts||{};
+    if(!identifier||md.trim().length<20){
+      return {ok:false,reason:'empty-input',patchVersion:Number(window.__irPatchVersion)||0};
+    }
+    var forceNativeReplace=/^preview-/.test(String(opts.source||""));
+    var pointer=window.__irLastPointer||null;
+    var pointerFresh=pointer&&pointer.at&&Date.now()-pointer.at<5000;
+    var x=pointerFresh&&typeof pointer.x==='number'?pointer.x:Math.floor((window.innerWidth||1000)/2);
+    var y=pointerFresh&&typeof pointer.y==='number'?pointer.y:Math.floor((window.innerHeight||700)/3);
+    var pointEl=(typeof document.elementFromPoint==='function')?document.elementFromPoint(x,y):null;
+    var pointHover=pointEl&&pointEl.closest?pointEl.closest('.monaco-hover,.monaco-editor-hover'):null;
+    var pointToken='';
+    try{pointToken=irEventTargetTokenText({target:pointEl,clientX:x,clientY:y,type:'native-refire-probe'});}catch(_){}
+    var roots=Array.prototype.slice.call(document.querySelectorAll('.monaco-hover,.monaco-editor-hover'));
+    var existing=null;
+    for(var i=0;i<roots.length;i++){
+      var h=roots[i];
+      if(!h||!document.body.contains(h)||irIsStaleHoverRoot(h))continue;
+      var visibility=irHoverRootVisibility(h);
+      var hText=String(h.textContent||'');
+      if(visibility&&visibility.visible&&hText.indexOf(identifier)>=0&&hText.length>40){
+        existing=h;
+        break;
+      }
+    }
+    if(existing&&!forceNativeReplace){
+      irMarkHoverManaged(existing,true);
+      irSetActiveHoverLayer(existing);
+      try{irScheduleScan()}catch(_){}
+      return {
+        ok:true,
+        created:false,
+        reason:'existing-hover',
+        textLength:String(existing.textContent||'').length,
+        rect:irRectBrief(existing),
+        token:pointToken,
+        patchVersion:Number(window.__irPatchVersion)||0
+      };
+    }
+    var forcedRemoved=0;
+    var released=0;
+    var preservedHiddenNative=0;
+    var removedHiddenNative=0;
+    try{ window.__irNativeHoverRefireUntil=Date.now()+1800; }catch(_){}
+    for(var ri=0;ri<roots.length;ri++){
+      var rootOld=roots[ri];
+      if(!rootOld||!document.body.contains(rootOld))continue;
+      try{
+        if(rootOld.getAttribute&&rootOld.getAttribute('data-ir-forced-hover')==='1'){
+          if(rootOld.parentNode)rootOld.parentNode.removeChild(rootOld);
+          forcedRemoved++;
+          continue;
+        }
+      }catch(_){}
+      try{
+        if(irHoverRootVisibility(rootOld).visible){
+          if(irReleaseNativeHoverManagement(rootOld,'native-refire-replace'))released++;
+        }else if(irIsNativeHoverRoot(rootOld)){
+          var oldHiddenText=String(rootOld.textContent||'');
+          var refireGraceActive=false;
+          try{refireGraceActive=!!(window.__irNativeHoverRefireUntil&&Date.now()<window.__irNativeHoverRefireUntil)}catch(_){}
+          if(oldHiddenText.trim()&&oldHiddenText.indexOf(identifier)<0&&!refireGraceActive){
+            if(window.__irActiveHoverEl===rootOld)window.__irActiveHoverEl=null;
+            if(rootOld.parentNode)rootOld.parentNode.removeChild(rootOld);
+            removedHiddenNative++;
+            continue;
+          }
+          // Hidden native shells can be VS Code's in-flight hover widget
+          // between provider resolution and paint. Keep them during native
+          // refire so the real hover can finish rendering.
+          try{
+            if(rootOld.__irReleaseRemoveTimer){
+              irClearTimer(rootOld.__irReleaseRemoveTimer);
+              rootOld.__irReleaseRemoveTimer=null;
+            }
+            rootOld.__irReleasedAt=0;
+            rootOld.__irReleasedText='';
+            rootOld.__irNativeRefirePreservedAt=Date.now();
+            if(rootOld.classList)rootOld.classList.remove('ir-native-released-hover','ir-scrollable','ir-sticky','ir-size-small','ir-size-medium','ir-size-large','ir-keepalive','hidden');
+            if(rootOld.removeAttribute){
+              rootOld.removeAttribute('data-ir-native-released-hover');
+              rootOld.removeAttribute('aria-hidden');
+              rootOld.removeAttribute('hidden');
+            }
+            if(rootOld.style){
+              rootOld.style.removeProperty('pointer-events');
+              rootOld.style.removeProperty('display');
+              rootOld.style.removeProperty('visibility');
+              rootOld.style.removeProperty('opacity');
+            }
+          }catch(_){}
+          preservedHiddenNative++;
+        }else if(irDisposeStaleHover(rootOld,'native-refire-hidden')){
+          released++;
+        }
+      }catch(_){}
+    }
+    try{
+      if(window.__irActiveHoverEl&&!document.body.contains(window.__irActiveHoverEl))window.__irActiveHoverEl=null;
+      window.__irLastPreviewTarget=null;
+    }catch(_){}
+    function fireNativeHoverRefireEvent(type,Ctor,target){
+      try{
+        if(!target)return false;
+        var ev=new Ctor(type,{bubbles:true,cancelable:true,view:window,clientX:x,clientY:y,screenX:x,screenY:y,buttons:0,button:0});
+        target.dispatchEvent(ev);
+        return true;
+      }catch(_){return false;}
+    }
+    try{
+      var eventTarget=(typeof document.elementFromPoint==='function'?document.elementFromPoint(x,y):null)||document.body;
+      if(eventTarget&&eventTarget.closest&&eventTarget.closest('.monaco-hover,.monaco-editor-hover')){
+        eventTarget=document.querySelector('.monaco-editor.focused .view-lines,.monaco-editor .view-lines')||document.body;
+      }
+      fireNativeHoverRefireEvent('pointerover',window.PointerEvent||window.MouseEvent,eventTarget);
+      fireNativeHoverRefireEvent('mouseover',window.MouseEvent,eventTarget);
+      fireNativeHoverRefireEvent('pointermove',window.PointerEvent||window.MouseEvent,eventTarget);
+      fireNativeHoverRefireEvent('mousemove',window.MouseEvent,eventTarget);
+      try{
+        var editorEl=eventTarget&&eventTarget.closest?eventTarget.closest('.monaco-editor'):null;
+        if(editorEl&&editorEl.focus)editorEl.focus({preventScroll:true});
+      }catch(_){}
+    }catch(_){}
+    if(window.__irHoverLifecycleLogCount<120){
+      window.__irHoverLifecycleLogCount++;
+      irLog('renderer: native hover refire requested identifier="'+identifier+'" source='+(opts.source||'')+' pointer='+(pointerFresh?'fresh':'fallback')+' token="'+pointToken+'" forcedRemoved='+forcedRemoved+' released='+released+' preservedHiddenNative='+preservedHiddenNative+' removedHiddenNative='+removedHiddenNative);
+    }
+    return {
+      ok:true,
+      created:false,
+      refired:true,
+      reason:'native-refire-requested',
+      identifier:identifier,
+      token:pointToken,
+      pointerFresh:!!pointerFresh,
+      pointHover:!!pointHover,
+      forcedRemoved:forcedRemoved,
+      released:released,
+      preservedHiddenNative:preservedHiddenNative,
+      removedHiddenNative:removedHiddenNative,
+      patchVersion:Number(window.__irPatchVersion)||0
+    };
+  }catch(eFallback){
+    return {ok:false,reason:String(eFallback&&eFallback.message||eFallback),patchVersion:Number(window.__irPatchVersion)||0};
+  }
 };
 
 var irLastContainerCount=0;
@@ -7732,11 +13147,19 @@ function irDedupeHoverContent(hoverHost){
   try{
     var seen=Object.create(null), removed=0;
     var blocks=hoverHost.querySelectorAll('.rendered-markdown');
+    if(blocks.length<2)return;
     for(var bi=0;bi<blocks.length;bi++){
       var block=blocks[bi];
       if(!block||!document.body.contains(block))continue;
       var key=irNormalizeHoverDedupeText(block.textContent||'');
       if(!key)continue;
+      if(irIsTransientHoverText(key)){
+        if(window.__irLazyHoverLifecycleLogCount<120){
+          window.__irLazyHoverLifecycleLogCount++;
+          irLog('renderer: lazy-hover dedupe-skip transient len='+key.length+' host={'+irHoverBrief(hoverHost)+'}');
+        }
+        continue;
+      }
       var prior=seen[key];
       if(prior&&!document.body.contains(prior)){
         prior=null;
@@ -7786,9 +13209,20 @@ function irSafeDuplicateHoverVictim(block){
 }
 
 function irScanRenderedMarkdown(){
-  irPruneDetachedHoverState();
   var containers=document.querySelectorAll('.monaco-hover .rendered-markdown, .monaco-editor-hover .rendered-markdown, .ij-find-hover-tooltip .rendered-markdown');
   if(containers.length!==irLastContainerCount) irLastContainerCount=containers.length;
+  for(var pre=0;pre<containers.length;pre++){
+    try{
+      var preBlock=containers[pre];
+      if(!document.body.contains(preBlock))continue;
+      var preText=preBlock.textContent||'';
+      var preHost=preBlock.closest('.monaco-hover, .monaco-editor-hover');
+      if(preHost&&preBlock.__irLastScanText!==preText){
+        irTouchHoverRootContent(preHost,'pre-scan-text-change',preText);
+      }
+    }catch(_){}
+  }
+  irPruneDetachedHoverState();
   var dedupedHosts=[];
   for(var j=0;j<containers.length;j++){var block=containers[j];
     if(!document.body.contains(block))continue;
@@ -7808,10 +13242,14 @@ function irScanRenderedMarkdown(){
     }
     if(!document.body.contains(block))continue;
     irEnsureHoverPointer(hoverHost);
+    irEnsurePreviewBackButtonForScannedHover(hoverHost,block);
     // VS Code can replace a hover row with the same text while removing our
     // spans. Same text is only a skip when the clickable links still exist.
     var hasTypeLinks=!!block.querySelector('.ir-type-link');
-    if(block.__irLastScanText===text&&hasTypeLinks){
+    if(block.__irLastScanText===text&&(hasTypeLinks||text.length>IR_HOVER_EAGER_WRAP_MAX_TEXT)){
+      if(irInterestingHoverScanText(text)){
+        irLogHoverScanDecision('skip-same-text',block,hoverHost,text,'',[], 'hasTypeLinks='+hasTypeLinks+' eagerTooLarge='+(text.length>IR_HOVER_EAGER_WRAP_MAX_TEXT));
+      }
       if(text.length>4000||hasTypeLinks) irMakeHoverScrollable(hoverHost, false, text.length);
       continue;
     }
@@ -7823,10 +13261,14 @@ function irScanRenderedMarkdown(){
       irMarkHoverManaged(hoverHost,true);
       irMakeHoverScrollable(hoverHost, false, text.length);
     }
-    if(text.length<3)continue;
+    if(text.length<3){
+      irLogHoverScanDecision('skip-short',block,hoverHost,text,'',[], '');
+      continue;
+    }
     var skip=IR_HOVER_LINK_SKIP;
     var candidateText=irHoverLinkCandidateText(block,text);
-    var types=irCollectHoverLinkNames(candidateText,skip);
+    var deferEagerWrap=text.length>IR_HOVER_EAGER_WRAP_MAX_TEXT;
+    var types=irCollectHoverLinkNames(candidateText,skip,deferEagerWrap);
     irSetHoverLinkCandidates(block,types);
     block.__irLastScanText=text;
     var existingLinks=block.querySelectorAll?block.querySelectorAll('.ir-type-link').length:0;
@@ -7834,16 +13276,26 @@ function irScanRenderedMarkdown(){
       window.__irScanLogCount++;
       irLog('renderer: scan text='+text.length+' types='+types.length+' existing='+existingLinks+' sample='+types.slice(0,10).join(','));
     }
-    if(!types.length)continue;
-    if(text.length>IR_HOVER_EAGER_WRAP_MAX_TEXT){
+    if(irInterestingHoverScanText(text)||irInterestingHoverScanText(candidateText)){
+      irLogHoverScanDecision('candidate-result',block,hoverHost,text,candidateText,types,'defer='+deferEagerWrap+' existing='+existingLinks);
+    }
+    if(!types.length){
+      irLogHoverScanDecision('skip-no-types',block,hoverHost,text,candidateText,types,'defer='+deferEagerWrap);
+      continue;
+    }
+    if(deferEagerWrap){
       if(window.__irWrapLogCount<20){
         window.__irWrapLogCount++;
         irLog('renderer: defer wrap text='+text.length+' types='+types.length+' existing='+existingLinks+' sample='+types.slice(0,10).join(','));
       }
+      irLogHoverScanDecision('skip-defer-wrap',block,hoverHost,text,candidateText,types,'existing='+existingLinks);
       continue;
     }
     var linkRe=irBuildHoverLinkRegex(types);
-    if(!linkRe)continue;
+    if(!linkRe){
+      irLogHoverScanDecision('skip-no-regex',block,hoverHost,text,candidateText,types,'');
+      continue;
+    }
     var walker=document.createTreeWalker(block,NodeFilter.SHOW_TEXT);
     var node,textNodes=[];
     while(node=walker.nextNode()){textNodes.push(node)}
@@ -7906,10 +13358,17 @@ function irScanRenderedMarkdown(){
     if(wrappedCount>0){
       irMarkHoverManaged(hoverHost,true);
       irMakeHoverScrollable(hoverHost, false, text.length);
+      if(hoverHost&&(hoverHost.__irContentChangedAt||0)&&Date.now()-(hoverHost.__irContentChangedAt||0)<1200){
+        hoverHost.__irActivatedAt=Date.now();
+        irSetActiveHoverLayer(hoverHost);
+      }
     }
     if(window.__irWrapLogCount<20&&(wrappedCount>0||types.length>0)){
       window.__irWrapLogCount++;
       irLog('renderer: wrap text='+text.length+' types='+types.length+' wrapped='+wrappedCount+' sample='+types.slice(0,10).join(','));
+    }
+    if(wrappedCount===0||irInterestingHoverScanText(text)||irInterestingHoverScanText(candidateText)){
+      irLogHoverScanDecision('wrap-result',block,hoverHost,text,candidateText,types,'wrapped='+wrappedCount+' nodes='+textNodes.length);
     }
     if(text.length>4000) irMakeHoverScrollable(hoverHost, false, text.length);
   }
@@ -7931,10 +13390,19 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
     var activated=0;
     for(var ni=0;ni<nodes.length;ni++){
       activated+=irActivateAddedHoverRoots(nodes[ni],'mutation-added');
+      try{
+        var addedEl=nodes[ni]&&(nodes[ni].nodeType===1?nodes[ni]:nodes[ni].parentElement);
+        var addedHover=addedEl&&addedEl.closest?addedEl.closest('.monaco-hover,.monaco-editor-hover'):null;
+        if(addedHover)irTouchHoverRootContent(addedHover,'mutation-added',addedEl.textContent||'');
+      }catch(_){}
     }
     var target=mut.target;
     var targetEl=target&&(target.nodeType===1?target:target.parentElement);
     if(targetEl&&targetEl.closest&&targetEl.closest('.rendered-markdown,.monaco-hover,.monaco-editor-hover,.ij-find-hover-tooltip')){
+      try{
+        var targetHover=targetEl.closest('.monaco-hover,.monaco-editor-hover');
+        if(targetHover)irTouchHoverRootContent(targetHover,'mutation-'+(mut.type||'target'),targetEl.textContent||'');
+      }catch(_){}
       irScheduleScan();
       return;
     }
@@ -7943,13 +13411,18 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
       if(!n||n.nodeType!==1)continue;
       if((n.matches&&n.matches('.rendered-markdown,.monaco-hover,.monaco-editor-hover,.ij-find-hover-tooltip'))||
          (n.querySelector&&n.querySelector('.rendered-markdown'))){
+        try{
+          var nodeHover=n.closest?n.closest('.monaco-hover,.monaco-editor-hover'):null;
+          if(!nodeHover&&n.querySelector)nodeHover=n.querySelector('.monaco-hover,.monaco-editor-hover');
+          if(nodeHover)irTouchHoverRootContent(nodeHover,'mutation-query',n.textContent||'');
+        }catch(_){}
         irScheduleScan();
         return;
       }
     }
   }
 }));
-window.__irMarkdownObserver.observe(document.body,{childList:true,subtree:true});
+window.__irMarkdownObserver.observe(document.body,{childList:true,subtree:true,characterData:true});
 irScheduleScan();
 
 irLog('renderer: MutationObserver scan installed');
@@ -10568,6 +16041,10 @@ export async function deactivate() {
     currentClickController.abort();
   }
   currentClickController = null;
+  for (const timer of rendererHoverFallbackTimers) {
+    clearTimeout(timer);
+  }
+  rendererHoverFallbackTimers.clear();
   await cleanupRendererInjection('deactivate');
   closeMainWebSocket();
   clearAllExtensionCaches();
