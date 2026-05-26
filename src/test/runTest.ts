@@ -45,6 +45,10 @@ async function main() {
     ]);
     const disabledUiExtensions = discoverInstalledExtensionIds(userExtensionsDir)
       .filter(id => !extensionAllowlist.has(id));
+    const disabledBuiltinUiExtensions = [
+      'github.copilot-chat',
+      'typescriptteam.jsts-chat-features',
+    ];
 
     console.log(`Running E2E tests with fixture: ${fixture}`);
     console.log(`  workspace: ${testWorkspace}`);
@@ -67,6 +71,8 @@ async function main() {
         `--extensions-dir=${userExtensionsDir}`,
         `--user-data-dir=${userDataDir}`,
         `--remote-debugging-port=${remoteDebuggingPort}`,
+        '--disable-features=EditContext',
+        ...disabledBuiltinUiExtensions.map(id => `--disable-extension=${id}`),
         ...disabledUiExtensions.map(id => `--disable-extension=${id}`),
       ],
     });

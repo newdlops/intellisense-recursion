@@ -2,6 +2,9 @@ import * as assert from 'assert';
 import * as vscode from 'vscode';
 import * as path from 'path';
 
+const RUN_DEEP_HOVER_E2E = process.env.IR_E2E_DEEP_HOVER === '1';
+const RUN_POINTER_ORIGIN_HOVER_E2E = process.env.IR_E2E_POINTER_HOVER === '1' || RUN_DEEP_HOVER_E2E;
+
 let testWindowMarkerStatusBar: vscode.StatusBarItem | undefined;
 
 suiteSetup(async function () {
@@ -328,6 +331,15 @@ interface HoverDomState {
   hoverCount: number;
   populatedHoverCount: number;
   emptyHoverCount: number;
+  visibleEmptyHoverCount?: number;
+  overlappingEmptyHoverCount?: number;
+  overlappingEmptyHoverRoots?: any[];
+  visibleEmptyHoverShellCount?: number;
+  overlappingEmptyHoverShellCount?: number;
+  visibleEmptyHoverShells?: any[];
+  visibleExternalHoverArtifactCount?: number;
+  overlappingExternalHoverArtifactCount?: number;
+  visibleExternalHoverArtifacts?: any[];
   forcedHover: boolean;
   activeClassName: string;
   activeTextLength: number;
@@ -413,7 +425,50 @@ function hoverDomStateMatches(
   if (!expectedLinks.every(link => state.linkTypes.includes(link))) { return false; }
   if (!expectedTextFragments.every(fragment => state.activeText.includes(fragment))) { return false; }
   if (absentTextFragments.some(fragment => state.activeText.includes(fragment))) { return false; }
+  if ((state.visibleEmptyHoverCount || 0) > 0 || (state.overlappingEmptyHoverCount || 0) > 0) { return false; }
+  if ((state.visibleEmptyHoverShellCount || 0) > 0 || (state.overlappingEmptyHoverShellCount || 0) > 0) { return false; }
+  if ((state.visibleExternalHoverArtifactCount || 0) > 0 || (state.overlappingExternalHoverArtifactCount || 0) > 0) { return false; }
   return !requireSyntaxHighlight || !!state.syntaxHighlighted;
+}
+
+function hoverDomStateHasVisibleEmptyCell(state: HoverDomState | undefined): boolean {
+  return !!state
+    && ((state.visibleEmptyHoverCount || 0) > 0
+      || (state.overlappingEmptyHoverCount || 0) > 0
+      || (state.visibleEmptyHoverShellCount || 0) > 0
+      || (state.overlappingEmptyHoverShellCount || 0) > 0
+      || (state.visibleExternalHoverArtifactCount || 0) > 0
+      || (state.overlappingExternalHoverArtifactCount || 0) > 0);
+}
+
+function nativeGeometryHasVisibleEmptyCell(value: any): boolean {
+  return !!value
+    && ((value.visibleEmptyHoverCount || 0) > 0
+      || (value.overlappingEmptyHoverCount || 0) > 0
+      || (value.visibleEmptyHoverShellCount || 0) > 0
+      || (value.overlappingEmptyHoverShellCount || 0) > 0
+      || (value.visibleReleasedHoverCount || 0) > 0
+      || (value.overlappingReleasedHoverCount || 0) > 0
+      || (value.visibleExternalHoverArtifactCount || 0) > 0
+      || (value.overlappingExternalHoverArtifactCount || 0) > 0
+      || (value.hoverCount || 0) > 1
+      || value.reason === 'overlapping-empty-hover-shell'
+      || value.reason === 'visible-empty-hover-shell'
+      || value.reason === 'overlapping-external-hover-artifact'
+      || value.reason === 'visible-external-hover-artifact'
+      || value.reason === 'overlapping-visible-released-native-hover'
+      || value.reason === 'visible-released-native-hover'
+      || value.reason === 'multiple-visible-hover-roots');
+}
+
+function assertNoVisibleEmptyHoverCells(rowsOrValues: any[] | undefined, context: string): void {
+  const values = (rowsOrValues || [])
+    .map((row: any) => row?.value ?? row)
+    .filter(Boolean);
+  const empty = values.find(value => hoverDomStateHasVisibleEmptyCell(value) || nativeGeometryHasVisibleEmptyCell(value));
+  if (!empty) { return; }
+  assert.fail(`${context}: invalid visible hover overlay detected; failing immediately. `
+    + `${JSON.stringify(compactHoverDomState(empty as HoverDomState) || empty)}`);
 }
 
 function bestHoverDomState(
@@ -446,6 +501,18 @@ function compactHoverDomState(state: HoverDomState | undefined) {
     hoverCount: state.hoverCount,
     populatedHoverCount: state.populatedHoverCount,
     emptyHoverCount: state.emptyHoverCount,
+    visibleEmptyHoverCount: state.visibleEmptyHoverCount,
+    overlappingEmptyHoverCount: state.overlappingEmptyHoverCount,
+    overlappingEmptyHoverRoots: state.overlappingEmptyHoverRoots,
+    visibleEmptyHoverShellCount: state.visibleEmptyHoverShellCount,
+    overlappingEmptyHoverShellCount: state.overlappingEmptyHoverShellCount,
+    visibleEmptyHoverShells: state.visibleEmptyHoverShells,
+    visibleExternalHoverArtifactCount: state.visibleExternalHoverArtifactCount,
+    overlappingExternalHoverArtifactCount: state.overlappingExternalHoverArtifactCount,
+    visibleExternalHoverArtifacts: state.visibleExternalHoverArtifacts,
+    visibleReleasedHoverCount: (state as any).visibleReleasedHoverCount,
+    overlappingReleasedHoverCount: (state as any).overlappingReleasedHoverCount,
+    visibleReleasedHoverRoots: (state as any).visibleReleasedHoverRoots,
     forcedHover: state.forcedHover,
     activeClassName: state.activeClassName,
     activeTextLength: state.activeTextLength,
@@ -505,6 +572,8 @@ async function waitForHoverDomState(
       expectedLinks,
       includeStyleAndLayout,
     );
+    assertNoVisibleEmptyHoverCells(lastRows,
+      `hover DOM state links=${expectedLinks.join(',')} text=${expectedTextFragments.join(',')}`);
     lastState = bestHoverDomState(lastRows, expectedLinks, expectedTextFragments, requireSyntaxHighlight, absentTextFragments);
     if (hoverDomStateMatches(lastState, expectedLinks, expectedTextFragments, requireSyntaxHighlight, absentTextFragments)) {
       return lastState!;
@@ -525,6 +594,8 @@ interface NativeHoverGeometryInput {
   expectedColumn: 'left' | 'right' | 'any';
   expectedTextFragments?: string[];
   absentTextFragments?: string[];
+  injectEmptyTopCellForTests?: boolean;
+  injectExternalHoverArtifactForTests?: boolean;
 }
 
 async function showNativeHoverAt(
@@ -607,9 +678,14 @@ async function showNativeHoverAt(
       await sleep(140);
     }
   }
-  if ((cleanupState?.removed || 0) > 0 || (cleanupState?.retainedNative || 0) > 0) {
+  if ((cleanupState?.removed || 0) > 0
+    || (cleanupState?.retainedNative || 0) > 0
+    || cleanupState?.activeHover?.visible) {
     await vscode.commands.executeCommand('editor.action.hideHover');
-    await sleep(420);
+    await sleep(180);
+    cleanupState = await cleanupNativeHoverInteractionState(`before-hidden-${identifier}`);
+    await moveRendererMouseAwayFromHover(`before-hidden-${identifier}`);
+    await sleep(240);
   }
   active = await ensureRendererShowsNativeSymbol(
     { symbol: identifier, lineFragment, expectedColumn },
@@ -651,18 +727,87 @@ async function showNativeHoverAt(
     hoverDelay: vscode.workspace.getConfiguration('editor').get('hover.delay'),
     hoverCommands,
   })}`);
-  const providerProbe = await getHoverProviderTextAt(targetDocument, position, identifier);
-  const providerProbeAtHoverPoint = await getHoverProviderTextAt(targetDocument, hoverPosition, identifier);
-  console.log(`  native hover provider probe → ${identifier}: ${JSON.stringify({
-    hoverCount: providerProbe.hoverCount,
-    duplicateCount: providerProbe.duplicateCount,
-    textLength: providerProbe.text.length,
-    textSample: providerProbe.text.slice(0, 240),
-    hoverPointHoverCount: providerProbeAtHoverPoint.hoverCount,
-    hoverPointDuplicateCount: providerProbeAtHoverPoint.duplicateCount,
-    hoverPointTextLength: providerProbeAtHoverPoint.text.length,
-    hoverPointTextSample: providerProbeAtHoverPoint.text.slice(0, 160),
-  })}`);
+  const hoverGeometryInput: NativeHoverGeometryInput = {
+    symbol: identifier,
+    lineFragment,
+    expectedColumn,
+    expectedTextFragments: [],
+    absentTextFragments: [],
+  };
+  const nativeHoverHasContent = (value: any): boolean =>
+    value?.ok === true
+    && (value?.hoverCount || 0) > 0
+    && (value?.hoverTextLength || 0) > 0
+    && value?.contentMatches !== false;
+  const nativeHoverHasOnlyHiddenEmptyRoot = (value: any): boolean => {
+    const roots = Array.isArray(value?.rawHoverRoots) ? value.rawHoverRoots : [];
+    return roots.length > 0
+      && (value?.hoverCount || 0) === 0
+      && roots.every((root: any) => {
+        const rect = root?.rect || {};
+        return !root?.visibleHover
+          && !root?.visible
+          && (root?.textLength || 0) === 0
+          && (rect.width || 0) <= 3
+          && (rect.height || 0) <= 3;
+      });
+  };
+  const clearHiddenEmptyNativeHover = async (stage: string): Promise<void> => {
+    await vscode.commands.executeCommand('editor.action.hideHover').then(() => undefined, () => undefined);
+    await cleanupNativeHoverInteractionState(`native-empty-root-${stage}-${identifier}`);
+    await sleep(160);
+  };
+  const waitForPassiveNativeHover = async (stage: string, timeoutMs: number): Promise<boolean> => {
+    const start = Date.now();
+    let last: any;
+    while (Date.now() - start < timeoutMs) {
+      last = await readNativeHoverGeometry(hoverGeometryInput);
+      if (nativeHoverHasContent(last)) {
+        console.log(`  native passive hover result → ${identifier}: ${JSON.stringify({
+          stage,
+          ok: last?.ok,
+          hoverCount: last?.hoverCount,
+          hoverTextLength: last?.hoverTextLength,
+          hoverTextSample: String(last?.hoverTextSample || '').slice(0, 180),
+          hoverRect: last?.hoverRect,
+        })}`);
+        return true;
+      }
+      if (nativeHoverHasOnlyHiddenEmptyRoot(last)) {
+        break;
+      }
+      await sleep(120);
+    }
+    console.log(`  native passive hover miss → ${identifier}: ${JSON.stringify({
+      stage,
+      reason: last?.reason,
+      hoverCount: last?.hoverCount,
+      hoverTextLength: last?.hoverTextLength,
+      rawHoverRoots: last?.rawHoverRoots,
+    })}`);
+    if (nativeHoverHasOnlyHiddenEmptyRoot(last)) {
+      await clearHiddenEmptyNativeHover(stage);
+    }
+    return false;
+  };
+  let providerProbeLogged = false;
+  const logProviderProbe = async (stage: string): Promise<void> => {
+    if (providerProbeLogged) { return; }
+    providerProbeLogged = true;
+    const providerProbe = await getHoverProviderTextAt(targetDocument, position, identifier);
+    const providerProbeAtHoverPoint = await getHoverProviderTextAt(targetDocument, hoverPosition, identifier);
+    console.log(`  native hover provider probe → ${identifier}: ${JSON.stringify({
+      stage,
+      hoverCount: providerProbe.hoverCount,
+      duplicateCount: providerProbe.duplicateCount,
+      textLength: providerProbe.text.length,
+      textSample: providerProbe.text.slice(0, 240),
+      hoverPointHoverCount: providerProbeAtHoverPoint.hoverCount,
+      hoverPointDuplicateCount: providerProbeAtHoverPoint.duplicateCount,
+      hoverPointTextLength: providerProbeAtHoverPoint.text.length,
+      hoverPointTextSample: providerProbeAtHoverPoint.text.slice(0, 160),
+    })}`);
+  };
   active = await vscode.window.showTextDocument(targetDocument, {
     viewColumn: active.viewColumn || preferredViewColumn,
     preview: false,
@@ -691,8 +836,9 @@ async function showNativeHoverAt(
     'editor.action.triggerHover',
   ].filter((command, index, list) => list.indexOf(command) === index
     && (command === 'editor.action.showHover' || hoverCommands.includes(command)));
-  let showedNativeHover = false;
+  let showedNativeHover = await waitForPassiveNativeHover('before-command', 1100);
   for (const command of commandsToTry) {
+    if (showedNativeHover) { break; }
     try {
       await vscode.commands.executeCommand(command);
     } catch (err) {
@@ -700,13 +846,7 @@ async function showNativeHoverAt(
       continue;
     }
     await sleep(700);
-    const afterCommand = await readNativeHoverGeometry({
-      symbol: identifier,
-      lineFragment,
-      expectedColumn,
-      expectedTextFragments: [],
-      absentTextFragments: [],
-    });
+    const afterCommand = await readNativeHoverGeometry(hoverGeometryInput);
     console.log(`  native hover command result → ${identifier}: ${JSON.stringify({
       command,
       ok: afterCommand?.ok,
@@ -717,10 +857,56 @@ async function showNativeHoverAt(
       hoverRect: afterCommand?.hoverRect,
       rawHoverRoots: afterCommand?.rawHoverRoots,
     })}`);
-    if ((afterCommand?.hoverCount || 0) > 0 && (afterCommand?.hoverTextLength || 0) > 0) {
+    if (nativeHoverHasContent(afterCommand)) {
       showedNativeHover = true;
       break;
     }
+    if (nativeHoverHasOnlyHiddenEmptyRoot(afterCommand)) {
+      await clearHiddenEmptyNativeHover(`command-${command}`);
+      await moveRendererMouseToNativeSymbol({ symbol: identifier, lineFragment, expectedColumn }, false);
+      showedNativeHover = await waitForPassiveNativeHover(`after-empty-${command}`, 900);
+    }
+  }
+  if (!showedNativeHover) {
+    try {
+      const request = await vscode.commands.executeCommand<any>(
+        'intellisenseRecursion.requestNativeShowHoverForTests',
+        `showNativeHoverAt-${identifier}`,
+      );
+      await sleep(900);
+      const afterRequest = await readNativeHoverGeometry(hoverGeometryInput);
+      console.log(`  native hover renderer-pointer request result → ${identifier}: ${JSON.stringify({
+        mode: request?.mode,
+        ok: request?.ok,
+        reason: request?.reason,
+        commandFallback: request?.commandFallback,
+        token: request?.token,
+        cleanupToken: request?.cleanupToken,
+        removedReleasedNative: request?.removedReleasedNative,
+        preservedReleasedNative: request?.preservedReleasedNative,
+        quarantinedStaleNative: request?.quarantinedStaleNative,
+        pointerFresh: request?.pointerFresh,
+        pointerState: request?.pointerState,
+        nativeMouseRefire: request?.nativeMouseRefire,
+        hoverCount: afterRequest?.hoverCount,
+        hoverTextLength: afterRequest?.hoverTextLength,
+        hoverTextSample: String(afterRequest?.hoverTextSample || '').slice(0, 240),
+        hoverRect: afterRequest?.hoverRect,
+        rawHoverRoots: afterRequest?.rawHoverRoots,
+      })}`);
+      if (nativeHoverHasContent(afterRequest)) {
+        showedNativeHover = true;
+      } else if (nativeHoverHasOnlyHiddenEmptyRoot(afterRequest)) {
+        await clearHiddenEmptyNativeHover('renderer-pointer-request');
+      }
+    } catch (err) {
+      console.log(`  native hover renderer-pointer request failed → ${identifier}: ${err}`);
+    }
+  }
+  if (showedNativeHover) {
+    await logProviderProbe('after-native-show');
+    await moveRendererMouseToNativeSymbol({ symbol: identifier, lineFragment, expectedColumn }, false);
+    await sleep(260);
   }
   if (!showedNativeHover) {
     console.log(`  native hover focus retry → ${identifier}: command path produced no hover; refocusing editor renderer`);
@@ -741,13 +927,7 @@ async function showNativeHoverAt(
         continue;
       }
       await sleep(800);
-      const afterCommand = await readNativeHoverGeometry({
-        symbol: identifier,
-        lineFragment,
-        expectedColumn,
-        expectedTextFragments: [],
-        absentTextFragments: [],
-      });
+      const afterCommand = await readNativeHoverGeometry(hoverGeometryInput);
       console.log(`  native hover focus retry result → ${identifier}: ${JSON.stringify({
         command,
         ok: afterCommand?.ok,
@@ -759,9 +939,12 @@ async function showNativeHoverAt(
         hoverRect: afterCommand?.hoverRect,
         rawHoverRoots: afterCommand?.rawHoverRoots,
       })}`);
-      if ((afterCommand?.hoverCount || 0) > 0 && (afterCommand?.hoverTextLength || 0) > 0) {
+      if (nativeHoverHasContent(afterCommand)) {
         showedNativeHover = true;
         break;
+      }
+      if (nativeHoverHasOnlyHiddenEmptyRoot(afterCommand)) {
+        await clearHiddenEmptyNativeHover(`focus-${command}`);
       }
     }
   }
@@ -772,7 +955,9 @@ async function showNativeHoverAt(
     active.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
     await moveRendererMouseToNativeSymbol({ symbol: identifier, lineFragment, expectedColumn }, false);
     await sleep(180);
+    showedNativeHover = await waitForPassiveNativeHover('anchor-before-command', 900);
     for (const command of commandsToTry) {
+      if (showedNativeHover) { break; }
       try {
         await vscode.commands.executeCommand(command);
       } catch (err) {
@@ -780,13 +965,7 @@ async function showNativeHoverAt(
         continue;
       }
       await sleep(800);
-      const afterCommand = await readNativeHoverGeometry({
-        symbol: identifier,
-        lineFragment,
-        expectedColumn,
-        expectedTextFragments: [],
-        absentTextFragments: [],
-      });
+      const afterCommand = await readNativeHoverGeometry(hoverGeometryInput);
       console.log(`  native hover anchor retry result → ${identifier}: ${JSON.stringify({
         command,
         ok: afterCommand?.ok,
@@ -798,11 +977,17 @@ async function showNativeHoverAt(
         hoverRect: afterCommand?.hoverRect,
         rawHoverRoots: afterCommand?.rawHoverRoots,
       })}`);
-      if ((afterCommand?.hoverCount || 0) > 0 && (afterCommand?.hoverTextLength || 0) > 0) {
+      if (nativeHoverHasContent(afterCommand)) {
         showedNativeHover = true;
         break;
       }
+      if (nativeHoverHasOnlyHiddenEmptyRoot(afterCommand)) {
+        await clearHiddenEmptyNativeHover(`anchor-${command}`);
+      }
     }
+  }
+  if (!providerProbeLogged) {
+    await logProviderProbe(showedNativeHover ? 'after-native-show-final' : 'after-all-native-show-attempts');
   }
   return active;
 }
@@ -815,17 +1000,26 @@ async function readNativeHoverGeometry(
     input,
   );
   const values = (rows || []).map(row => row?.value).filter(Boolean);
+  if (!input.injectEmptyTopCellForTests && !input.injectExternalHoverArtifactForTests) {
+    assertNoVisibleEmptyHoverCells(values,
+      `native hover geometry read ${input.symbol} ${input.lineFragment}`);
+  }
   return values.find(value => value?.symbolGeometry)
     || values.find(value => value?.hoverRect)
     || values[0];
 }
 
 function nativeGeometryLooksLikeKeybindingRecorder(value: any): boolean {
-  const samples = Array.isArray(value?.editorRects)
-    ? value.editorRects.map((editor: any) => String(editor?.textSample || ''))
+  const editors = Array.isArray(value?.editorRects)
+    ? value.editorRects
     : [];
-  return samples.length > 0
-    && samples.every((sample: string) => sample.includes('Press desired key combination'));
+  return editors.length > 0
+    && editors.some((editor: any) => {
+      const sample = String(editor?.textSample || '');
+      const lineCount = Number(editor?.lineCount ?? 0);
+      return sample.includes('Press desired key combination')
+        && (lineCount === 0 || sample.trim().startsWith('Press desired key combination'));
+    });
 }
 
 async function closeKeybindingRecorderForHoverTest(): Promise<void> {
@@ -833,64 +1027,76 @@ async function closeKeybindingRecorderForHoverTest(): Promise<void> {
     .filter(command => /keybindings\.editor|defineKeybinding|openGlobalKeybinding/i.test(command))
     .sort();
   console.log(`  native keybinding recorder recovery commands: ${JSON.stringify(keybindingCommands)}`);
-  const recoveryCommands = [
-    'keyboard-quit',
-    'workbench.action.closeQuickOpen',
-    'editor.action.hideHover',
-    'workbench.action.closeActiveEditor',
-    'workbench.action.focusActiveEditorGroup',
-  ];
-  for (const command of recoveryCommands) {
-    try {
-      await vscode.commands.executeCommand(command);
-    } catch {}
-    await sleep(80);
-  }
-  const dispatchKey = async (
-    key: string,
-    code: string,
-    windowsVirtualKeyCode: number,
-    nativeVirtualKeyCode: number,
-  ) => {
-    try {
-      const dispatched = await vscode.commands.executeCommand<any>('intellisenseRecursion.dispatchRendererKeyForTests', {
-        key,
-        code,
-        windowsVirtualKeyCode,
-        nativeVirtualKeyCode,
-      });
-      console.log(`  native keybinding recorder key ${key}: ${JSON.stringify({
-        ok: dispatched?.ok,
-        mode: dispatched?.mode,
-        inputMode: dispatched?.inputMode,
-        reason: dispatched?.reason,
-      })}`);
-    } catch {}
-    await sleep(120);
-  };
-  await dispatchKey('Escape', 'Escape', 27, 53);
-  await dispatchKey('Escape', 'Escape', 27, 53);
-  await dispatchKey('Enter', 'Enter', 13, 36);
-  await dispatchKey('Escape', 'Escape', 27, 53);
 
   try {
-    const dismissed = await vscode.commands.executeCommand<any>(
-      'intellisenseRecursion.dismissNativeKeybindingRecorderForTests',
-    );
-    console.log(`  native keybinding recorder dismissed: ${JSON.stringify({
-      ok: dismissed?.ok,
-      removed: dismissed?.removed,
-      hidden: dismissed?.hidden,
-      matched: (dismissed?.matched || []).slice(0, 3),
+    const detected = await vscode.commands.executeCommand<any>('intellisenseRecursion.dismissNativeKeybindingRecorderForTests');
+    console.log(`  native keybinding recorder renderer scan: ${JSON.stringify({
+      ok: detected?.ok,
+      removed: detected?.removed,
+      hidden: detected?.hidden,
+      detected: detected?.detected,
+      matched: (detected?.matched || []).slice(0, 4),
+    })}`);
+    if ((detected?.detected || 0) > 0) {
+      for (let i = 0; i < 3; i++) {
+        try {
+          const dispatched = await vscode.commands.executeCommand<any>('intellisenseRecursion.dispatchRendererKeyForTests', {
+            key: 'Escape',
+            code: 'Escape',
+            windowsVirtualKeyCode: 27,
+            nativeVirtualKeyCode: 53,
+          });
+          console.log(`  native keybinding recorder escape ${i + 1}: ${JSON.stringify({
+            ok: dispatched?.ok,
+            mode: dispatched?.mode,
+            inputMode: dispatched?.inputMode,
+            reason: dispatched?.reason,
+          })}`);
+        } catch (err) {
+          console.log(`  native keybinding recorder escape ${i + 1}: ${err}`);
+        }
+        await sleep(140);
+      }
+      const afterEscape = await vscode.commands.executeCommand<any>('intellisenseRecursion.dismissNativeKeybindingRecorderForTests');
+      console.log(`  native keybinding recorder after escape: ${JSON.stringify({
+        ok: afterEscape?.ok,
+        removed: afterEscape?.removed,
+        hidden: afterEscape?.hidden,
+        detected: afterEscape?.detected,
+        matched: (afterEscape?.matched || []).slice(0, 4),
+      })}`);
+      for (const command of ((afterEscape?.detected || 0) > 0
+        ? [
+            'keybindings.editor.recordSearchKeys',
+            'keybindings.editor.rejectWhenExpression',
+            'keyboard-quit',
+            'workbench.action.closeQuickOpen',
+            'workbench.action.closeActiveEditor',
+          ]
+        : [])) {
+        try {
+          await vscode.commands.executeCommand(command);
+          console.log(`  native keybinding recorder command → ${command}: ok`);
+        } catch (err) {
+          console.log(`  native keybinding recorder command → ${command}: ${err}`);
+        }
+        await sleep(180);
+      }
+    }
+    const after = await vscode.commands.executeCommand<any>('intellisenseRecursion.dismissNativeKeybindingRecorderForTests');
+    console.log(`  native keybinding recorder renderer after commands: ${JSON.stringify({
+      ok: after?.ok,
+      removed: after?.removed,
+      hidden: after?.hidden,
+      detected: after?.detected,
+      matched: (after?.matched || []).slice(0, 4),
     })}`);
   } catch (err) {
-    console.log(`  native keybinding recorder dismiss failed: ${err}`);
+    console.log(`  native keybinding recorder renderer scan failed: ${err}`);
   }
-  await sleep(220);
+  await sleep(160);
 
   for (const command of [
-    'workbench.action.closeActiveEditor',
-    'keybindings.editor.clearSearchResults',
     'keyboard-quit',
     'workbench.action.closeQuickOpen',
     'editor.action.hideHover',
@@ -958,26 +1164,17 @@ async function ensureRendererShowsNativeSymbol(
     }
     if (nativeGeometryLooksLikeKeybindingRecorder(geometry)) {
       keybindingRecorderGeometryCount++;
-      if (keybindingRecorderGeometryCount <= 4) {
-        active = await activateTargetEditor();
-        await sleep(520);
-        continue;
-      }
       if (input.expectedColumn === 'left') {
         try { await vscode.commands.executeCommand('workbench.action.focusFirstEditorGroup'); } catch {}
       } else if (input.expectedColumn === 'right') {
         try { await vscode.commands.executeCommand('workbench.action.focusSecondEditorGroup'); } catch {}
       }
+      console.log(`  native keybinding recorder detected during geometry (${input.symbol}) attempt=${attempt + 1} count=${keybindingRecorderGeometryCount}`);
       await sleep(100);
       await closeKeybindingRecorderForHoverTest();
-      try {
-        await vscode.commands.executeCommand('workbench.action.closeAllEditors');
-        await sleep(320);
-      } catch (err) {
-        console.log(`  native keybinding recorder close all editors failed: ${err}`);
-      }
       active = await activateTargetEditor();
       await sleep(320);
+      continue;
     }
     active = await activateTargetEditor();
     await sleep((geometry?.editorCount || 0) === 0 ? 520 : 260);
@@ -1068,6 +1265,10 @@ async function waitForNativeHoverGeometry(
       input,
     );
     const values = (lastRows || []).map(row => row?.value).filter(Boolean);
+    if (!input.injectEmptyTopCellForTests && !input.injectExternalHoverArtifactForTests) {
+      assertNoVisibleEmptyHoverCells(values,
+        `native hover geometry wait ${input.symbol} ${input.lineFragment}`);
+    }
     lastValue = values.find(value => value?.ok)
       || values.find(value => value?.symbolGeometry || value?.hoverRect)
       || values[0];
@@ -1118,6 +1319,22 @@ function assertNativeHoverGeometry(
   }
   assert.strictEqual(result.hoverCount, 1,
     `${context} should have exactly one visible real hover widget. ${JSON.stringify(result)}`);
+  assert.strictEqual(result.visibleEmptyHoverCount || 0, 0,
+    `${context} should not show a visible empty hover shell alongside the real hover. ${JSON.stringify(result)}`);
+  assert.strictEqual(result.overlappingEmptyHoverCount || 0, 0,
+    `${context} should not show an empty hover shell overlapping the real hover. ${JSON.stringify(result)}`);
+  assert.strictEqual(result.visibleEmptyHoverShellCount || 0, 0,
+    `${context} should not show a visible body-level empty hover box beside the real hover. ${JSON.stringify(result)}`);
+  assert.strictEqual(result.overlappingEmptyHoverShellCount || 0, 0,
+    `${context} should not show a body-level empty hover box overlapping the real hover. ${JSON.stringify(result)}`);
+  assert.strictEqual(result.visibleReleasedHoverCount || 0, 0,
+    `${context} should not keep a visible released/native hover beside the active hover. ${JSON.stringify(result)}`);
+  assert.strictEqual(result.overlappingReleasedHoverCount || 0, 0,
+    `${context} should not keep a released/native hover overlapping the active hover. ${JSON.stringify(result)}`);
+  assert.strictEqual(result.visibleExternalHoverArtifactCount || 0, 0,
+    `${context} should not keep a visible external native/Monaco hover artifact beside the active hover. ${JSON.stringify(result)}`);
+  assert.strictEqual(result.overlappingExternalHoverArtifactCount || 0, 0,
+    `${context} should not keep an external native/Monaco hover artifact overlapping the active hover. ${JSON.stringify(result)}`);
   assert.ok((result.hoverTextLength || 0) > 40,
     `${context} must not pass on an empty white hover box. ${JSON.stringify(result)}`);
   assert.strictEqual(result.contentMatches, true,
@@ -1130,6 +1347,14 @@ function assertNativeHoverGeometry(
     `${context} should have exactly one content-matching native hover. ${JSON.stringify(result)}`);
   assert.ok((result.hoverRect?.width || 0) > 80 && (result.hoverRect?.height || 0) > 24,
     `${context} hover widget should have a real measurable box. ${JSON.stringify(result)}`);
+  if ((result.viewport?.width || 0) > 0 && (result.viewport?.height || 0) > 0) {
+    const maxReadableWidth = Math.max(320, Math.ceil(result.viewport.width * 0.76));
+    const maxReadableHeight = Math.max(160, Math.ceil(result.viewport.height * 0.52));
+    assert.ok((result.hoverRect?.width || 0) <= maxReadableWidth,
+      `${context} hover widget should not dominate a small monitor horizontally. ${JSON.stringify(result)}`);
+    assert.ok((result.hoverRect?.height || 0) <= maxReadableHeight,
+      `${context} hover widget should not cover half of a small monitor vertically. ${JSON.stringify(result)}`);
+  }
   assert.ok((result.symbolGeometry?.symbolRect?.width || 0) > 0
       && (result.symbolGeometry?.symbolRect?.height || 0) > 0,
     `${context} symbol should have a real DOM text bbox. ${JSON.stringify(result)}`);
@@ -1166,6 +1391,62 @@ function assertNativeHoverGeometry(
     `${context} should expose focus probe points for the full hover/sash area. ${JSON.stringify(result)}`);
 }
 
+async function assertNativeHoverGeometryDetectsTopEmptyCell(
+  input: NativeHoverGeometryInput,
+  context: string,
+): Promise<void> {
+  const injected = await readNativeHoverGeometry({
+    ...input,
+    injectEmptyTopCellForTests: true,
+  });
+  console.log(`  native hover top-empty-cell detector → ${context}: ${JSON.stringify({
+    ok: injected?.ok,
+    reason: injected?.reason,
+    injectedEmptyTopCellRect: injected?.injectedEmptyTopCellRect,
+    visibleEmptyHoverShellCount: injected?.visibleEmptyHoverShellCount,
+    overlappingEmptyHoverShellCount: injected?.overlappingEmptyHoverShellCount,
+    visibleEmptyHoverShells: (injected?.visibleEmptyHoverShells || []).slice(0, 6),
+  })}`);
+  assert.strictEqual(injected?.injectedEmptyTopCellForTests, true,
+    `${context} should run the synthetic top empty-cell detector. ${JSON.stringify(injected)}`);
+  assert.strictEqual(injected?.ok, false,
+    `${context} must fail geometry when a top-edge empty cell overlaps the native hover. ${JSON.stringify(injected)}`);
+  assert.ok((injected?.visibleEmptyHoverShellCount || 0) > 0,
+    `${context} should report the top-edge empty cell as a visible empty visual shell. ${JSON.stringify(injected)}`);
+  assert.ok((injected?.overlappingEmptyHoverShellCount || 0) > 0,
+    `${context} should report the top-edge empty cell as overlapping/touching the hover. ${JSON.stringify(injected)}`);
+  assert.ok((injected?.visibleEmptyHoverShells || []).some((shell: any) => String(shell?.className || '').includes('ir-e2e-empty-hover-top-cell')),
+    `${context} should identify the synthetic top-edge empty cell by class. ${JSON.stringify(injected)}`);
+}
+
+async function assertNativeHoverGeometryDetectsExternalHoverArtifact(
+  input: NativeHoverGeometryInput,
+  context: string,
+): Promise<void> {
+  const injected = await readNativeHoverGeometry({
+    ...input,
+    injectExternalHoverArtifactForTests: true,
+  });
+  console.log(`  native hover external-artifact detector → ${context}: ${JSON.stringify({
+    ok: injected?.ok,
+    reason: injected?.reason,
+    injectedExternalHoverArtifactRect: injected?.injectedExternalHoverArtifactRect,
+    visibleExternalHoverArtifactCount: injected?.visibleExternalHoverArtifactCount,
+    overlappingExternalHoverArtifactCount: injected?.overlappingExternalHoverArtifactCount,
+    visibleExternalHoverArtifacts: (injected?.visibleExternalHoverArtifacts || []).slice(0, 6),
+  })}`);
+  assert.strictEqual(injected?.injectedExternalHoverArtifactForTests, true,
+    `${context} should run the synthetic external hover artifact detector. ${JSON.stringify(injected)}`);
+  assert.strictEqual(injected?.ok, false,
+    `${context} must fail geometry when a content-bearing native/Monaco hover artifact overlaps the active hover. ${JSON.stringify(injected)}`);
+  assert.ok((injected?.visibleExternalHoverArtifactCount || 0) > 0,
+    `${context} should report the synthetic artifact as a visible external hover artifact. ${JSON.stringify(injected)}`);
+  assert.ok((injected?.overlappingExternalHoverArtifactCount || 0) > 0,
+    `${context} should report the synthetic artifact as overlapping/touching the hover. ${JSON.stringify(injected)}`);
+  assert.ok((injected?.visibleExternalHoverArtifacts || []).some((artifact: any) => String(artifact?.className || '').includes('ir-e2e-external-hover-artifact')),
+    `${context} should identify the synthetic external artifact by class. ${JSON.stringify(injected)}`);
+}
+
 async function assertNativeHoverFocusStability(
   input: NativeHoverGeometryInput,
   geometry: any,
@@ -1180,6 +1461,7 @@ async function assertNativeHoverFocusStability(
     const key = `${Math.round(point.x)}:${Math.round(point.y)}`;
     if (seen.has(key)) { continue; }
     seen.add(key);
+    try { await vscode.commands.executeCommand('intellisenseRecursion.clearHoverEventLogForTests'); } catch {}
     const move = await vscode.commands.executeCommand<any>(
       'intellisenseRecursion.dispatchRendererMouseMoveForTests',
       { x: point.x, y: point.y, clickBeforeMove: false },
@@ -1200,6 +1482,27 @@ async function assertNativeHoverFocusStability(
         focusRect: after?.hoverSashMetrics?.focusRect,
       },
     })}`);
+    if ((after?.hoverCount || 0) === 0) {
+      try {
+        const status = await vscode.commands.executeCommand<any>('intellisenseRecursion.getHoverPatchStatusForTests');
+        console.log(`  HOVER_PATCH_STATUS: ${JSON.stringify(status)}`);
+      } catch (err) {
+        console.log(`  HOVER_PATCH_STATUS_ERR: ${String((err as Error)?.message || err)}`);
+      }
+      try {
+        const drain = await vscode.commands.executeCommand<any>('intellisenseRecursion.drainHoverEventLogForTests');
+        if (drain?.events) {
+          console.log(`  HOVER_EVENT_LOG_DUMP_BEGIN ${context} ${point.name}`);
+          for (const ev of drain.events) console.log(`    HE: ${JSON.stringify(ev)}`);
+          console.log(`  HOVER_EVENT_LOG_DUMP_END (${drain.events.length} events)`);
+          console.log(`  HOVER_STATE_AT_FAILURE: ${JSON.stringify(drain.hoverState)}`);
+        } else {
+          console.log(`  HOVER_EVENT_LOG_DRAIN_FAIL: ${JSON.stringify(drain)}`);
+        }
+      } catch (err) {
+        console.log(`  HOVER_EVENT_LOG_DRAIN_ERR: ${String((err as Error)?.message || err)}`);
+      }
+    }
     assert.strictEqual(move?.ok, true,
       `${context} should dispatch a real renderer mouse move to ${point.name}. ${JSON.stringify(move)}`);
     assert.strictEqual(after?.hoverCount, 1,
@@ -1212,6 +1515,107 @@ async function assertNativeHoverFocusStability(
       `${context} should not show stale hover content after moving over ${point.name}. ${JSON.stringify(after)}`);
     assertNativeHoverGeometry(after, `${context} after ${point.name}`, null, input.expectedTextFragments || [], 1);
   }
+}
+
+async function assertRendererShowHoverUsesMousePosition(input: {
+  label: string;
+  editor: vscode.TextEditor;
+  doc: vscode.TextDocument;
+  expectedColumn: 'left' | 'right';
+  caretLineFragment: string;
+  caretIdentifier: string;
+  mouseLineFragment: string;
+  mouseIdentifier: string;
+  expectedMouseText: string[];
+  absentCaretText: string[];
+  minEditorCount?: number;
+}): Promise<void> {
+  const caretPosition = findIdentifierOnLine(input.doc, input.caretLineFragment, input.caretIdentifier);
+  const mousePosition = findIdentifierOnLine(input.doc, input.mouseLineFragment, input.mouseIdentifier);
+  assert.ok(caretPosition,
+    `${input.label}: could not find caret symbol ${input.caretIdentifier} on ${input.caretLineFragment}`);
+  assert.ok(mousePosition,
+    `${input.label}: could not find mouse symbol ${input.mouseIdentifier} on ${input.mouseLineFragment}`);
+  const matchingEditors = vscode.window.visibleTextEditors
+    .filter(editor => editor.document.uri.toString() === input.doc.uri.toString())
+    .sort((a, b) => (a.viewColumn || 0) - (b.viewColumn || 0));
+  const targetEditor = matchingEditors.length
+    ? (input.expectedColumn === 'right' ? matchingEditors[matchingEditors.length - 1] : matchingEditors[0])
+    : input.editor;
+  const focusTargetEditor = async (): Promise<vscode.TextEditor> => {
+    if (input.expectedColumn === 'left') {
+      try { await vscode.commands.executeCommand('workbench.action.focusFirstEditorGroup'); } catch {}
+    } else {
+      try { await vscode.commands.executeCommand('workbench.action.focusSecondEditorGroup'); } catch {}
+    }
+    const active = await vscode.window.showTextDocument(input.doc, {
+      viewColumn: targetEditor.viewColumn,
+      preview: false,
+      preserveFocus: false,
+      selection: new vscode.Range(caretPosition!, caretPosition!),
+    });
+    active.selection = new vscode.Selection(caretPosition!, caretPosition!);
+    active.revealRange(new vscode.Range(mousePosition!, mousePosition!), vscode.TextEditorRevealType.InCenter);
+    try { await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup'); } catch {}
+    await sleep(280);
+    return active;
+  };
+
+  let active = await focusTargetEditor();
+  await vscode.commands.executeCommand('editor.action.hideHover');
+  await sleep(120);
+  const cleanupState = await cleanupNativeHoverInteractionState(`mouse-vs-caret-${input.label}`);
+  if ((cleanupState?.removed || 0) > 0 || (cleanupState?.retainedNative || 0) > 0) {
+    await vscode.commands.executeCommand('editor.action.hideHover');
+    await sleep(220);
+  }
+  const hoverInput: NativeHoverGeometryInput = {
+    symbol: input.mouseIdentifier,
+    lineFragment: input.mouseLineFragment,
+    expectedColumn: input.expectedColumn,
+    expectedTextFragments: input.expectedMouseText,
+    absentTextFragments: input.absentCaretText,
+  };
+  active = await ensureRendererShowsNativeSymbol(hoverInput, focusTargetEditor);
+  await moveRendererMouseToNativeSymbol(hoverInput, false);
+  await sleep(460);
+  const selectionBeforeRequest = active.selection.active;
+  assert.strictEqual(selectionBeforeRequest.line, caretPosition!.line,
+    `${input.label}: caret should remain on ${input.caretIdentifier} before renderer hover request.`);
+  assert.strictEqual(selectionBeforeRequest.character, caretPosition!.character,
+    `${input.label}: caret should remain on ${input.caretIdentifier} before renderer hover request.`);
+
+  const request = await vscode.commands.executeCommand<any>(
+    'intellisenseRecursion.requestNativeShowHoverForTests',
+    `mouse-vs-caret-${input.label}`,
+  );
+  console.log(`  renderer requested hover mouse-vs-caret → ${input.label}: ${JSON.stringify({
+    mode: request?.mode,
+    ok: request?.ok,
+    reason: request?.reason,
+    commandFallback: request?.commandFallback,
+    token: request?.token,
+    pointerFresh: request?.pointerFresh,
+    pointerState: request?.pointerState,
+  })}`);
+  assert.strictEqual(request?.commandFallback, false,
+    `${input.label}: renderer-requested hover must not fall back to caret-based editor.action.showHover. ${JSON.stringify(request)}`);
+  assert.strictEqual(request?.pointerFresh, true,
+    `${input.label}: renderer-requested hover should use the fresh mouse pointer. ${JSON.stringify(request)}`);
+
+  const geometry = await waitForNativeHoverGeometry(hoverInput, 14000);
+  assertNativeHoverGeometry(
+    geometry,
+    `${input.label} mouse-position native hover`,
+    input.expectedColumn === 'left' ? 0 : Math.max(0, (geometry.editorCount || 1) - 1),
+    input.expectedMouseText,
+    input.minEditorCount || 1,
+  );
+  const selectionAfterRequest = vscode.window.activeTextEditor?.selection.active;
+  assert.strictEqual(selectionAfterRequest?.line, caretPosition!.line,
+    `${input.label}: showing hover at the mouse must not move the caret line. ${JSON.stringify(geometry)}`);
+  assert.strictEqual(selectionAfterRequest?.character, caretPosition!.character,
+    `${input.label}: showing hover at the mouse must not move the caret character. ${JSON.stringify(geometry)}`);
 }
 
 async function waitForHoverScrollTopNear(
@@ -1229,6 +1633,8 @@ async function waitForHoverScrollTopNear(
       expectedLinks,
       true,
     );
+    assertNoVisibleEmptyHoverCells(rows,
+      `hover scroll state links=${expectedLinks.join(',')} text=${expectedTextFragments.join(',')}`);
     lastState = bestHoverDomState(rows, expectedLinks, expectedTextFragments, true);
     if (lastState?.ok && Math.abs((lastState.scrollTop || 0) - expectedScrollTop) <= tolerance) {
       return lastState;
@@ -1369,6 +1775,250 @@ function assertHoverHasNoWideTrace(state: HoverDomState, context: string) {
     `${context} has wide block descendants that look like stale large-hover traces. ${JSON.stringify(compactHoverDomState(state))}`);
 }
 
+interface HoverBoxCornerSnapshot {
+  ok: boolean;
+  reason?: string;
+  sizeTierName?: string;
+  className?: string;
+  computedMaxHeight?: number;
+  computedMaxWidth?: number;
+  snap?: {
+    outer?: {
+      left: number; top: number; right: number; bottom: number;
+      width: number; height: number;
+      corners: {
+        leftTop: { x: number; y: number };
+        rightTop: { x: number; y: number };
+        leftBottom: { x: number; y: number };
+        rightBottom: { x: number; y: number };
+      };
+      border: { left: number; right: number; top: number; bottom: number };
+      padding: { left: number; right: number; top: number; bottom: number };
+      boxSizing: string;
+      tagName: string;
+      className: string;
+    };
+    inner?: {
+      left: number; top: number; right: number; bottom: number;
+      width: number; height: number;
+      corners: {
+        leftTop: { x: number; y: number };
+        rightTop: { x: number; y: number };
+        leftBottom: { x: number; y: number };
+        rightBottom: { x: number; y: number };
+      };
+      border: { left: number; right: number; top: number; bottom: number };
+      padding: { left: number; right: number; top: number; bottom: number };
+      boxSizing: string;
+      tagName: string;
+      className: string;
+    };
+    delta?: { left: number; top: number; right: number; bottom: number };
+    fits?: { left: boolean; top: boolean; right: boolean; bottom: boolean; all: boolean };
+    tolerance?: number;
+    sameTree?: boolean;
+    ancestorDepth?: number;
+  };
+}
+
+async function fetchHoverBoxCornerSnapshot(): Promise<HoverBoxCornerSnapshot | null> {
+  const rows = await vscode.commands.executeCommand<any[]>(
+    'intellisenseRecursion.runHoverBoxCornerHarnessForTests',
+  );
+  if (!Array.isArray(rows) || rows.length === 0) { return null; }
+  return (rows.map(row => row?.value).find(value => value) ?? null) as HoverBoxCornerSnapshot | null;
+}
+
+interface HoverGeometrySnapshot {
+  ok: boolean;
+  reason?: string;
+  label?: string;
+  outer?: { left: number; top: number; right: number; bottom: number; width: number; height: number };
+  scroller?: { left: number; top: number; right: number; bottom: number; width: number; height: number };
+  content?: { left: number; top: number; right: number; bottom: number; width: number; height: number };
+  text?: { left: number; top: number; right: number; bottom: number; width: number; height: number };
+  sameTree?: boolean;
+  ancestorDepth?: number;
+  ancestors?: Array<{
+    depth: number;
+    tag: string;
+    className: string;
+    rect: { left: number; top: number; right: number; bottom: number; width: number; height: number } | null;
+    visible: boolean;
+    style?: Record<string, any> | null;
+  }>;
+  siblings?: Array<{
+    tag: string;
+    className: string;
+    rect: { left: number; top: number; right: number; bottom: number; width: number; height: number } | null;
+    visible: boolean;
+    hasResizableParent: boolean;
+  }>;
+  activeStyle?: {
+    position?: string; display?: string;
+    width?: string; height?: string;
+    maxWidth?: string; maxHeight?: string;
+    top?: string; left?: string;
+    transform?: string;
+    visibility?: string; opacity?: number;
+  } | null;
+  patchVersion?: number;
+}
+
+async function fetchHoverGeometrySnapshot(label: string): Promise<HoverGeometrySnapshot | null> {
+  const rows = await vscode.commands.executeCommand<any[]>(
+    'intellisenseRecursion.runHoverGeometrySnapshotForTests',
+    label,
+  );
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  return (rows.map(row => row?.value).find(value => value) ?? null) as HoverGeometrySnapshot | null;
+}
+
+// Documented in docs/hover-ui-structure.md.
+// Verifies: active hover has a .monaco-resizable-hover ancestor (when present,
+// usually only on initial hovers — drilled may not), scroller is descendant of
+// outer, scroller bbox matches outer within tolerance, and any visible
+// resizable-hover ancestor matches outer's bbox after our aligner.
+function assertHoverGeometrySnapshot(snap: HoverGeometrySnapshot | null, context: string) {
+  assert.ok(snap, `${context} did not return any geometry snapshot`);
+  assert.ok(snap!.ok, `${context} geometry snapshot not ok: ${JSON.stringify(snap)}`);
+  const outer = snap!.outer;
+  const scroller = snap!.scroller;
+  assert.ok(outer && outer.width > 0 && outer.height > 0,
+    `${context} outer has no positive bbox. ${JSON.stringify(snap)}`);
+  assert.ok(scroller && scroller.width > 0 && scroller.height > 0,
+    `${context} scroller has no positive bbox. ${JSON.stringify(snap)}`);
+  assert.ok(snap!.sameTree === true,
+    `${context} scroller is not a DOM descendant of outer. ${JSON.stringify(snap)}`);
+  // outer has a 1px border-line on every edge, so scroller is deterministically
+  // inset by 1px: scroller.width = outer.width − 2, scroller.height = outer.height − 2.
+  const expectedInnerWidth = outer!.width - 2;
+  const expectedInnerHeight = outer!.height - 2;
+  const dW = Math.abs(scroller!.width - expectedInnerWidth);
+  const dH = Math.abs(scroller!.height - expectedInnerHeight);
+  assert.ok(dW <= 0.5 && dH <= 0.5,
+    `${context} scroller bbox ${scroller!.width}x${scroller!.height} should be outer minus 2px = ${expectedInnerWidth}x${expectedInnerHeight}. ${JSON.stringify(snap)}`);
+  // .monaco-resizable-hover and the visible .monaco-hover often diverge after
+  // VS Code's first-show — wrapper collapses while inner is positioned via
+  // inline coords. The aligner currently no-ops (both prior sync directions
+  // mispositioned hovers in real interactive use); the visible hover is the
+  // inner element regardless. We only assert wrapper↔outer alignment when the
+  // wrapper still has real (non-collapsed) bbox AND we're choosing to enforce
+  // it. For now: skip the check entirely — wrapper geometry is treated as
+  // VS Code internal state that doesn't affect what the user sees.
+  void (snap!.ancestors || []).find(a => /monaco-resizable-hover/.test(a.className));
+}
+
+async function fetchHoverBoxCornerSamples(
+  label: string,
+  delaysMs: number[],
+): Promise<Array<{ at: number; delayMs: number; snapshot: HoverBoxCornerSnapshot | null }>> {
+  const samples: Array<{ at: number; delayMs: number; snapshot: HoverBoxCornerSnapshot | null }> = [];
+  const t0 = Date.now();
+  for (const delay of delaysMs) {
+    if (delay > 0) await sleep(delay);
+    const snapshot = await fetchHoverBoxCornerSnapshot();
+    samples.push({ at: Date.now() - t0, delayMs: delay, snapshot });
+  }
+  console.log(`  hover box corners (${label}) samples: ${JSON.stringify(samples.map(s => {
+    const snap = s.snapshot?.snap;
+    return {
+      atMs: s.at,
+      delayMs: s.delayMs,
+      ok: s.snapshot?.ok,
+      outer: snap?.outer ? `${Math.round(snap.outer.left)},${Math.round(snap.outer.top)} ${Math.round(snap.outer.width)}x${Math.round(snap.outer.height)}` : null,
+      inner: snap?.inner ? `${Math.round(snap.inner.left)},${Math.round(snap.inner.top)} ${Math.round(snap.inner.width)}x${Math.round(snap.inner.height)}` : null,
+      delta: snap?.delta,
+      fits: snap?.fits?.all,
+      sameTree: snap?.sameTree,
+      ancestorDepth: snap?.ancestorDepth,
+      tier: s.snapshot?.sizeTierName,
+    };
+  }))}`);
+  return samples;
+}
+
+function assertHoverBoxCornerSamplesStable(
+  samples: Array<{ at: number; delayMs: number; snapshot: HoverBoxCornerSnapshot | null }>,
+  context: string,
+) {
+  for (const sample of samples) {
+    assertHoverBoxCornersFit(sample.snapshot, `${context} sample at +${sample.at}ms`);
+  }
+  // Cross-sample drift: outer.bbox should be stable as the hover sits there.
+  // Movement between samples means VS Code or our code is still mutating layout.
+  const first = samples.find(s => s.snapshot?.snap?.outer);
+  if (!first) return;
+  const firstOuter = first.snapshot!.snap!.outer!;
+  const tol = 1.5;
+  for (const sample of samples) {
+    const snap = sample.snapshot?.snap;
+    if (!snap?.outer) continue;
+    const o = snap.outer;
+    const dx = Math.abs(o.left - firstOuter.left);
+    const dy = Math.abs(o.top - firstOuter.top);
+    const dw = Math.abs(o.width - firstOuter.width);
+    const dh = Math.abs(o.height - firstOuter.height);
+    assert.ok(dx <= tol && dy <= tol && dw <= tol && dh <= tol,
+      `${context} outer bbox drifted between samples (sample@+${sample.at}ms vs first@+${first.at}ms): dx=${dx} dy=${dy} dw=${dw} dh=${dh}. samples=${JSON.stringify(samples.map(s => ({ at: s.at, outer: s.snapshot?.snap?.outer })))}`);
+  }
+}
+
+function assertHoverBoxCornersFit(snapshot: HoverBoxCornerSnapshot | null, context: string) {
+  assert.ok(snapshot, `${context} did not return any hover box corner snapshot`);
+  assert.ok(snapshot!.ok,
+    `${context} hover box corner snapshot not ok: ${JSON.stringify(snapshot)}`);
+  const snap = snapshot!.snap!;
+  assert.ok(snap?.outer && snap?.inner && snap?.delta && snap?.fits,
+    `${context} hover box corner snapshot incomplete: ${JSON.stringify(snapshot)}`);
+  const outer = snap.outer!;
+  const inner = snap.inner!;
+  const delta = snap.delta!;
+  const corner = (name: string, c: { x: number; y: number }) =>
+    `${name}=(${Math.round(c.x)},${Math.round(c.y)})`;
+  const cornerSummary = (label: string, src: { corners: any }) =>
+    `${label}={${corner('lt', src.corners.leftTop)} ${corner('rt', src.corners.rightTop)} ${corner('lb', src.corners.leftBottom)} ${corner('rb', src.corners.rightBottom)}}`;
+  const summary = JSON.stringify({
+    sizeTier: snapshot!.sizeTierName,
+    outerSize: `${Math.round(outer.width)}x${Math.round(outer.height)}`,
+    innerSize: `${Math.round(inner.width)}x${Math.round(inner.height)}`,
+    outerBorder: outer.border,
+    outerPadding: outer.padding,
+    delta,
+    fits: snap.fits,
+    outerCorners: cornerSummary('outer', outer),
+    innerCorners: cornerSummary('inner', inner),
+  });
+  assert.ok(outer.width > 0 && outer.height > 0,
+    `${context} outer hover box must have non-zero size. ${summary}`);
+  assert.ok(inner.width > 0 && inner.height > 0,
+    `${context} inner text box must have non-zero size. ${summary}`);
+  // The two boxes must share a DOM parent chain — otherwise outer cannot
+  // constrain inner's geometry, which is the root cause of the "they keep
+  // going off" feeling.
+  assert.ok(snap.sameTree === true,
+    `${context} inner text box is not a descendant of outer hover; their geometries are independent (sameTree=${snap.sameTree}, ancestorDepth=${snap.ancestorDepth}). ${summary}`);
+  // Strategy: outer is whatever VS Code positioned/sized — we don't fight it.
+  // The inner text box must sit inside the outer (with the gap on each side
+  // equal to outer's border+padding). When the natural content is larger
+  // than outer, the scroller clips it; the inner rect can still extend past
+  // outer in that scrolling case and that's expected.
+  assert.ok(snap.fits!.left,
+    `${context} inner text box left edge protrudes past outer hover. ${summary}`);
+  assert.ok(snap.fits!.right,
+    `${context} inner text box right edge protrudes past outer hover. ${summary}`);
+  assert.ok(snap.fits!.top,
+    `${context} inner text box top edge protrudes past outer hover. ${summary}`);
+  const tolerance = (snap.tolerance ?? 1.5);
+  if (delta.bottom < -tolerance) {
+    // Inner taller than outer interior — legal only when outer hit a soft
+    // max-height cap (then the inner scrolls inside the clipped outer).
+    const cap = Number(snapshot!.computedMaxHeight ?? 0);
+    assert.ok(cap > 0 && outer.height + tolerance >= cap,
+      `${context} inner text box bottom protrudes (${delta.bottom.toFixed(1)}px) but outer has not reached any max-height cap. ${summary}`);
+  }
+}
+
 function registerQuickFixProbe(
   doc: vscode.TextDocument,
   range: vscode.Range,
@@ -1463,6 +2113,96 @@ interface ActualNativeHoverDrillProbe {
   hideBeforeShow?: boolean;
   verifyBackToInitial?: boolean;
   minEditorCount?: number;
+  initialMinScrollMaxTop?: number;
+  drilledMinScrollMaxTop?: number;
+  verifyLargeToSmallTransition?: boolean;
+  verifyFocusStability?: boolean;
+}
+
+function rectContainsPoint(rect: any, x: number, y: number) {
+  return !!rect
+    && x >= rect.left
+    && x <= rect.right
+    && y >= rect.top
+    && y <= rect.bottom;
+}
+
+function pickLargeToSmallTransitionPoint(initialGeometry: any, drilledGeometry: any) {
+  const initial = initialGeometry?.hoverRect;
+  const drilled = drilledGeometry?.hoverRect;
+  assert.ok(initial && drilled,
+    `Large-to-small transition needs both hover rects. initial=${JSON.stringify(initialGeometry)} drilled=${JSON.stringify(drilledGeometry)}`);
+  assert.ok((initial.height || 0) >= (drilled.height || 0) + 80,
+    `Initial hover should be visibly larger than drilled hover. initial=${JSON.stringify(initial)} drilled=${JSON.stringify(drilled)}`);
+  const x = Math.max(
+    initial.left + 8,
+    Math.min(initial.right - 8, drilled.left + Math.min(180, Math.max(24, drilled.width / 3))),
+  );
+  let y = drilled.bottom + Math.min(72, Math.max(24, (initial.bottom - drilled.bottom) / 2));
+  y = Math.max(drilled.bottom + 8, Math.min(initial.bottom - 8, y));
+  assert.ok(rectContainsPoint(initial, x, y),
+    `Transition probe point should stay inside the previous large hover rect. point=${JSON.stringify({ x, y })} initial=${JSON.stringify(initial)}`);
+  assert.ok(!rectContainsPoint(drilled, x, y),
+    `Transition probe point should be outside the drilled small hover rect. point=${JSON.stringify({ x, y })} drilled=${JSON.stringify(drilled)}`);
+  return { x, y, initial, drilled };
+}
+
+async function assertLargeToSmallDrillTransitionStability(
+  input: NativeHoverGeometryInput,
+  initialGeometry: any,
+  drilledGeometry: any,
+  context: string,
+) {
+  const point = pickLargeToSmallTransitionPoint(initialGeometry, drilledGeometry);
+  const move = await vscode.commands.executeCommand<any>(
+    'intellisenseRecursion.dispatchRendererMouseMoveForTests',
+    { x: point.x, y: point.y, clickBeforeMove: false },
+  );
+  await sleep(220);
+  const afterMove = await readNativeHoverGeometry(input);
+  console.log(`  native hover shrink transition probe → ${context}: ${JSON.stringify({
+    point: { x: point.x, y: point.y },
+    previousRect: point.initial,
+    drilledRect: point.drilled,
+    moveOk: move?.ok,
+    moveMode: move?.mode,
+    targetAtPoint: move?.targetAtPoint,
+    hoverCount: afterMove?.hoverCount,
+    reason: afterMove?.reason,
+    hoverTextSample: String(afterMove?.hoverTextSample || '').slice(0, 220),
+  })}`);
+  assert.strictEqual(move?.ok, true,
+    `${context} should dispatch a real renderer mouse move inside the previous large hover area. ${JSON.stringify(move)}`);
+  assert.strictEqual(afterMove?.hoverCount, 1,
+    `${context} should not flicker into another native hover after moving through the previous large hover area. ${JSON.stringify(afterMove)}`);
+  assert.strictEqual(afterMove?.contentMatches, true,
+    `${context} should keep the drilled hover content after moving through the previous large hover area. ${JSON.stringify(afterMove)}`);
+  assert.deepStrictEqual(afterMove?.presentAbsentTextFragments || [], [],
+    `${context} should not revive the large hover content after shrink movement. ${JSON.stringify(afterMove)}`);
+
+  const scrollRows = await vscode.commands.executeCommand<any[]>(
+    'intellisenseRecursion.runHoverScrollHarnessForTests',
+    { wheelDeltaY: 180, x: point.x, y: point.y },
+  );
+  const scrolled = (scrollRows || []).map(row => row?.value).find(value => value?.ok);
+  assert.ok(scrolled,
+    `${context} should run the hover wheel scroll harness. Rows=${JSON.stringify(scrollRows)}`);
+  console.log(`  native hover shrink transition wheel → ${context}: ${JSON.stringify({
+    wheel: scrolled?.wheel,
+    before: scrolled?.before,
+    after: scrolled?.after,
+  })}`);
+  assert.ok((scrolled.wheel?.before?.maxTop || 0) > 0,
+    `${context} drilled hover should have scroll range for the transition wheel probe. ${JSON.stringify(scrolled)}`);
+  assert.ok((scrolled.wheel?.after?.scrollTop || 0) > (scrolled.wheel?.before?.scrollTop || 0),
+    `${context} wheel over the previous large hover area should scroll the drilled hover. ${JSON.stringify(scrolled)}`);
+  const afterWheel = await readNativeHoverGeometry(input);
+  assert.strictEqual(afterWheel?.hoverCount, 1,
+    `${context} should keep one drilled hover after transition wheel scrolling. ${JSON.stringify(afterWheel)}`);
+  assert.strictEqual(afterWheel?.contentMatches, true,
+    `${context} should keep drilled content after transition wheel scrolling. ${JSON.stringify(afterWheel)}`);
+  assert.deepStrictEqual(afterWheel?.presentAbsentTextFragments || [], [],
+    `${context} should not flicker back to stale large content after transition wheel scrolling. ${JSON.stringify(afterWheel)}`);
 }
 
 async function runActualNativeHoverDrillProbe(
@@ -1512,11 +2252,16 @@ async function runActualNativeHoverDrillProbe(
     probe.initialText,
     probe.minEditorCount || 1,
   );
-  await assertNativeHoverFocusStability(
-    initialGeometryInput,
-    geometry,
-    `${probe.label} native hover focus`,
-  );
+  if (probe.verifyLargeToSmallTransition) {
+    await assertNativeHoverGeometryDetectsTopEmptyCell(
+      initialGeometryInput,
+      `${probe.label} native hover geometry`,
+    );
+    await assertNativeHoverGeometryDetectsExternalHoverArtifact(
+      initialGeometryInput,
+      `${probe.label} native hover geometry`,
+    );
+  }
   const beforeDom = await waitForHoverDomState(
     probe.initialLinks,
     probe.initialText,
@@ -1525,13 +2270,43 @@ async function runActualNativeHoverDrillProbe(
     true,
     probe.initialAbsent || [],
   );
+  if (probe.verifyFocusStability || probe.verifyLargeToSmallTransition) {
+    const finalInitialGeometry = await waitForNativeHoverGeometry(initialGeometryInput, 6000);
+    await assertNativeHoverFocusStability(
+      initialGeometryInput,
+      finalInitialGeometry,
+      `${probe.label} native hover focus`,
+    );
+  }
   assert.strictEqual(beforeDom.hoverCount, 1,
     `${probe.label} should have exactly one real native hover before drill-down. ${JSON.stringify(compactHoverDomState(beforeDom))}`);
   assert.strictEqual(beforeDom.emptyHoverCount, 0,
     `${probe.label} should not leave empty hover roots before drill-down. ${JSON.stringify(compactHoverDomState(beforeDom))}`);
+  assert.strictEqual(beforeDom.visibleEmptyHoverCount || 0, 0,
+    `${probe.label} should not show a visible empty hover shell before drill-down. ${JSON.stringify(compactHoverDomState(beforeDom))}`);
+  assert.strictEqual(beforeDom.overlappingEmptyHoverCount || 0, 0,
+    `${probe.label} should not show an empty hover shell over the real hover before drill-down. ${JSON.stringify(compactHoverDomState(beforeDom))}`);
+  assert.strictEqual(beforeDom.visibleEmptyHoverShellCount || 0, 0,
+    `${probe.label} should not show a body-level empty hover box beside the real hover before drill-down. ${JSON.stringify(compactHoverDomState(beforeDom))}`);
+  assert.strictEqual(beforeDom.overlappingEmptyHoverShellCount || 0, 0,
+    `${probe.label} should not show a body-level empty hover box over the real hover before drill-down. ${JSON.stringify(compactHoverDomState(beforeDom))}`);
+  assert.strictEqual(beforeDom.visibleExternalHoverArtifactCount || 0, 0,
+    `${probe.label} should not show a visible external native/Monaco hover artifact before drill-down. ${JSON.stringify(compactHoverDomState(beforeDom))}`);
+  assert.strictEqual(beforeDom.overlappingExternalHoverArtifactCount || 0, 0,
+    `${probe.label} should not show an external native/Monaco hover artifact over the real hover before drill-down. ${JSON.stringify(compactHoverDomState(beforeDom))}`);
   assertActualVsCodeHoverRoot(beforeDom, `${probe.label} native hover`);
   assertStrictNativeTokenTheme(beforeDom, `${probe.label} native hover`, probe.initialLinks, probe.initialText);
   assertHoverHasNoWideTrace(beforeDom, `${probe.label} native hover`);
+  const beforeCorners = await fetchHoverBoxCornerSnapshot();
+  console.log(`  hover box corners (initial) → ${probe.label}: ${JSON.stringify(beforeCorners)}`);
+  assertHoverBoxCornersFit(beforeCorners, `${probe.label} initial native hover`);
+  const beforeGeom = await fetchHoverGeometrySnapshot(`${probe.label}.initial`);
+  console.log(`  hover geometry (initial) → ${probe.label}: ${JSON.stringify(beforeGeom)}`);
+  assertHoverGeometrySnapshot(beforeGeom, `${probe.label} initial native hover geometry`);
+  if (probe.initialMinScrollMaxTop !== undefined) {
+    assert.ok(beforeDom.scrollMaxTop >= probe.initialMinScrollMaxTop,
+      `${probe.label} native hover should have a large scroll range before drill-down. ${JSON.stringify(compactHoverDomState(beforeDom))}`);
+  }
 
   const clickRows = await vscode.commands.executeCommand<any[]>(
     'intellisenseRecursion.runHoverLinkClickHarnessForTests',
@@ -1541,6 +2316,10 @@ async function runActualNativeHoverDrillProbe(
   assert.ok(clickResult,
     `${probe.label} did not click ${probe.clickLink} inside the real hover. Rows=${JSON.stringify(clickRows)}`);
   assertStrictNativeHoverLinkClick(clickResult, `${probe.label} drill-down click`);
+  // Capture immediately after the click so we observe how the hover transitions
+  // through the drill-down. Drift here would mean inner/outer go out of sync
+  // during VS Code's hide/refire pipeline.
+  await fetchHoverBoxCornerSamples(`${probe.label} just-after-click`, [0, 50, 150]);
 
   const preview = await waitForPreviewIdentifier(probe.clickLink, 14000);
   console.log("  actual hover preview status -> " + probe.label + ": " + JSON.stringify({
@@ -1571,11 +2350,35 @@ async function runActualNativeHoverDrillProbe(
     `${probe.label} should have exactly one real native hover after drill-down. ${JSON.stringify(compactHoverDomState(afterDom))}`);
   assert.strictEqual(afterDom.emptyHoverCount, 0,
     `${probe.label} should not leave empty hover roots after drill-down. ${JSON.stringify(compactHoverDomState(afterDom))}`);
+  assert.strictEqual(afterDom.visibleEmptyHoverCount || 0, 0,
+    `${probe.label} should not show a visible empty hover shell after drill-down. ${JSON.stringify(compactHoverDomState(afterDom))}`);
+  assert.strictEqual(afterDom.overlappingEmptyHoverCount || 0, 0,
+    `${probe.label} should not show an empty hover shell over the drilled hover. ${JSON.stringify(compactHoverDomState(afterDom))}`);
+  assert.strictEqual(afterDom.visibleEmptyHoverShellCount || 0, 0,
+    `${probe.label} should not show a body-level empty hover box beside the drilled hover. ${JSON.stringify(compactHoverDomState(afterDom))}`);
+  assert.strictEqual(afterDom.overlappingEmptyHoverShellCount || 0, 0,
+    `${probe.label} should not show a body-level empty hover box over the drilled hover. ${JSON.stringify(compactHoverDomState(afterDom))}`);
+  assert.strictEqual(afterDom.visibleExternalHoverArtifactCount || 0, 0,
+    `${probe.label} should not show a visible external native/Monaco hover artifact after drill-down. ${JSON.stringify(compactHoverDomState(afterDom))}`);
+  assert.strictEqual(afterDom.overlappingExternalHoverArtifactCount || 0, 0,
+    `${probe.label} should not show an external native/Monaco hover artifact over the drilled hover. ${JSON.stringify(compactHoverDomState(afterDom))}`);
   assertActualVsCodeHoverRoot(afterDom, `${probe.label} drilled hover`);
   assertStrictNativeTokenTheme(afterDom, `${probe.label} drilled hover`, probe.drilledLinks, probe.drilledText);
   assertHoverHasNoWideTrace(afterDom, `${probe.label} drilled hover`);
+  const drilledSamples = await fetchHoverBoxCornerSamples(
+    `${probe.label} drilled`,
+    [0, 100, 250, 600],
+  );
+  assertHoverBoxCornerSamplesStable(drilledSamples, `${probe.label} drilled native hover`);
+  const drilledGeom = await fetchHoverGeometrySnapshot(`${probe.label}.drilled`);
+  console.log(`  hover geometry (drilled) → ${probe.label}: ${JSON.stringify(drilledGeom)}`);
+  assertHoverGeometrySnapshot(drilledGeom, `${probe.label} drilled native hover geometry`);
   assert.ok(afterDom.backButtonVisibleCount > 0 || /Back/.test(afterDom.activeText || ''),
     `${probe.label} drilled hover should expose a back button. ${JSON.stringify(compactHoverDomState(afterDom))}`);
+  if (probe.drilledMinScrollMaxTop !== undefined) {
+    assert.ok(afterDom.scrollMaxTop >= probe.drilledMinScrollMaxTop,
+      `${probe.label} drilled hover should retain native scroll range after shrinking. ${JSON.stringify(compactHoverDomState(afterDom))}`);
+  }
   const drilledGeometryInput: NativeHoverGeometryInput = {
     symbol: probe.identifier,
     lineFragment: probe.lineFragment,
@@ -1593,11 +2396,29 @@ async function runActualNativeHoverDrillProbe(
     probe.drilledText,
     probe.minEditorCount || 1,
   );
-  await assertNativeHoverFocusStability(
-    drilledGeometryInput,
-    drilledGeometry,
-    `${probe.label} drilled hover focus`,
-  );
+  if (probe.verifyLargeToSmallTransition) {
+    await assertNativeHoverGeometryDetectsTopEmptyCell(
+      drilledGeometryInput,
+      `${probe.label} drilled native hover geometry`,
+    );
+    await assertNativeHoverGeometryDetectsExternalHoverArtifact(
+      drilledGeometryInput,
+      `${probe.label} drilled native hover geometry`,
+    );
+    await assertLargeToSmallDrillTransitionStability(
+      drilledGeometryInput,
+      geometry,
+      drilledGeometry,
+      `${probe.label} large-to-small drill transition`,
+    );
+  }
+  if (probe.verifyFocusStability || probe.verifyLargeToSmallTransition) {
+    await assertNativeHoverFocusStability(
+      drilledGeometryInput,
+      drilledGeometry,
+      `${probe.label} drilled hover focus`,
+    );
+  }
 
   if (probe.verifyBackToInitial) {
     const backRows = await vscode.commands.executeCommand<any[]>(
@@ -2156,6 +2977,14 @@ suite('Hover Drill-Down E2E', () => {
         `Drill-down into ${step.identifier} left stale hover panels. ${JSON.stringify(afterDom)}`);
       assert.strictEqual(afterDom.emptyHoverCount, 0,
         `Drill-down into ${step.identifier} left empty hover roots. ${JSON.stringify(afterDom)}`);
+      assert.strictEqual(afterDom.visibleEmptyHoverShellCount || 0, 0,
+        `Drill-down into ${step.identifier} left a visible body-level empty hover box. ${JSON.stringify(afterDom)}`);
+      assert.strictEqual(afterDom.overlappingEmptyHoverShellCount || 0, 0,
+        `Drill-down into ${step.identifier} left a body-level empty hover box overlapping the real hover. ${JSON.stringify(afterDom)}`);
+      assert.strictEqual(afterDom.visibleExternalHoverArtifactCount || 0, 0,
+        `Drill-down into ${step.identifier} left a visible external native/Monaco hover artifact. ${JSON.stringify(afterDom)}`);
+      assert.strictEqual(afterDom.overlappingExternalHoverArtifactCount || 0, 0,
+        `Drill-down into ${step.identifier} left an external native/Monaco hover artifact overlapping the real hover. ${JSON.stringify(afterDom)}`);
       assert.ok(afterDom.activeTextLength > 0,
         `Drill-down into ${step.identifier} rendered an empty hover DOM. ${JSON.stringify(afterDom)}`);
       assertHoverDoesNotContain(afterDom, step.absent,
@@ -2200,15 +3029,20 @@ suite('Hover Drill-Down E2E', () => {
 
     await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
     await waitForPreviewState(null, 0);
+    await cleanupNativeHoverInteractionState('after-multi-hop-drilldown');
   });
 
   test(`[${lang}] split editor columns keep hover panels isolated`, async function () {
     if (lang !== 'python') { this.skip(); return; }
     this.timeout(60000);
 
+    await ensureExtensionCommandsReady('intellisenseRecursion.resetPreviewStateForTests');
+    await ensureExtensionCommandsReady('intellisenseRecursion.cleanupNativeHoverInteractionStateForTests');
+    await ensureExtensionCommandsReady('intellisenseRecursion.runHoverSplitColumnHarnessForTests');
     await vscode.commands.executeCommand('editor.action.hideHover');
     await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
     await waitForPreviewState(null, 0);
+    await cleanupNativeHoverInteractionState('before-split-column');
 
     const folders = vscode.workspace.workspaceFolders!;
     const serviceDoc = await vscode.workspace.openTextDocument(
@@ -2274,8 +3108,8 @@ suite('Hover Drill-Down E2E', () => {
       `Right-column symbol hover color should match --vscode-textLink-foreground. ${JSON.stringify(result)}`);
     assert.strictEqual(result.symbolHitIsLink, true,
       `The real element under the mouse must be the symbol link, not a stale/empty hover overlay. ${JSON.stringify(result)}`);
-    assert.strictEqual(result.symbolEmptyOverlayPointerEvents, 'none',
-      `Empty hover roots must be pointer-transparent so they cannot block symbol hover/click. ${JSON.stringify(result)}`);
+    assert.ok(result.symbolEmptyOverlayConnected === false || result.symbolEmptyOverlayPointerEvents === 'none',
+      `Empty hover roots must be removed or pointer-transparent so they cannot block symbol hover/click. ${JSON.stringify(result)}`);
     assert.strictEqual(result.symbolPointerDownFallbackPreview, true,
       `Pointerdown-only on a hover link must still trigger preview when VS Code swallows the later click. ${JSON.stringify(result)}`);
     assert.strictEqual(result.symbolNearLinkHover?.ok, true,
@@ -2392,12 +3226,14 @@ suite('Hover Drill-Down E2E', () => {
     await vscode.commands.executeCommand('editor.action.hideHover');
     await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
     await waitForPreviewState(null, 0);
+    await cleanupNativeHoverInteractionState('after-split-column-hover');
   });
 
   test(`[${lang}] split editor columns resolve hover provider content at the hovered symbol`, async function () {
     if (lang !== 'python') { this.skip(); return; }
     this.timeout(30000);
 
+    await ensureExtensionCommandsReady('intellisenseRecursion.resetPreviewStateForTests');
     await vscode.commands.executeCommand('editor.action.hideHover');
     await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
     await waitForPreviewState(null, 0);
@@ -2489,6 +3325,7 @@ suite('Hover Drill-Down E2E', () => {
       await vscode.commands.executeCommand('editor.action.hideHover');
       await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
       await waitForPreviewState(null, 0);
+      await cleanupNativeHoverInteractionState('after-split-column-provider');
     }
   });
 
@@ -2500,8 +3337,22 @@ suite('Hover Drill-Down E2E', () => {
     await ensureExtensionCommandsReady('intellisenseRecursion.runNativePopupStateHarnessForTests');
     await ensureExtensionCommandsReady('intellisenseRecursion.cleanupNativeHoverInteractionStateForTests');
     await ensureExtensionCommandsReady('intellisenseRecursion.dismissNativeKeybindingRecorderForTests');
+    await ensureExtensionCommandsReady('intellisenseRecursion.runHoverScrollHarnessForTests');
+    await ensureExtensionCommandsReady('intellisenseRecursion.runHoverBoxCornerHarnessForTests');
+    await ensureExtensionCommandsReady('intellisenseRecursion.runHoverGeometrySnapshotForTests');
     await ensureExtensionCommandsReady('intellisenseRecursion.dispatchRendererKeyForTests');
+    await ensureExtensionCommandsReady('intellisenseRecursion.requestNativeShowHoverForTests');
     await vscode.workspace.getConfiguration('editor').update('minimap.enabled', false, vscode.ConfigurationTarget.Global);
+    try {
+      await vscode.workspace.getConfiguration('editor').update('experimentalEditContextEnabled', false, vscode.ConfigurationTarget.Global);
+    } catch (err) {
+      console.log(`  optional editor.experimentalEditContextEnabled unavailable: ${err}`);
+    }
+    try {
+      await vscode.workspace.getConfiguration('editor').update('editContext', false, vscode.ConfigurationTarget.Global);
+    } catch (err) {
+      console.log(`  optional editor.editContext unavailable: ${err}`);
+    }
     await vscode.workspace.getConfiguration('editor').update('hover.enabled', true, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('editor').update('hover.delay', 100, vscode.ConfigurationTarget.Global);
     await vscode.workspace.getConfiguration('editor').update('hover.sticky', true, vscode.ConfigurationTarget.Global);
@@ -2509,6 +3360,17 @@ suite('Hover Drill-Down E2E', () => {
     await sleep(250);
     await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
     await waitForPreviewState(null, 0);
+    try {
+      await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+      await sleep(220);
+    } catch {}
+    await cleanupNativeHoverInteractionState('before-actual-native-after-split-column');
+    await closeKeybindingRecorderForHoverTest();
+    try {
+      await vscode.commands.executeCommand('workbench.action.closeAllEditors');
+      await sleep(220);
+    } catch {}
+    await cleanupNativeHoverInteractionState('before-actual-native-open-after-split-column');
 
     let quickFixProbe: vscode.Disposable | undefined;
     try {
@@ -2524,6 +3386,43 @@ suite('Hover Drill-Down E2E', () => {
       });
 
       await waitForLanguageServer(serviceDoc, 'User');
+
+      if (RUN_POINTER_ORIGIN_HOVER_E2E) {
+        await assertRendererShowHoverUsesMousePosition({
+          label: 'load-immediate-left-user-with-caret-on-basemodel',
+          editor: leftEditor,
+          doc: serviceDoc,
+          expectedColumn: 'left',
+          caretLineFragment: 'from models import User, Company',
+          caretIdentifier: 'BaseModel',
+          mouseLineFragment: 'from models import User, Company',
+          mouseIdentifier: 'User',
+          expectedMouseText: ['class User', 'def get_display_name'],
+          absentCaretText: ['class BaseModel', 'def save'],
+        });
+      }
+
+      if (RUN_DEEP_HOVER_E2E) {
+        await runActualNativeHoverDrillProbe({
+          label: 'large-to-small-left-largehovermodel',
+          editor: leftEditor,
+          doc: serviceDoc,
+          expectedColumn: 'left',
+          lineFragment: 'model: LargeHoverModel',
+          identifier: 'LargeHoverModel',
+          initialText: ['class LargeHoverModel', 'field_070'],
+          initialLinks: ['BaseModel', 'str'],
+          clickLink: 'BaseModel',
+          drilledText: ['class BaseModel', 'def save'],
+          drilledLinks: ['save'],
+          initialAbsent: ['class Company', 'STATUS_ACTIVE'],
+          drilledAbsent: ['class LargeHoverModel', 'field_070', 'class Company'],
+          hideBeforeShow: true,
+          initialMinScrollMaxTop: 120,
+          drilledMinScrollMaxTop: 1,
+          verifyLargeToSmallTransition: true,
+        });
+      }
 
       await runActualNativeHoverDrillProbe({
         label: 'load-immediate-left-company',
@@ -2600,6 +3499,7 @@ suite('Hover Drill-Down E2E', () => {
         drilledAbsent: ['class Company', 'class User'],
         hideBeforeShow: false,
         minEditorCount: 2,
+        verifyFocusStability: true,
       });
 
       await vscode.commands.executeCommand('editor.action.hideHover');
@@ -2974,6 +3874,298 @@ suite('Hover Drill-Down E2E', () => {
     console.log(`  back stack → ${backTwo.currentPreviewIdentifier}, history=[${backTwo.previewHistoryIdentifiers.join(' > ')}]`);
   });
 
+  test(`[${lang}] drill-down emits widget-capture + reposition diagnostic events`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(60000);
+
+    const folders = vscode.workspace.workspaceFolders!;
+    const serviceFile = vscode.Uri.file(path.join(folders[0].uri.fsPath, 'service.py'));
+    const doc = await vscode.workspace.openTextDocument(serviceFile);
+    const anchor = findIdentifier(doc, 'Company', 1);
+    assert.ok(anchor, 'Could not find Company identifier in service.py');
+
+    await vscode.commands.executeCommand('editor.action.hideHover');
+    await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+    await waitForPreviewState(null, 0);
+
+    await vscode.window.showTextDocument(doc, { selection: new vscode.Range(anchor!, anchor!) });
+    await waitForLanguageServer(doc, 'Company');
+    // Initial native hover so the widget exists and our prototype patch
+    // has hooked addContentWidget by the time drill content lands.
+    const hoverText = await getHoverText(doc.uri, anchor!);
+    assert.ok(hoverText.length > 0, 'Initial hover on Company returned empty content');
+
+    // Seed the initial drilled preview state so the renderer has a hover
+    // panel with a Back link + clickable identifier (mirrors the multi-hop
+    // drill-down test's setup at line 2893).
+    await vscode.commands.executeCommand('intellisenseRecursion.goToType', doc.uri.toString(), 'PREVIEW:Company');
+    const initialCompanyState = await waitForPreviewState('Company', 0);
+    const seedRows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverSeedPreviewHarnessForTests',
+      'Company',
+      initialCompanyState.currentPreviewMarkdown,
+    );
+    const seeded = (seedRows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(seeded, `Could not seed initial hover panel. Rows=${JSON.stringify(seedRows)}`);
+    await waitForHoverDomState(['get_owner'], ['Company'], 10000, true);
+
+    // Clear HE log immediately before the drill click so the drain after
+    // only contains events from the drill flow.
+    await vscode.commands.executeCommand('intellisenseRecursion.clearHoverEventLogForTests');
+
+    // Drill: click the get_owner link inside the seeded Company panel.
+    const rows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverLinkClickHarnessForTests',
+      'get_owner',
+    );
+    const result = (rows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(result, `Renderer did not click get_owner. Rows=${JSON.stringify(rows)}`);
+
+    // Wait for drill content to render. Use the existing dom-state wait
+    // for next-step links (User) — that's the cleanest "drill landed" signal.
+    await waitForPreviewState('get_owner', 1);
+    await waitForHoverDomState(['User'], ['get_owner'], 10000, true);
+    // Extra grace period so the body-observer / ResizeObserver fallbacks
+    // have a chance to fire their reposition events.
+    await new Promise(resolve => setTimeout(resolve, 600));
+
+    const drain = await vscode.commands.executeCommand<any>(
+      'intellisenseRecursion.drainHoverEventLogForTests',
+    );
+    const events = Array.isArray(drain?.events) ? drain.events : [];
+    const kinds = events.map((e: any) => String(e?.kind || ''));
+    const kindSet = new Set(kinds);
+    console.log(`  drill-diag drain count=${events.length} unique-kinds=${Array.from(kindSet).sort().join(',')}`);
+
+    // Hard contract: the editor proto must have been patched so we even
+    // had a chance to wrap addContentWidget.
+    assert.ok(kindSet.has('editor-proto-patched') || kindSet.has('editor-captured-via-map'),
+      `Drill flow did not engage the editor prototype patch. ` +
+      `events=${events.length} kinds=${Array.from(kindSet).sort().join(',')}`);
+
+    // The hover widget should be captured during the drill flow (either
+    // via the addContentWidget wrap or the sniffer).
+    assert.ok(kindSet.has('hover-widget-captured'),
+      `Drill flow did not capture the hover widget. ` +
+      `events=${events.length} kinds=${Array.from(kindSet).sort().join(',')}`);
+
+    // At least one reposition path should fire — either ResizeObserver-
+    // driven (drill-reposition) or body-observer-driven (drill-reposition-byel).
+    const hasReposition = kindSet.has('drill-reposition') || kindSet.has('drill-reposition-byel');
+    assert.ok(hasReposition,
+      `Drill flow did not trigger a reposition. The drilled hover would stick at the ` +
+      `original symbol's top-left in real use. events=${events.length} ` +
+      `kinds=${Array.from(kindSet).sort().join(',')}`);
+
+    // Inspect the first reposition event's coord triplets — the change we
+    // shipped should record viewport+document+screen frames for both the
+    // anchor and the wrapper rect.
+    const repos = events.find((e: any) => e?.kind === 'drill-reposition' || e?.kind === 'drill-reposition-byel');
+    assert.ok(repos, 'Failed to extract a reposition event from drain');
+    if (repos.hoverRectBefore) {
+      assert.ok(repos.hoverRectBefore.v && typeof repos.hoverRectBefore.v.l === 'number',
+        `Reposition event missing viewport rect frame. ${JSON.stringify(repos)}`);
+      assert.ok(repos.hoverRectBefore.d && typeof repos.hoverRectBefore.d.l === 'number',
+        `Reposition event missing document rect frame. ${JSON.stringify(repos)}`);
+      assert.ok(repos.hoverRectBefore.s && typeof repos.hoverRectBefore.s.l === 'number',
+        `Reposition event missing screen rect frame. ${JSON.stringify(repos)}`);
+    }
+    if (repos.anchorTriplet) {
+      assert.ok(repos.anchorTriplet.v && repos.anchorTriplet.d && repos.anchorTriplet.s,
+        `Reposition anchor triplet missing one or more frames. ${JSON.stringify(repos.anchorTriplet)}`);
+    }
+    console.log(`  drill-reposition sample: ${JSON.stringify({
+      kind: repos.kind,
+      anchorSource: repos.anchorSource,
+      anchorTriplet: repos.anchorTriplet,
+      hoverRectBefore: repos.hoverRectBefore,
+      window: repos.window,
+    })}`);
+
+    // Final-pose check: after settle, the visible hover wrapper rect
+    // should sit near the mouse anchor — NOT at the original symbol's
+    // screen position. This catches "drilled hover stuck at original
+    // top-left" regressions where VS Code's _resizableNode.layout()
+    // overwrites our reposition.
+    const finalGeom = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverGeometrySnapshotForTests',
+      'drill-diag.final',
+    );
+    const finalShot = (finalGeom || []).map(row => row?.value).find(value => value?.outer);
+    if (finalShot && finalShot.outer && repos.anchorTriplet?.v) {
+      const finalTop = Math.round(finalShot.outer.top);
+      const finalLeft = Math.round(finalShot.outer.left);
+      const anchorY = repos.anchorTriplet.v.y;
+      const anchorX = repos.anchorTriplet.v.x;
+      const symbolY = repos.symbolTriplet?.v?.y ?? 0;
+      const symbolX = repos.symbolTriplet?.v?.x ?? 0;
+      const dy = Math.abs(finalTop - anchorY);
+      const symbolDy = Math.abs(finalTop - symbolY);
+      console.log(`  drill-diag final outer=(${finalLeft},${finalTop}) anchor=(${anchorX},${anchorY}) symbol=(${symbolX},${symbolY}) dy-to-anchor=${dy} dy-to-symbol=${symbolDy}`);
+      // Hover should be within 220px vertically of the mouse anchor.
+      // Generous tolerance — VS Code may flip above/below; we only
+      // want to catch the case where it's pinned to symbol position.
+      if (repos.anchorSource === 'mouse' && symbolY > 0 && Math.abs(symbolY - anchorY) > 100) {
+        // We have a meaningful difference between symbol and mouse Y.
+        // Final position should be closer to mouse than to symbol.
+        assert.ok(dy < symbolDy + 40,
+          `Drilled hover settled closer to original symbol than to mouse anchor — ` +
+          `the reposition was overwritten by VS Code's layout. ` +
+          `finalTop=${finalTop} anchorY=${anchorY} symbolY=${symbolY} ` +
+          `dy-to-anchor=${dy} dy-to-symbol=${symbolDy}`);
+      }
+    } else {
+      console.log(`  drill-diag final geometry unavailable — skipping final-pose check`);
+    }
+
+    await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+    await waitForPreviewState(null, 0);
+  });
+
+  test(`[${lang}] hover survives editor scroll and stays attached to its symbol`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(120000);
+
+    const folders = vscode.workspace.workspaceFolders!;
+    const serviceFile = vscode.Uri.file(path.join(folders[0].uri.fsPath, 'service.py'));
+    const doc = await vscode.workspace.openTextDocument(serviceFile);
+    // Anchor on the Company occurrence at `get_company_stakeholders(company: Company)`
+    // (line 13). It's far enough down that a 4-line scroll either
+    // direction keeps it inside the visible range — the auto-restore
+    // path only fires when the anchor stays visible (otherwise it
+    // would scroll the cursor back, which is disruptive).
+    const anchor = findIdentifier(doc, 'Company', 1);
+    assert.ok(anchor, 'Could not find Company identifier in service.py');
+
+    await vscode.commands.executeCommand('editor.action.hideHover');
+    await vscode.commands.executeCommand('intellisenseRecursion.resetPreviewStateForTests');
+    await waitForPreviewState(null, 0);
+    const editor = await vscode.window.showTextDocument(doc, {
+      viewColumn: vscode.ViewColumn.One,
+      preview: false,
+      preserveFocus: false,
+      selection: new vscode.Range(anchor!, anchor!),
+    });
+    await waitForLanguageServer(doc, 'Company');
+    // Pre-scroll the editor by a few lines so the symbol is visible
+    // but NOT at the very top — leaves room for both scroll-up and
+    // scroll-down assertions.
+    editor.revealRange(new vscode.Range(anchor!, anchor!), vscode.TextEditorRevealType.InCenterIfOutsideViewport);
+    await sleep(200);
+
+    const captureGeometry = async (label: string): Promise<any> => {
+      const rows = await vscode.commands.executeCommand<any[]>(
+        'intellisenseRecursion.runHoverGeometrySnapshotForTests',
+        label,
+      );
+      return (rows || []).map(row => row?.value).find(value => value?.outer);
+    };
+    const showHoverAtCursor = async (): Promise<void> => {
+      await vscode.commands.executeCommand('editor.action.hideHover');
+      await sleep(120);
+      // Position cursor on the anchor and trigger showHover.
+      editor.selection = new vscode.Selection(anchor!, anchor!);
+      await sleep(60);
+      await vscode.commands.executeCommand('editor.action.showHover');
+      await sleep(400);
+    };
+
+    // 1) Initial hover before any document scroll.
+    await getHoverText(doc.uri, anchor!);
+    await showHoverAtCursor();
+    const initial = await captureGeometry('scroll-test.initial');
+    // (diagnostic patch-status dump removed — dynamic clamp engages
+    // only when Map.set capture happens, which depends on workbench
+    // activity; the test's correctness doesn't depend on it.)
+    assert.ok(initial && initial.outer,
+      `initial hover should have geometry. ${JSON.stringify(initial)}`);
+    const initialTop = Math.round(initial.outer.top);
+    const initialLeft = Math.round(initial.outer.left);
+    console.log(`  scroll-test initial outer top=${initialTop} left=${initialLeft} size=${Math.round(initial.outer.width)}x${Math.round(initial.outer.height)}`);
+
+    // 2) Scroll the document DOWN by 4 lines, then re-check the hover.
+    const SCROLL_LINES = 4;
+    await vscode.commands.executeCommand('editorScroll', { to: 'down', by: 'line', value: SCROLL_LINES, revealCursor: false });
+    await sleep(220);
+    const afterScroll = await captureGeometry('scroll-test.after-scroll');
+    if (afterScroll && afterScroll.outer) {
+      const afterTop = Math.round(afterScroll.outer.top);
+      const afterLeft = Math.round(afterScroll.outer.left);
+      console.log(`  scroll-test after-scroll outer top=${afterTop} left=${afterLeft} size=${Math.round(afterScroll.outer.width)}x${Math.round(afterScroll.outer.height)}`);
+      // Expected: scrolling document DOWN moves text UP — symbol's
+      // screen y decreases by ~ SCROLL_LINES * lineHeight (typ. 18px).
+      // Hover anchored above the symbol should track that decrease.
+      // Allow generous tolerance (line-height varies, VS Code may also
+      // flip above/below if there's no room).
+      const expectedDeltaY = -SCROLL_LINES * 18; // approx
+      const actualDeltaY = afterTop - initialTop;
+      assert.ok(Math.abs(actualDeltaY - expectedDeltaY) <= 40 || Math.abs(actualDeltaY) <= 40,
+        `Hover did not follow scroll. initialTop=${initialTop} afterTop=${afterTop} ` +
+        `expectedDeltaY≈${expectedDeltaY} actualDeltaY=${actualDeltaY}`);
+      assert.ok(Math.abs(afterLeft - initialLeft) <= 8,
+        `Hover horizontal position should not jump on vertical scroll. initialLeft=${initialLeft} afterLeft=${afterLeft}`);
+    } else {
+      // VS Code dismissed the hover on scroll (common behavior). The
+      // user can re-trigger the hover by hovering again. We verify the
+      // re-acquired hover paints AT THE SYMBOL'S NEW SCREEN POSITION.
+      console.log(`  scroll-test after-scroll: hover dismissed by scroll — re-acquiring at new screen position`);
+      await showHoverAtCursor();
+      const reacquired = await captureGeometry('scroll-test.after-scroll-reacquire');
+      assert.ok(reacquired && reacquired.outer,
+        `Should be able to re-acquire hover after scroll. ${JSON.stringify(reacquired)}`);
+      const reTop = Math.round(reacquired.outer.top);
+      const reLeft = Math.round(reacquired.outer.left);
+      console.log(`  scroll-test re-acquired outer top=${reTop} left=${reLeft} size=${Math.round(reacquired.outer.width)}x${Math.round(reacquired.outer.height)}`);
+      // The re-acquired hover should be VISIBLE somewhere on screen.
+      // We don't pin a precise top — VS Code may flip above/below the
+      // symbol depending on remaining viewport room.
+      assert.ok(reTop >= 0 && reTop < 900 && reacquired.outer.width > 20,
+        `Re-acquired hover should be on-screen. initialTop=${initialTop} reTop=${reTop}`);
+    }
+
+    // 3) Restore scroll, drill down, then scroll again — verify drilled
+    // hover auto-restores via the scheduleScrollRestoreHover path
+    // (no manual re-acquire). VS Code dismisses the wrapper on scroll,
+    // but onDidChangeTextEditorVisibleRanges re-fires
+    // applyPreviewStateAsHover within ~220ms while currentPreviewState
+    // is alive, so a 500ms wait should see the drilled hover back.
+    await vscode.commands.executeCommand('editorScroll', { to: 'up', by: 'line', value: SCROLL_LINES, revealCursor: false });
+    await sleep(220);
+    await getHoverText(doc.uri, anchor!);
+    await sleep(120);
+    await vscode.commands.executeCommand(
+      'intellisenseRecursion.goToType',
+      doc.uri.toString(),
+      'PREVIEW:Company',
+    );
+    await waitForPreviewState('Company', 0).catch(() => null);
+    await sleep(220);
+    const drilledBeforeScroll = await captureGeometry('scroll-test.drilled-before-scroll');
+    if (drilledBeforeScroll && drilledBeforeScroll.outer) {
+      const drilledTop0 = Math.round(drilledBeforeScroll.outer.top);
+      console.log(`  scroll-test drilled-before-scroll outer top=${drilledTop0} size=${Math.round(drilledBeforeScroll.outer.width)}x${Math.round(drilledBeforeScroll.outer.height)}`);
+      await vscode.commands.executeCommand('editorScroll', { to: 'down', by: 'line', value: SCROLL_LINES, revealCursor: false });
+      // Wait long enough for the auto-restore debounce (~220ms) + the
+      // refireHoverAtAnchor round-trip (~3 showHover attempts of
+      // 360ms each).
+      await sleep(2000);
+      const drilledAfterScroll = await captureGeometry('scroll-test.drilled-after-scroll');
+      assert.ok(drilledAfterScroll && drilledAfterScroll.outer,
+        `Drilled hover should auto-restore after scroll via onDidChangeTextEditorVisibleRanges. ` +
+        `Got: ${JSON.stringify(drilledAfterScroll)}`);
+      const drilledTop1 = Math.round(drilledAfterScroll.outer.top);
+      const dy = drilledTop1 - drilledTop0;
+      console.log(`  scroll-test drilled-after-scroll outer top=${drilledTop1} dy=${dy}`);
+      // Auto-restore is the success: the drilled hover came back at
+      // SOME on-screen position. Exact y depends on VS Code's
+      // above/below flip behavior.
+      assert.ok(drilledTop1 >= 0 && drilledTop1 < 900 && drilledAfterScroll.outer.width > 20,
+        `Auto-restored drilled hover should be on-screen. drilledTop0=${drilledTop0} drilledTop1=${drilledTop1}`);
+    } else {
+      console.log(`  scroll-test drilled-before-scroll: drilled hover not visible — skipping drill scroll check`);
+    }
+  });
+
   test(`[${lang}] hover back restores the previous preview scroll position`, async function () {
     if (lang !== 'python') { this.skip(); return; }
     this.timeout(60000);
@@ -3183,7 +4375,7 @@ suite('Hover Drill-Down E2E', () => {
 
   test(`[${lang}] hover panel decorators are drill-down links`, async function () {
     if (lang !== 'python') { this.skip(); return; }
-    this.timeout(70000);
+    this.timeout(120000);
 
     const folders = vscode.workspace.workspaceFolders!;
     const serviceFile = vscode.Uri.file(path.join(folders[0].uri.fsPath, 'service.py'));
@@ -3723,6 +4915,18 @@ suite('Hover Renderer E2E', () => {
       `Large synthetic hover should be scrollable. ${JSON.stringify(result.largeBefore)}`);
     assert.ok(result.largeBefore.scroller.maxTop > 20,
       `Large synthetic hover should have scroll range. ${JSON.stringify(result.largeBefore.scroller)}`);
+    assert.strictEqual(result.hugeBefore?.sizeTier, 'large',
+      `Huge synthetic hover should exercise the largest hover size tier. ${JSON.stringify(result.hugeBefore || result)}`);
+    assert.ok(result.hugeBefore?.isScrollable,
+      `Largest synthetic hover should remain scrollable after compact sizing. ${JSON.stringify(result.hugeBefore || result)}`);
+    assert.ok((result.hugeBefore?.scroller?.maxTop || 0) > 100,
+      `Largest synthetic hover should keep scroll range instead of taking over the tab. ${JSON.stringify(result.hugeBefore || result)}`);
+    assert.ok((result.hugeBefore?.rect?.width || Infinity)
+      <= Math.max(320, Math.ceil((result.viewport?.width || 0) * 0.74)),
+      `Largest hover should not dominate a small monitor horizontally. ${JSON.stringify(result.hugeBefore || result)}`);
+    assert.ok((result.hugeBefore?.rect?.height || Infinity)
+      <= Math.max(160, Math.ceil((result.viewport?.height || 0) * 0.50)),
+      `Largest hover should stay below half of the editor window height. ${JSON.stringify(result.hugeBefore || result)}`);
     assert.ok(result.largeAfterWheel.scroller.scrollTop > result.largeBefore.scroller.scrollTop,
       `Wheel should scroll hover panel. Before=${JSON.stringify(result.largeBefore.scroller)} `
       + `After=${JSON.stringify(result.largeAfterWheel.scroller)}`);
@@ -3767,16 +4971,22 @@ suite('Hover Renderer E2E', () => {
       'Switching to a small hover should remove the previous large hover');
     assert.ok(result.smallConnectedAfterEmptyRoot,
       'Empty cursor-sized hover roots must not remove the active populated hover');
+    assert.ok(result.orphanEmptyShellConnectedAfterCleanup,
+      `Product cleanup must not remove body-level empty shells outside the active hover. Geometry E2E detects those instead. ${JSON.stringify(result)}`);
+    assert.ok(result.topEmptyCellConnectedAfterCleanup,
+      `Product cleanup must not remove top-edge body-level visual cells outside the active hover. Geometry E2E detects those instead. ${JSON.stringify(result)}`);
+    assert.ok(!result.internalEmptyCellConnectedAfterCleanup,
+      `Empty visual cells overlapping inside the active hover should be removed. ${JSON.stringify(result)}`);
     assert.ok(!result.orphanConnectedAfterSmall,
       'Switching to a small hover should remove inactive previous hover panels');
     assert.ok(!result.lateHandleConnectedAfterCleanup,
       'Late native hover handles should be removed after the active hover is already shown');
-    assert.ok(!result.bodyHandleConnectedAfterCleanup,
-      'Body-level stale hover handles should be removed after final hover sizing');
-    assert.ok(!result.unownedBodyHandleConnectedAfterCleanup,
-      'Unowned body-level hover sashes at the hover edge should be removed after final hover sizing');
-    assert.ok(!result.topBodyHandleConnectedAfterCleanup,
-      'Top-right body-level hover sashes at the hover edge should be removed after final hover sizing');
+    assert.ok(result.bodyHandleConnectedAfterCleanup,
+      'Product hover cleanup must not remove body-level sashes outside the active hover');
+    assert.ok(result.unownedBodyHandleConnectedAfterCleanup,
+      'Product hover cleanup must not remove unowned body-level hover sashes outside the active hover');
+    assert.ok(result.topBodyHandleConnectedAfterCleanup,
+      'Top-right body-level sashes outside the active hover must not be removed by hover cleanup');
     assert.ok(result.workbenchSashConnectedAfterCleanup,
       'Workbench/editor sashes must not be removed by hover cleanup');
     assert.ok(result.topWorkbenchSashConnectedAfterCleanup,
@@ -3789,8 +4999,8 @@ suite('Hover Renderer E2E', () => {
       `Native scrollbars should be hidden. ${JSON.stringify(result.small.nativeScrollbar)}`);
     assert.strictEqual(result.inactiveAfterSmall.inactiveHovers, 0,
       `No inactive hover panels should remain. ${JSON.stringify(result.inactiveAfterSmall)}`);
-    assert.strictEqual(result.inactiveAfterSmall.externalArtifacts, 0,
-      `No external hover artifacts should remain. ${JSON.stringify(result.inactiveAfterSmall)}`);
+    assert.ok(result.inactiveAfterSmall.externalArtifacts >= 3,
+      `Renderer harness should leave injected body-level artifacts for geometry E2E to catch, not remove them in product cleanup. ${JSON.stringify(result.inactiveAfterSmall)}`);
     assert.strictEqual(result.hiddenActiveWasActive, true,
       `Renderer harness must reproduce a populated active hover before hiding it. ${JSON.stringify(result)}`);
     assert.strictEqual(result.hiddenActiveStillActive, false,

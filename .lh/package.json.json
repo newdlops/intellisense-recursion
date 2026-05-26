@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 6,
+            "activePatchIndex": 8,
             "patches": [
                 {
                     "date": 1776576981553,
@@ -32,6 +32,14 @@
                 {
                     "date": 1778130555484,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellisense-recursion\",\n   \"displayName\": \"IntelliSense Recursion\",\n   \"description\": \"Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA\",\n-  \"version\": \"0.2.54\",\n+  \"version\": \"0.2.55\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n@@ -51,13 +51,9 @@\n         \"title\": \"Go to Definition (from hover)\"\n       },\n       {\n         \"command\": \"intellisenseRecursion.rebuildIndex\",\n-        \"title\": \"IR: Rebuild Symbol Index\"\n-      },\n-      {\n-        \"command\": \"intellisenseRecursion.rebuildIndexHard\",\n-        \"title\": \"IR: Rebuild Symbol Index (Clear Cache)\"\n+        \"title\": \"IR: Rebuild Symbol Index (Force)\"\n       }\n     ]\n   },\n   \"scripts\": {\n"
+                },
+                {
+                    "date": 1779196063828,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellisense-recursion\",\n   \"displayName\": \"IntelliSense Recursion\",\n   \"description\": \"Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA\",\n-  \"version\": \"0.2.55\",\n+  \"version\": \"0.2.56\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n"
+                },
+                {
+                    "date": 1779247834435,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellisense-recursion\",\n   \"displayName\": \"IntelliSense Recursion\",\n   \"description\": \"Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA\",\n-  \"version\": \"0.2.56\",\n+  \"version\": \"0.2.57\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n"
                 }
             ],
             "date": 1776576981553,
