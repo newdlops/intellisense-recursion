@@ -1073,8 +1073,14 @@ let pendingPreviewHover: PendingPreviewHover | null = null;
 // the original hover can be swallowed into an empty hover widget.
 const PREVIEW_HOVER_SUPPRESS_MS = 90;
 const PREVIEW_HOVER_SUPPRESS_MAX = 8;
-const PREVIEW_HOVER_ANCHOR_LINE_TOLERANCE = 1;
-const PREVIEW_HOVER_ANCHOR_CHAR_TOLERANCE = 120;
+const PREVIEW_HOVER_ANCHOR_LINE_TOLERANCE = 0;
+// Tightened from 120 → 5. The wide 120-char tolerance caused drill state
+// to match unrelated symbols on the same line: VS Code combined our
+// drill content with another extension's hover content into one panel.
+// 5 chars is enough to absorb VS Code's micro-jitter when it re-queries
+// the provider during active drill (same identifier, slightly different
+// offset), but small enough to reject neighboring symbols.
+const PREVIEW_HOVER_ANCHOR_CHAR_TOLERANCE = 5;
 let previewHoverSuppressUntil = 0;
 let previewHoverSuppressKey: string | null = null;
 let previewHoverSuppressCount = 0;
@@ -1980,41 +1986,23 @@ async function provideBroadSymbolHover(
   position: vscode.Position,
   token: vscode.CancellationToken,
 ): Promise<vscode.Hover | null> {
-  if (internalHoverProviderRequestDepth > 0) { return null; }
-  if (!isCodeDoc(doc)) { return null; }
-  const candidate = hoverWordCandidateAt(doc, position);
-  if (!candidate || (!candidate.nearby && !shouldDirectHoverCandidate(candidate.name))) { return null; }
-  if (hoverPatchActive) { return null; }
-
-  const cacheKey = defCacheKey(doc.uri, candidate.anchor, candidate.name);
-  let result: DefCacheEntry['result'] | null = null;
-
-  if (declarationLineContainsIdentifier(doc, candidate.anchor.line, candidate.name)) {
-    result = buildDefinitionPreviewResult(candidate.name, doc.uri, doc, candidate.anchor.line);
-    defCacheSet(cacheKey, result);
-    cappedPreviewLocationSet(lastPreviewLocations, candidate.name, result.location);
-  } else {
-    const cached = defCacheGet(cacheKey);
-    if (cached) {
-      result = cached.result;
-    } else {
-      result = await resolveInBackground(candidate.name, doc.uri, candidate.anchor, cacheKey, 'hover');
-    }
-  }
-
-  if (token.isCancellationRequested || !result?.preview) { return null; }
-  if (hoverPatchActive) {
-    const posKey = `${doc.uri.path || doc.uri.toString()}:${position.line}:${position.character}`;
-    if (shouldSuppressHoverPreviewDelivery(posKey, result.preview)) {
-      logHoverPreviewDeliverySuppressed(`[directHover] "${candidate.name}" duplicate suppressed`);
-      return null;
-    }
-  }
-  log.info(`[directHover] "${candidate.name}" → md=${result.preview.length}`);
-  return new vscode.Hover(
-    markdownStringForDirectHover(result.preview),
-    candidate.range,
-  );
+  // DISABLED: this separate registered provider caused our preview
+  // content to appear in front of other extensions' (e.g., Pylance)
+  // hover content in the same combined panel. VS Code shows registered
+  // providers' results side-by-side in registration order, so our
+  // result always took the top slot for lowercase / snake_case symbols.
+  //
+  // The $provideHover wrap (line ~2724) already attaches our preview
+  // to other extensions' hover content via append-after, which gives
+  // the right ordering (native content first, then our enhancement).
+  // For symbols where no other extension provides hover content, the
+  // wrap path also returns a content-only result without prepending.
+  //
+  // Net effect of disabling: lowercase symbols that previously got OUR
+  // standalone preview now show only what the language server returns —
+  // matching user expectation that our content enhances rather than
+  // replaces native hover output.
+  return null;
 }
 
 function schedulePrefetch(doc: vscode.TextDocument | undefined) {
