@@ -1144,7 +1144,13 @@ interface PreviewState {
   anchorRange?: vscode.Range;
   scrollState?: PreviewScrollState;
   originScrollState?: PreviewScrollState;
+  /** Last time this state was created, drilled, back'd, or served as a
+   * same-anchor re-query response. Used to expire stale state after
+   * the user mouses out — without this, hovering the same symbol later
+   * replays the last drill state instead of showing a fresh initial hover. */
+  lastActivityAt?: number;
 }
+const PREVIEW_STATE_IDLE_TTL_MS = 1500;
 interface PreviewScrollState {
   scrollerScrollTop?: number;
   hoverScrollTop?: number;
@@ -2811,6 +2817,17 @@ function patchSharedService(service: any) {
     // contents so the drill session survives idle/edge interactions.
     if (currentPreviewState
       && previewStateMatchesHoverRequest(currentPreviewState, requestUriKey, requestLine, requestChar)) {
+      // Idle expiry: if the drill state hasn't been touched within
+      // PREVIEW_STATE_IDLE_TTL_MS, the user mouse-out'd long enough ago
+      // that this should be treated as a fresh hover session — drop the
+      // state and fall through to the LSP path. Without this, hovering
+      // the same symbol later replays the last drill state.
+      const lastAct = currentPreviewState.lastActivityAt ?? 0;
+      if (lastAct && Date.now() - lastAct > PREVIEW_STATE_IDLE_TTL_MS) {
+        log.info(`[hover] drill state idle-expired (was at "${currentPreviewState.identifier}", idle=${Date.now() - lastAct}ms) — falling through to LSP`);
+        previewHistory.length = 0;
+        currentPreviewState = null;
+      } else {
       // Dedupe across parallel hover providers. VS Code fans the same
       // request out to every registered hover provider; each one hits
       // this branch. Without dedupe the same fallback markdown gets
@@ -2822,6 +2839,9 @@ function patchSharedService(service: any) {
       if (!fallbackPrimary) {
         return null;
       }
+      // Refresh activity timestamp so the state stays alive while user
+      // actively interacts with the drilled hover.
+      currentPreviewState.lastActivityAt = Date.now();
       const ln = position?.lineNumber !== undefined ? position.lineNumber : (position?.line !== undefined ? position.line + 1 : 1);
       const col = position?.column !== undefined ? position.column : (position?.character !== undefined ? position.character + 1 : 1);
       const pointRange = { startLineNumber: ln, startColumn: col, endLineNumber: ln, endColumn: col };
@@ -2837,6 +2857,7 @@ function patchSharedService(service: any) {
         contents: [{ value: fallbackMarkdown, isTrusted: true, supportThemeIcons: true }],
         range: internalRangeFromVsCode(currentPreviewState.anchorRange) ?? pointRange,
       };
+      } // close idle-fresh else
     }
     // Suppression branch: parallel handles in the same showHover fanout return
     // null so the override isn't duplicated across providers and an empty
@@ -3185,7 +3206,7 @@ function patchSharedService(service: any) {
 
 // ── Renderer injection via main process CDP ──
 
-const RENDERER_PATCH_VERSION = 209;
+const RENDERER_PATCH_VERSION = 212;
 
 interface ProcessRow {
   pid: number;
@@ -10741,6 +10762,7 @@ async function previewTypeHandler(
   };
 
   await applyPreviewStateAsHover(nextPreviewState, ms);
+  nextPreviewState.lastActivityAt = Date.now();
   currentPreviewState = nextPreviewState;
 }
 
@@ -10835,6 +10857,7 @@ async function previewBackHandler(): Promise<void> {
   }
   if (previewHistory.length > 0) {
     const prev = previewHistory.pop()!;
+    prev.lastActivityAt = Date.now();
     currentPreviewState = prev;
     log.info(`previewBack: → "${prev.identifier}" stack=${previewHistory.length}`);
     // Capture drill wrapper position so the restored hover (still a
@@ -11519,9 +11542,14 @@ style.textContent=[
   // footprint. Either way, drilled hover never grows BIGGER than the
   // initial. Inner .monaco-hover and .monaco-scrollable-element track
   // the wrapper with the usual 2/4px insets.
-  '.monaco-resizable-hover:has(a[href*="previewBack"]),.monaco-resizable-hover:has(a[data-href*="previewBack"]){max-height:var(--ir-drill-max-h,162px) !important}',
-  '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-hover,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-hover{max-height:calc(var(--ir-drill-max-h,162px) - 2px) !important}',
-  '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-scrollable-element,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-scrollable-element{max-height:calc(var(--ir-drill-max-h,162px) - 4px) !important}',
+  // Drill hover scales with content up to 48vh (same as initial). For
+  // small drill content (single fn), wrapper stays compact via
+  // height:max-content. For large content (Company-scale class), wrapper
+  // grows to 48vh and scrolls internally — previously hard-clamped at
+  // 162px which cut off most of the content.
+  '.monaco-resizable-hover:has(a[href*="previewBack"]),.monaco-resizable-hover:has(a[data-href*="previewBack"]){max-height:var(--ir-drill-max-h,48vh) !important}',
+  '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-hover,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-hover{max-height:calc(var(--ir-drill-max-h,48vh) - 2px) !important}',
+  '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-scrollable-element,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-scrollable-element{max-height:calc(var(--ir-drill-max-h,48vh) - 4px) !important}',
 ].join('');
 document.head.appendChild(style);
 window.__irStyleEl = style;
@@ -12095,19 +12123,48 @@ function irPointerTriplet(){
     return {v:t.v,d:t.d,s:t.s,at:p.at,type:p.type};
   }catch(_){return null;}
 }
+// WeakSet-based dedupe for editor captures. The previous Array+indexOf
+// approach was O(n) per call → O(n²) total. For Company-scale hover
+// content, VS Code creates 20K+ EmbeddedCodeEditorWidget instances for
+// syntax-highlighted code blocks, blowing up CPU and frame timing.
+window.__irCapturedEditorSet=window.__irCapturedEditorSet||(typeof WeakSet==='function'?new WeakSet():null);
+window.__irCapturedEditorCount=window.__irCapturedEditorCount||0;
 function irOnEditorCaptured(widget){
   try{
     if(!widget||!irLooksLikeCodeEditorWidget(widget))return;
-    if(window.__irCapturedEditorList.indexOf(widget)>=0)return;
-    window.__irCapturedEditorList.push(widget);
+    // O(1) dedupe via WeakSet.
+    if(window.__irCapturedEditorSet){
+      if(window.__irCapturedEditorSet.has(widget))return;
+      window.__irCapturedEditorSet.add(widget);
+    }
+    window.__irCapturedEditorCount=(window.__irCapturedEditorCount||0)+1;
     if(!window.__irCapturedEditor)window.__irCapturedEditor=widget;
     // Throttle log spam: workbench creates many short-lived editor
-    // instances (peek view, suggest overlay, minimap, etc). Record only
-    // the first few to log.txt; the in-renderer buffer still gets all.
-    var idx=window.__irCapturedEditorList.length-1;
-    if(idx<3||idx%50===0){
+    // instances (peek view, suggest overlay, minimap, hover code blocks).
+    // Record only the first few + every 500th.
+    var idx=window.__irCapturedEditorCount-1;
+    if(idx<3||idx%500===0){
       irHERecord('editor-captured-via-map',{idx:idx});
     }
+    // Skip the heavy follow-up work for embedded code-block editors —
+    // they're small read-only editors inside hover content with no
+    // _contentWidgets and no need for our scroll watch. Only the main
+    // editing surfaces benefit from our patching.
+    var isEmbedded=false;
+    try{
+      var dom=widget.getDomNode&&widget.getDomNode();
+      if(dom&&typeof dom.closest==='function'){
+        if(dom.closest('.monaco-hover,.monaco-resizable-hover,.monaco-editor-hover')){
+          isEmbedded=true;
+        }
+      }
+    }catch(_){}
+    if(isEmbedded){
+      return; // skip prototype patch / content widget walk / scroll watch
+    }
+    // Track non-embedded editors in the list (used by irScanAndPatchEditors
+    // as a fallback source for prototype patching).
+    try{window.__irCapturedEditorList.push(widget);}catch(_){}
     // Patch the prototype immediately. Subsequent addContentWidget calls
     // (including ones for the hover widget) will flow through our wrap.
     try{irPatchEditorPrototype(widget);}catch(_){}
@@ -12281,8 +12338,23 @@ function irAttachEditorScrollWatch(editor){
     if(typeof editor.onDidScrollChange==='function'){
       editor.onDidScrollChange(function(e){
         try{
+          // Cheap fast-path when no hover widget is captured — skip all
+          // layout-forcing rect reads. The watcher previously did 3+
+          // getBoundingClientRect calls per scroll, which combined with
+          // many editor scroll listeners caused frame drops on large
+          // hover content scroll.
           var widget=window.__irCapturedHoverWidget;
-          var wrapperEl=widget&&widget._resizableNode&&widget._resizableNode.domNode;
+          if(!widget){
+            // No hover alive — record a minimal scroll event only.
+            irHERecord('editor-scroll',{
+              scrollTop:Math.round(e.scrollTop),
+              scrollLeft:Math.round(e.scrollLeft),
+              scrollTopChanged:e.scrollTopChanged,
+              scrollLeftChanged:e.scrollLeftChanged
+            });
+            return;
+          }
+          var wrapperEl=widget._resizableNode&&widget._resizableNode.domNode;
           var bbox=null;
           var isDrill=false;
           if(wrapperEl){
@@ -12302,11 +12374,7 @@ function irAttachEditorScrollWatch(editor){
             scrollTopChanged:e.scrollTopChanged,
             scrollLeftChanged:e.scrollLeftChanged,
             wrapperBbox:bbox,
-            isDrill:isDrill,
-            wrapperConnected:!!(wrapperEl&&document.body.contains(wrapperEl)),
-            hoverRect:wrapperEl?irRectTriplet(wrapperEl):null,
-            pointer:irPointerTriplet(),
-            viewport:irViewportInfo()
+            isDrill:isDrill
           });
           // (Scroll-triggered reposition removed. Per user policy, the
           // drill hover should be placed at mouse cursor on first
@@ -12398,13 +12466,16 @@ function irRepositionDrilledHover(editor,widget){
     }catch(_){}
     if(hasBack){
       try{
-        wrapperEl.style.maxWidth='460px';
-        wrapperEl.style.maxHeight='162px';
+        // Width clamp stays (prevents viewport-edge pinning), but
+        // height is allowed to grow up to 48vh (set by our CSS rule
+        // for drill wrappers). Large classes (Company-scale) need
+        // the full vertical space; small drill content stays compact
+        // via height:max-content.
+        wrapperEl.style.maxWidth='560px';
         wrapperEl.style.width='auto';
         var inner=wrapperEl.querySelector('.monaco-hover');
         if(inner){
-          inner.style.maxWidth='460px';
-          inner.style.maxHeight='160px';
+          inner.style.maxWidth='560px';
         }
         var rectAfter=wrapperEl.getBoundingClientRect();
         rawH=rectAfter.height;
@@ -12519,41 +12590,52 @@ function irInstallDrillBodyObserver(){
         // that's currently in layout: connected, not display:none, with
         // a non-zero rect. Without this filter our retries keep
         // retargeting the same stale 0×0 element and never settle.
+        // Per-wrapper cached flags reduce layout-thrash during scroll:
+        // once we've decided a wrapper is visible AND forced its inner
+        // statics, skip the getComputedStyle calls on subsequent fires.
+        // Scroll bursts in large hover content used to trigger body-MO
+        // mutations that ran 6+ forced-layout calls per wrapper per
+        // mutation → frame drops. Now each wrapper does it ONCE.
         var visibleWrappers=[];
         for(var fi=0;fi<wrappers.length;fi++){
           var w=wrappers[fi];
           if(!w||!document.body.contains(w))continue;
-          try{
-            var cs=window.getComputedStyle(w);
-            if(cs.display==='none'||cs.visibility==='hidden')continue;
-          }catch(_){}
-          try{
-            var r=w.getBoundingClientRect();
-            if(r.width<=0||r.height<=0)continue;
-          }catch(_){continue;}
+          // Cached visibility (refreshed only if explicitly invalidated).
+          if(!w.__irVisCached){
+            try{
+              var cs=window.getComputedStyle(w);
+              if(cs.display==='none'||cs.visibility==='hidden'){w.__irVisCached='hidden';continue;}
+            }catch(_){}
+            try{
+              var r=w.getBoundingClientRect();
+              if(r.width<=0||r.height<=0){w.__irVisCached='zero';continue;}
+            }catch(_){continue;}
+            w.__irVisCached='visible';
+          }else if(w.__irVisCached!=='visible'){
+            // Cheap re-check: only the rect (no getComputedStyle).
+            try{
+              var rChk=w.getBoundingClientRect();
+              if(rChk.width<=0||rChk.height<=0)continue;
+              w.__irVisCached='visible';
+            }catch(_){continue;}
+          }
           visibleWrappers.push(w);
         }
-        // Dismiss-detection pass: any wrapper we previously positioned
-        // that is now 0×0 / display:none → reset its state. Run BEFORE
-        // checking visible wrappers so a dismissed wrapper that briefly
-        // came back doesn't keep stale flags.
-        try{
-          var allWrappers=document.querySelectorAll('.monaco-resizable-hover');
-          for(var di=0;di<allWrappers.length;di++){
-            var dw=allWrappers[di];
-            if(!dw.__irPositionedOnce)continue;
-            try{
-              var dwRect=dw.getBoundingClientRect();
-              var dwCs=null;try{dwCs=window.getComputedStyle(dw);}catch(_){}
-              var dismissed=(dwRect.width<2||dwRect.height<2)
-                ||(dwCs&&(dwCs.display==='none'||dwCs.visibility==='hidden'))
-                ||!document.body.contains(dw);
-              if(dismissed){
-                irResetWrapperPositionState(dw,'body-mo-dismiss');
-              }
-            }catch(_){}
-          }
-        }catch(_){}
+        // Dismiss-detection pass: only check wrappers that were
+        // previously positioned. Use cheap rect-only check (skip
+        // getComputedStyle) — display:none gives 0×0 rect too.
+        for(var di=0;di<wrappers.length;di++){
+          var dw=wrappers[di];
+          if(!dw.__irPositionedOnce)continue;
+          try{
+            var dwRect=dw.getBoundingClientRect();
+            if(dwRect.width<2||dwRect.height<2||!document.body.contains(dw)){
+              irResetWrapperPositionState(dw,'body-mo-dismiss');
+              dw.__irVisCached=null;
+              dw.__irInnerForcedOnce=false;
+            }
+          }catch(_){}
+        }
         if(!visibleWrappers.length)return;
         // Arm settle observer on every visible wrapper. The drill check
         // (← Back link) happens INSIDE the observer after the wrapper
@@ -12561,35 +12643,40 @@ function irInstallDrillBodyObserver(){
         // rendered yet (textContent empty, no <a> tag), so a synchronous
         // hasBack check at find-time always misses drill wrappers.
         for(var i=0;i<visibleWrappers.length;i++){
-          irArmDrillSettleObserver(visibleWrappers[i]);
-          // Proactively force inner position:static — fix decoupled
-          // inner immediately, before mouse pointer enters.
-          try{
-            var w2=visibleWrappers[i];
-            ['.monaco-hover','.monaco-hover-content','.monaco-scrollable-element'].forEach(function(sel){
-              var el=w2.querySelector(sel);
-              if(!el)return;
-              var cs3=null;try{cs3=window.getComputedStyle(el);}catch(_){}
-              if(cs3&&cs3.position&&cs3.position!=='static'){
-                if(el.style&&typeof el.style.setProperty==='function'){
-                  el.style.setProperty('position','static','important');
-                  el.style.setProperty('top','auto','important');
-                  el.style.setProperty('left','auto','important');
-                  el.style.setProperty('right','auto','important');
-                  el.style.setProperty('bottom','auto','important');
-                  el.style.setProperty('transform','none','important');
-                  el.style.setProperty('inset','auto','important');
-                }
+          var w2=visibleWrappers[i];
+          irArmDrillSettleObserver(w2);
+          // Proactively force inner position:static — but only ONCE per
+          // wrapper. Once we've applied inline !important styles, the
+          // inner stays static for the wrapper's lifetime; re-checking
+          // on every mutation just thrashes layout.
+          if(!w2.__irInnerForcedOnce){
+            try{
+              var inners=w2.querySelectorAll('.monaco-hover,.monaco-hover-content,.monaco-scrollable-element');
+              for(var ie=0;ie<inners.length;ie++){
+                var el=inners[ie];
+                if(!el||!el.style||typeof el.style.setProperty!=='function')continue;
+                el.style.setProperty('position','static','important');
+                el.style.setProperty('top','auto','important');
+                el.style.setProperty('left','auto','important');
+                el.style.setProperty('right','auto','important');
+                el.style.setProperty('bottom','auto','important');
+                el.style.setProperty('transform','none','important');
+                el.style.setProperty('inset','auto','important');
               }
-            });
-          }catch(_){}
+              w2.__irInnerForcedOnce=true;
+            }catch(_){}
+          }
         }
         lastRepositionedAt=now;
       }catch(_){}
     }
     var mo=new MutationObserver(function(){
       if(pendingTimer)clearTimeout(pendingTimer);
-      pendingTimer=setTimeout(maybeReposition,30);
+      // Debounce 120ms: a single drill content swap fires a burst of
+      // mutations, and scroll-induced mutations elsewhere on the page
+      // also reach us (subtree observer). 120ms catches settle while
+      // letting scroll bursts coalesce into a single check.
+      pendingTimer=setTimeout(maybeReposition,120);
     });
     mo.observe(document.body,{childList:true,subtree:true});
     window.__irDrillBodyObserver=mo;
@@ -13091,13 +13178,12 @@ function irRepositionDrilledHoverByElement(editor,wrapperEl){
     }catch(_){}
     if(hasBackBE){
       try{
-        wrapperEl.style.maxWidth='460px';
-        wrapperEl.style.maxHeight='162px';
+        // Width clamp stays; height allowed to grow to 48vh via CSS.
+        wrapperEl.style.maxWidth='560px';
         wrapperEl.style.width='auto';
         var innerBE=wrapperEl.querySelector('.monaco-hover');
         if(innerBE){
-          innerBE.style.maxWidth='460px';
-          innerBE.style.maxHeight='160px';
+          innerBE.style.maxWidth='560px';
         }
         var rectAfterBE=wrapperEl.getBoundingClientRect();
         rawBH=rectAfterBE.height;
