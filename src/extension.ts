@@ -60,6 +60,33 @@ function languageOf(fsPath: string): SidecarLanguage | undefined {
 const TYPE_SHAPED_NAME = /^[A-Z_][A-Za-z0-9_]*$/;
 const CONSTANT_SHAPED_NAME = /^_*[A-Z][A-Z0-9_]*$/;
 const IDENTIFIER_WORD_RE = /[A-Za-z_$][\w$]*/;
+// Reusable global-flag variant; reset .lastIndex before each use. Hoisted
+// out of nearbyHoverWordCandidateAt where it used to be re-allocated on
+// every hover/cursor probe.
+const IDENTIFIER_WORD_RE_G = /[A-Za-z_$][\w$]*/g;
+
+// Per-identifier escaped pattern cache. Builds \b<identifier>\b regexes
+// without re-running the escape replace each call. We always return a
+// fresh RegExp so callers can mutate .lastIndex across awaits without
+// stepping on each other.
+const ESC_IDENTIFIER_CACHE_MAX = 256;
+const escIdentifierCache = new Map<string, string>();
+function identifierWordRegex(identifier: string, flags = ''): RegExp {
+  let escaped = escIdentifierCache.get(identifier);
+  if (escaped === undefined) {
+    escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (escIdentifierCache.size >= ESC_IDENTIFIER_CACHE_MAX) {
+      const first = escIdentifierCache.keys().next().value;
+      if (first !== undefined) { escIdentifierCache.delete(first); }
+    }
+    escIdentifierCache.set(identifier, escaped);
+  } else {
+    // LRU touch
+    escIdentifierCache.delete(identifier);
+    escIdentifierCache.set(identifier, escaped);
+  }
+  return new RegExp(`\\b${escaped}\\b`, flags);
+}
 const HOVER_NEARBY_SYMBOL_COLUMN_RADIUS = 8;
 const HOVER_NOISY_IDENTIFIER_MAX_LENGTH = 80;
 
@@ -706,7 +733,15 @@ function rememberPreviewLocations(
 
   const seen = new Set<string>([typeName]);
   const lineTexts = preview.code.split('\n');
-  for (let offset = 0; offset < lineTexts.length; offset++) {
+  // Cap how many preview lines we eagerly index by identifier. Previously
+  // this loop ran over the entire preview block (up to ~600 lines), doing
+  // a matchAll on every line and ~hundreds of cappedPreviewLocationSet
+  // calls per hover. Headers + first 24 lines is enough to support
+  // Cmd+Click into nearby declarations; deeper identifiers can still be
+  // resolved by the regular LSP path when the user actually hovers them.
+  const REMEMBER_PREVIEW_INDEX_LINES = 24;
+  const indexedLineCount = Math.min(lineTexts.length, REMEMBER_PREVIEW_INDEX_LINES);
+  for (let offset = 0; offset < indexedLineCount; offset++) {
     const lineText = lineTexts[offset];
     const absLine = preview.previewStartLine + offset;
     for (const decl of decoratorIdentifiersInLine(lineText)) {
@@ -1286,6 +1321,44 @@ function defCacheSet(key: string, result: DefCacheEntry['result']) {
   defCache.set(key, { timestamp: Date.now(), result });
 }
 
+// L14: Global "not found in docs" negative cache, keyed by (uri.fsPath,
+// typeName) — independent of cursor position. The existing position-keyed
+// defCache misses when the user hovers the same identifier at different
+// positions in the same file (e.g. styled-components TS infra types like
+// IStyledComponentBase / FastOmit that appear in every React component
+// hover). Log analysis showed those two alone accounted for 42 of 50
+// "not found in docs" entries in a single 63-minute session, each
+// repeating the full doc.getText() + regex scan + resolvedDefDocs walk.
+const NOT_FOUND_NEG_TTL = 60_000;
+const NOT_FOUND_MAX = 256;
+const notFoundInDocs = new Map<string, number>();
+function notFoundInDocsKey(docUri: vscode.Uri, typeName: string): string {
+  return `${docUri.fsPath}\0${typeName}`;
+}
+function notFoundInDocsHas(docUri: vscode.Uri, typeName: string): boolean {
+  const k = notFoundInDocsKey(docUri, typeName);
+  const ts = notFoundInDocs.get(k);
+  if (ts === undefined) { return false; }
+  if (Date.now() - ts > NOT_FOUND_NEG_TTL) {
+    notFoundInDocs.delete(k);
+    return false;
+  }
+  // LRU touch
+  notFoundInDocs.delete(k);
+  notFoundInDocs.set(k, ts);
+  return true;
+}
+function notFoundInDocsRemember(docUri: vscode.Uri, typeName: string): void {
+  const k = notFoundInDocsKey(docUri, typeName);
+  notFoundInDocs.delete(k);
+  notFoundInDocs.set(k, Date.now());
+  while (notFoundInDocs.size > NOT_FOUND_MAX) {
+    const first = notFoundInDocs.keys().next().value;
+    if (first === undefined) { break; }
+    notFoundInDocs.delete(first);
+  }
+}
+
 // ── Click negative cache ──
 // Identifier-level: short-circuits goToTypeHandler when a prior click already
 // walked every fallback (steps 1-6) and came up empty. Avoids re-running the
@@ -1391,9 +1464,34 @@ function withTimeout<T>(p: Thenable<T>, ms: number, label: string): Promise<T> {
   });
 }
 
+// Lazy map of open documents keyed by canonical fsPath. Used to be a
+// linear .find() over workspace.textDocuments; with many open files and
+// findOpenDoc called from every hover/Cmd+Click path that scan went
+// quadratic on idle. The map is rebuilt on first use and kept in sync by
+// onDidOpenTextDocument / onDidCloseTextDocument listeners registered in
+// activate().
+let openDocByFsPath: Map<string, vscode.TextDocument> | null = null;
+function ensureOpenDocIndex(): Map<string, vscode.TextDocument> {
+  if (!openDocByFsPath) {
+    openDocByFsPath = new Map();
+    for (const d of vscode.workspace.textDocuments) {
+      openDocByFsPath.set(d.uri.fsPath, d);
+    }
+  }
+  return openDocByFsPath;
+}
 function findOpenDoc(uri: vscode.Uri): vscode.TextDocument | undefined {
-  const fs = uri.fsPath;
-  return vscode.workspace.textDocuments.find(d => d.uri.fsPath === fs);
+  return ensureOpenDocIndex().get(uri.fsPath);
+}
+function registerOpenDocIndexListeners(context: vscode.ExtensionContext) {
+  context.subscriptions.push(
+    vscode.workspace.onDidOpenTextDocument((d) => {
+      ensureOpenDocIndex().set(d.uri.fsPath, d);
+    }),
+    vscode.workspace.onDidCloseTextDocument((d) => {
+      ensureOpenDocIndex().delete(d.uri.fsPath);
+    }),
+  );
 }
 
 /**
@@ -1815,21 +1913,44 @@ function enqueuePrefetch(task: () => Promise<void>) {
 }
 
 // Extract PascalCase tokens (>= 3 chars) ranked by frequency, return top N with their first position.
+// Result is memoized per (fsPath, version) so repeated tab switches on an
+// unchanged document don't re-scan the entire text.
+const PREFETCH_TOKEN_CACHE_MAX = 32;
+const prefetchTokenCache = new Map<string, Array<{ name: string; pos: vscode.Position }>>();
+const PASCAL_TOKEN_RE = /\b[A-Z][A-Za-z0-9_]{2,}\b/g;
 function extractPrefetchTokens(doc: vscode.TextDocument): Array<{ name: string; pos: vscode.Position }> {
+  const cacheKey = `${doc.uri.fsPath}\0${doc.version}`;
+  const cached = prefetchTokenCache.get(cacheKey);
+  if (cached) {
+    prefetchTokenCache.delete(cacheKey);
+    prefetchTokenCache.set(cacheKey, cached);
+    return cached;
+  }
   const text = doc.getText();
-  const re = /\b[A-Z][A-Za-z0-9_]{2,}\b/g;
+  PASCAL_TOKEN_RE.lastIndex = 0;
   const seen = new Map<string, { pos: vscode.Position; count: number }>();
   let m: RegExpExecArray | null;
-  while ((m = re.exec(text)) !== null) {
+  while ((m = PASCAL_TOKEN_RE.exec(text)) !== null) {
     const name = m[0];
     if (SKIP_WORDS.has(name)) { continue; }
     const prev = seen.get(name);
     if (prev) { prev.count++; } else { seen.set(name, { pos: doc.positionAt(m.index), count: 1 }); }
   }
-  return [...seen.entries()]
+  const result = [...seen.entries()]
     .sort((a, b) => b[1].count - a[1].count)
     .slice(0, PREFETCH_MAX_TOKENS)
     .map(([name, v]) => ({ name, pos: v.pos }));
+  // Evict any prior entry for this fsPath (different version) before inserting.
+  const fsPrefix = `${doc.uri.fsPath}\0`;
+  for (const key of prefetchTokenCache.keys()) {
+    if (key !== cacheKey && key.startsWith(fsPrefix)) { prefetchTokenCache.delete(key); }
+  }
+  if (prefetchTokenCache.size >= PREFETCH_TOKEN_CACHE_MAX) {
+    const first = prefetchTokenCache.keys().next().value;
+    if (first !== undefined) { prefetchTokenCache.delete(first); }
+  }
+  prefetchTokenCache.set(cacheKey, result);
+  return result;
 }
 
 interface HoverWordCandidate {
@@ -1885,7 +2006,8 @@ function nearbyHoverWordCandidateAt(
   const line = doc.lineAt(position.line).text;
   if (!line) { return null; }
   const target = Math.max(0, Math.min(position.character, line.length));
-  const re = new RegExp(IDENTIFIER_WORD_RE.source, 'g');
+  const re = IDENTIFIER_WORD_RE_G;
+  re.lastIndex = 0;
   let best: { candidate: HoverWordCandidate; distance: number; exact: number; priority: number } | null = null;
   let match: RegExpExecArray | null;
   while ((match = re.exec(line)) !== null) {
@@ -2260,6 +2382,8 @@ export async function activate(context: vscode.ExtensionContext) {
   }
   context.subscriptions.push({ dispose: () => indexManager?.dispose() });
 
+  registerOpenDocIndexListeners(context);
+
   context.subscriptions.push(
     vscode.commands.registerCommand('intellisenseRecursion.goToType', goToTypeHandler),
     vscode.commands.registerCommand('intellisenseRecursion.previewType', previewTypeCommandHandler),
@@ -2546,9 +2670,16 @@ export async function activate(context: vscode.ExtensionContext) {
     log.info('[inject] Renderer injection disabled by IR_SKIP_RENDERER_INJECTION');
   } else {
     await runRendererInjection(injectRenderer);
+    // Low-frequency safety pass for renderer windows that open after our
+    // initial injection. Used to be every 60s, which was constant Node↔CDP
+    // chatter and re-evaluation of the ~25KB injection bundle for no real
+    // gain in steady state. Dropping to 5 minutes still catches new
+    // windows quickly enough — and the WebSocket-close handler already
+    // schedules an immediate reconnect+reinject when the renderer
+    // actually goes away.
     reinjectTimer = setInterval(() => {
       runRendererInjection(reinjectRenderer).catch(() => {});
-    }, 60000);
+    }, 300000);
   }
 
   // Do not arm renderer prototype capture on activation. Capture is useful
@@ -2752,7 +2883,13 @@ function patchSharedService(service: any) {
       // showHover fanout. VS Code may render a later handle, not the first
       // one that reaches us; consuming the preview on the first hit can leave
       // the visible hover widget with an empty/null provider result.
-      log.info(`[hover] page-transition handle=${handle} → "${preview.identifier}"`);
+      // Log only the first matching handle in a multi-handle fanout — we
+      // still return the preview content for every handle (VS Code may
+      // render a later one), but logging each duplicates output 5–7× per
+      // drill. matchCount was just incremented above.
+      if (preview.matchCount === 1) {
+        log.info(`[hover] page-transition handle=${handle} → "${preview.identifier}"`);
+      }
       const ln = position?.lineNumber !== undefined ? position.lineNumber : (position?.line !== undefined ? position.line + 1 : 1);
       const col = position?.column !== undefined ? position.column : (position?.character !== undefined ? position.character + 1 : 1);
       const pointRange = { startLineNumber: ln, startColumn: col, endLineNumber: ln, endColumn: col };
@@ -2960,7 +3097,12 @@ function patchSharedService(service: any) {
     const hoverMs = () => `${Date.now() - hoverT0}ms`;
     const postNativeMs = () => `${Date.now() - postNativeT0}ms`;
     const typesKey = uniqueTypes.slice(0, 3).sort().join(',');
-    const inflightKey = `${posKey}:${typesKey}`;
+    // Position-only inflight key. Multiple handles at the same (uri, pos)
+    // — VS Code dispatches one per registered language server — may produce
+    // slightly different result.contents (and hence different typesKey),
+    // but they're all hovering the same identifier, so let them share the
+    // preview computation rather than each running it independently.
+    const inflightKey = posKey;
 
     // (A) Position-level preview cache — short-circuits everything below for
     // repeated hovers at the same point with the same extracted types.
@@ -3081,6 +3223,13 @@ function patchSharedService(service: any) {
             log.info(`[hover]   "${typeName}" → large-doc unresolved (${Date.now() - typeT0}ms)`);
             return null;
           }
+          // L14: position-independent negative cache short-circuit. Avoids
+          // the doc-wide regex + resolvedDefDocs walk for typeNames that
+          // were not findable in this docUri within NOT_FOUND_NEG_TTL —
+          // dominant cases are styled-components / Apollo codegen types.
+          if (notFoundInDocsHas(docUri, typeName)) {
+            return null;
+          }
           // (D) Cached compiled regex, scan hovered doc first
           const regex = typeRegex(typeName);
           regex.lastIndex = 0;
@@ -3093,6 +3242,9 @@ function patchSharedService(service: any) {
               if (match) { matchUri = rd.uri; matchDoc = rd.doc; break; }
             }
             if (!match) {
+              const negPos = hoveredAnchor ?? hoverApiPos;
+              defCacheSet(defCacheKey(docUri, negPos, typeName), null);
+              notFoundInDocsRemember(docUri, typeName);
               log.info(`[hover]   "${typeName}" not found in docs (${hoverMs()})`);
               return null;
             }
@@ -10414,7 +10566,7 @@ async function resolvePreviewIdentifierViaDefinitionProvider(
   const activeDoc = vscode.window.activeTextEditor?.document;
   addCandidate(activeDoc?.uri, undefined, 'active-doc');
 
-  const re = new RegExp(`\\b${esc(identifier)}\\b`, 'g');
+  const re = identifierWordRegex(identifier, 'g');
   for (const candidate of candidates) {
     let doc: vscode.TextDocument;
     try { doc = findOpenDoc(candidate.uri) ?? await vscode.workspace.openTextDocument(candidate.uri); }
@@ -10459,7 +10611,7 @@ async function resolvePreviewIdentifierFromCurrentMarkdown(
   const sourceLoc = registerPreviewMarkdownLocations(parsed.typeName, uri, parsed.definitionLine, parsed.code);
   const lineTexts = parsed.code.split('\n');
   const previewStartLine = sourceLoc.previewStartLine;
-  const re = new RegExp(`\\b${esc(identifier)}\\b`, 'g');
+  const re = identifierWordRegex(identifier, 'g');
 
   for (let offset = 0; offset < lineTexts.length; offset++) {
     const declarationIndex = declarationIndexInLine(lineTexts[offset], identifier);
@@ -10638,7 +10790,7 @@ async function previewTypeHandler(
         const cl = cached.range.start.line;
         const startLine = Math.max(0, cl - 5);
         const endLine = Math.min(cacheDoc.lineCount, cl + 30);
-        const re = new RegExp(`\\b${esc(identifier)}\\b`);
+        const re = identifierWordRegex(identifier);
         let foundPos: vscode.Position | null = null;
         for (let li = startLine; li < endLine; li++) {
           const m = re.exec(cacheDoc.lineAt(li).text);
@@ -11551,7 +11703,8 @@ irLog('renderer: CSS injected');
 // intellisenseRecursion.drainHoverEventLogForTests; the bottom-right
 // dismiss case writes the buffer to test stdout for analysis.
 if(!window.__irHoverEventLog)window.__irHoverEventLog=[];
-if(!window.__irHoverEventLogConfig)window.__irHoverEventLogConfig={enabled:true,max:4000};
+// telemetry is opt-in; tests/diag tools can flip it via window.__irHoverEventLogConfig.enabled=true before activation
+if(!window.__irHoverEventLogConfig)window.__irHoverEventLogConfig={enabled:false,max:4000};
 window.__irHoverEventSeq=Number(window.__irHoverEventLogSeq)||0;
 function irHEDescribe(el){
   if(!el||el.nodeType!==1)return null;
@@ -11641,9 +11794,48 @@ var IR_HE_FORWARDED_KINDS={
   'editor-scroll':1,
   'global-prototype-patched':1
 };
+// L20 diagnostic: drill-reposition* kinds always reach log.txt regardless
+// of telemetry being disabled (L1). User reported drill hovers visibly
+// jumping in position, and we cannot see the timing of reposition events
+// with telemetry off. Once root cause is identified and fixed, this
+// allowlist should shrink back to {}.
+var IR_HE_FORCE_LOG_KINDS={
+  'drill-reposition':1,
+  'drill-reposition-byel':1,
+  'drill-reposition-byel-skip-transient':1,
+  'drill-reposition-byel-skip-already-positioned':1,
+  'drill-reposition-skip-transient':1,
+  'drill-reposition-skip-already-positioned':1,
+  'drill-reposition-error':1,
+  'drill-reposition-byel-error':1,
+  'drill-settle-observer-fired':1,
+  'anchor-drift-observed':1,
+  'hover-widget-captured':1,
+  // L22 diagnostic: investigate drill-jump root cause. Capture the
+  // moment we clamp the wrapper height (paint → shrink), the initial
+  // height capture, and any drill class apply / remove. Compare these
+  // timestamps against drill-reposition-byel to find the actual jump
+  // vector (size change or position change).
+  'drill-class-on':1,
+  'drill-class-off':1,
+  'drill-inline-clamp':1,
+  'init-height-captured':1,
+  'drill-style-reapplied':1,
+  // L24 diagnostics
+  'resizable-layout-wrapped':1,
+  'drill-layout-wrap-reapplied':1,
+  // L24 diag step 2: trace where irAttachWrapperResizeReposition bails out
+  'attach-wrr-skip':1,
+  'attach-wrr-defer':1,
+  'attach-wrr-give-up':1
+};
 function irHERecord(kind,detail){
   try{
-    if(!window.__irHoverEventLogConfig||!window.__irHoverEventLogConfig.enabled)return;
+    var forceLog=!!IR_HE_FORCE_LOG_KINDS[kind];
+    if(!forceLog && (!window.__irHoverEventLogConfig||!window.__irHoverEventLogConfig.enabled))return;
+    if(forceLog && !window.__irHoverEventLogConfig){window.__irHoverEventLogConfig={enabled:false,max:4000};}
+    if(forceLog && !window.__irHoverEventLog){window.__irHoverEventLog=[];}
+    if(forceLog && typeof window.__irHoverEventSeq!=='number'){window.__irHoverEventSeq=0;}
     var entry={
       seq:++window.__irHoverEventSeq,
       at:Date.now(),
@@ -11655,7 +11847,10 @@ function irHERecord(kind,detail){
     while(window.__irHoverEventLog.length>max)window.__irHoverEventLog.shift();
     // Forward selected diagnostic kinds to log.txt via irLog. Wrap in a
     // try so a stringify error never breaks the in-renderer buffer write.
-    if(IR_HE_FORWARDED_KINDS[kind]){
+    // forceLog kinds (L20+) bypass the IR_HE_FORWARDED_KINDS allowlist —
+    // they were added to surface diagnostic data when telemetry is off
+    // and must reach log.txt regardless.
+    if(IR_HE_FORWARDED_KINDS[kind]||forceLog){
       try{
         var line='he-event '+kind+' seq='+entry.seq;
         if(detail){
@@ -11747,36 +11942,64 @@ function irHEScanForHovers(){
   }catch(_){}
 }
 var IR_HE_BODY_OBSERVER=null;
+var IR_HE_PENDING_RECORDS=null;
+var IR_HE_RAF_HANDLE=null;
+function irHEProcessRecords(records){
+  for(var r=0;r<records.length;r++){
+    var rec=records[r];
+    if(rec.type!=='childList')continue;
+    for(var a=0;a<rec.addedNodes.length;a++){
+      var n=rec.addedNodes[a];
+      if(!n||n.nodeType!==1)continue;
+      // Cheap pre-filter: typing-induced mutations are dominated by
+      // editor internals (.view-line, .mtk*, .monaco-list-row, ...) that
+      // never directly host a hover widget. We still inspect added nodes
+      // that could plausibly be a hover wrapper or contain one.
+      var cls=typeof n.className==='string'?n.className:'';
+      var couldBeHover=cls.indexOf('monaco-hover')>=0||cls.indexOf('resizable-hover')>=0||cls.indexOf('context-view')>=0||cls.indexOf('monaco-editor-hover')>=0;
+      var hasChildren=!!(n.firstElementChild);
+      if(!couldBeHover&&!hasChildren)continue;
+      if(n.matches&&(n.matches('.monaco-resizable-hover')||n.matches('.monaco-hover')||n.matches('.monaco-editor-hover'))){
+        irHEAttachAttributeObserver(n);
+        irHERecord('hover-added',{target:irHEDescribe(n)});
+      }
+      // Only deep-scan children when the node looks like a plausible
+      // hover container — avoids querySelectorAll on every Monaco line.
+      if(couldBeHover){
+        try{
+          var inner=n.querySelectorAll&&n.querySelectorAll('.monaco-resizable-hover, .monaco-hover, .monaco-editor-hover');
+          if(inner)for(var k=0;k<inner.length;k++){irHEAttachAttributeObserver(inner[k]);irHERecord('hover-added',{target:irHEDescribe(inner[k])});}
+        }catch(_){}
+      }
+    }
+    for(var d=0;d<rec.removedNodes.length;d++){
+      var rn=rec.removedNodes[d];
+      if(!rn||rn.nodeType!==1)continue;
+      if(rn.matches&&(rn.matches('.monaco-resizable-hover')||rn.matches('.monaco-hover')||rn.matches('.monaco-editor-hover'))){
+        irHERecord('hover-removed',{target:irHEDescribe(rn)});
+      }
+    }
+  }
+}
 function irHESetupBodyObserver(){
   if(IR_HE_BODY_OBSERVER||!document.body)return;
   try{
     IR_HE_BODY_OBSERVER=new MutationObserver(function(records){
-      for(var r=0;r<records.length;r++){
-        var rec=records[r];
-        if(rec.type==='childList'){
-          for(var a=0;a<rec.addedNodes.length;a++){
-            var n=rec.addedNodes[a];
-            if(n&&n.nodeType===1){
-              if(n.matches&&(n.matches('.monaco-resizable-hover')||n.matches('.monaco-hover')||n.matches('.monaco-editor-hover'))){
-                irHEAttachAttributeObserver(n);
-                irHERecord('hover-added',{target:irHEDescribe(n)});
-              }
-              try{
-                var inner=n.querySelectorAll&&n.querySelectorAll('.monaco-resizable-hover, .monaco-hover, .monaco-editor-hover');
-                if(inner)for(var k=0;k<inner.length;k++){irHEAttachAttributeObserver(inner[k]);irHERecord('hover-added',{target:irHEDescribe(inner[k])});}
-              }catch(_){}
-            }
-          }
-          for(var d=0;d<rec.removedNodes.length;d++){
-            var rn=rec.removedNodes[d];
-            if(rn&&rn.nodeType===1){
-              if(rn.matches&&(rn.matches('.monaco-resizable-hover')||rn.matches('.monaco-hover')||rn.matches('.monaco-editor-hover'))){
-                irHERecord('hover-removed',{target:irHEDescribe(rn)});
-              }
-            }
-          }
-        }
+      // Coalesce mutation bursts (typing, layout) into one rAF-batched
+      // pass. Was processing every batch synchronously which made hot
+      // paths quadratic when many .view-line nodes are added/removed.
+      if(IR_HE_PENDING_RECORDS){
+        for(var i=0;i<records.length;i++)IR_HE_PENDING_RECORDS.push(records[i]);
+        return;
       }
+      IR_HE_PENDING_RECORDS=records.slice();
+      var schedule=window.requestAnimationFrame||function(cb){return setTimeout(cb,16);};
+      IR_HE_RAF_HANDLE=schedule(function(){
+        var pending=IR_HE_PENDING_RECORDS;
+        IR_HE_PENDING_RECORDS=null;
+        IR_HE_RAF_HANDLE=null;
+        if(pending)irHEProcessRecords(pending);
+      });
     });
     IR_HE_BODY_OBSERVER.observe(document.body,{childList:true,subtree:true});
     irHEScanForHovers();
@@ -12213,17 +12436,23 @@ function irAttachStyleObserverToWrapper(wrapperEl){
       // Stop re-applying once the desired pose is older than 4s — the
       // hover may have been re-purposed for a fresh non-drill render.
       if(Date.now()-desired.at>4000)return;
+      // L23: Was setTimeout(...,0) which deferred the re-apply to the
+      // next macrotask. Between VS Code writing top/left and our timer
+      // firing, a layout+paint could occur, so the user saw the wrapper
+      // briefly at VS Code's anchor before snapping back — i.e. the
+      // reported drill jump. MutationObserver callbacks already run in
+      // a microtask before the next paint, so re-applying synchronously
+      // (with the re-entry guard) lands the correction in the same
+      // frame VS Code wrote its mutation.
       styleReapplyPending=true;
-      setTimeout(function(){
-        try{
-          wrapperEl.style.top=desired.top+'px';
-          wrapperEl.style.left=desired.left+'px';
-          irHERecord('drill-style-reapplied',{
-            desired:desired,prev:{top:curTop,left:curLeft}
-          });
-        }catch(_){}
-        styleReapplyPending=false;
-      },0);
+      try{
+        wrapperEl.style.top=desired.top+'px';
+        wrapperEl.style.left=desired.left+'px';
+        irHERecord('drill-style-reapplied',{
+          desired:desired,prev:{top:curTop,left:curLeft}
+        });
+      }catch(_){}
+      styleReapplyPending=false;
     }catch(_){}
   });
   try{styleObs.observe(wrapperEl,{attributes:true,attributeFilter:['style']});}catch(_){}
@@ -12258,19 +12487,21 @@ function irResetWrapperPositionState(wrapperEl,reason){
   }catch(_){}
 }
 function irAttachWrapperResizeReposition(widget){
-  if(!widget)return;
+  if(!widget){irHERecord('attach-wrr-skip',{reason:'no-widget'});return;}
   // The hover widget's _resizableNode may be lazily constructed.
   // Retry a few times so we still attach when the widget is captured
   // before its resizable node lands.
   if(!widget._resizableNode||!widget._resizableNode.domNode){
     var tries=(widget.__irAttachTries||0)+1;
     widget.__irAttachTries=tries;
+    if(tries===1)irHERecord('attach-wrr-defer',{reason:'no-resizable-node',tries:tries});
+    if(tries===20)irHERecord('attach-wrr-give-up',{tries:tries});
     if(tries<=20){setTimeout(function(){try{irAttachWrapperResizeReposition(widget);}catch(_){}},50);}
     return;
   }
   var wrapperEl=widget._resizableNode.domNode;
-  if(wrapperEl.__irResizeRepositioned)return;
-  if(typeof ResizeObserver!=='function')return;
+  if(wrapperEl.__irResizeRepositioned){irHERecord('attach-wrr-skip',{reason:'already-attached'});return;}
+  if(typeof ResizeObserver!=='function'){irHERecord('attach-wrr-skip',{reason:'no-ResizeObserver'});return;}
   wrapperEl.__irResizeRepositioned=true;
   try{
     var debounce=null;
@@ -12312,6 +12543,49 @@ function irAttachWrapperResizeReposition(widget){
     ro.observe(wrapperEl);
     wrapperEl.__irRepositionResizeObs=ro;
     try{irAttachStyleObserverToWrapper(wrapperEl);}catch(_){}
+    // L24: Wrap _resizableNode.layout(). VS Code's layout call writes
+    // intermediate top/left to the wrapper style mid-flight (multi-stage
+    // measurement), and the user saw those intermediate positions as a
+    // "drill jump" before our MutationObserver could correct them.
+    // Wrapping here lets us re-apply __irDesired synchronously inside
+    // the same call frame as the original layout — paint sees only our
+    // desired pose. Only takes effect when the wrapper is in drill mode
+    // (← Back link present) and __irDesired was set within 4s.
+    try{
+      var resizable=widget._resizableNode;
+      if(resizable&&typeof resizable.layout==='function'&&!resizable.__irLayoutWrapped){
+        resizable.__irLayoutWrapped=true;
+        var origLayout=resizable.layout;
+        resizable.layout=function(){
+          var rv;
+          try{rv=origLayout.apply(this,arguments);}
+          catch(layoutErr){throw layoutErr;}
+          try{
+            var desired=wrapperEl.__irDesired;
+            if(desired&&Date.now()-desired.at<4000){
+              var hasBackLW=!!wrapperEl.querySelector('a[href*="previewBack"],a[data-href*="previewBack"]');
+              if(!hasBackLW){
+                try{var tLW=String(wrapperEl.textContent||'');if(tLW.indexOf('← Back')>=0)hasBackLW=true;}catch(_){}
+              }
+              if(hasBackLW){
+                var lwCurTop=parseInt(wrapperEl.style.top,10);
+                var lwCurLeft=parseInt(wrapperEl.style.left,10);
+                if(lwCurTop!==desired.top||lwCurLeft!==desired.left){
+                  wrapperEl.style.top=desired.top+'px';
+                  wrapperEl.style.left=desired.left+'px';
+                  irHERecord('drill-layout-wrap-reapplied',{
+                    desired:desired,
+                    prev:{top:lwCurTop,left:lwCurLeft}
+                  });
+                }
+              }
+            }
+          }catch(_){}
+          return rv;
+        };
+        irHERecord('resizable-layout-wrapped',{});
+      }
+    }catch(_){}
     irHERecord('wrapper-resize-observer-attached',{
       hoverRect:irRectTriplet(wrapperEl),
       pointer:irPointerTriplet(),
@@ -12326,14 +12600,21 @@ function irAttachEditorScrollWatch(editor){
     if(typeof editor.onDidScrollChange==='function'){
       editor.onDidScrollChange(function(e){
         try{
-          // Cheap fast-path when no hover widget is captured — skip all
-          // layout-forcing rect reads. The watcher previously did 3+
-          // getBoundingClientRect calls per scroll, which combined with
-          // many editor scroll listeners caused frame drops on large
-          // hover content scroll.
+          // L27: pre-gate. This handler only forwards telemetry — its
+          // reposition logic was removed earlier. When telemetry is off
+          // (default after L1) AND there is no scroll change to report,
+          // we must do NOTHING. Previously we still read wrapper rect
+          // and the hover's full textContent (57K chars in the user's
+          // large-class case) on every scroll tick — a major scroll
+          // jank source on huge hovers. editor-scroll is not in the
+          // force-log set, so when enabled is false the irHERecord call
+          // below would early-return anyway; just skip the expensive
+          // reads up front.
+          var telOn=!!(window.__irHoverEventLogConfig&&window.__irHoverEventLogConfig.enabled);
+          if(!telOn)return;
+          if(!e.scrollTopChanged&&!e.scrollLeftChanged)return;
           var widget=window.__irCapturedHoverWidget;
           if(!widget){
-            // No hover alive — record a minimal scroll event only.
             irHERecord('editor-scroll',{
               scrollTop:Math.round(e.scrollTop),
               scrollLeft:Math.round(e.scrollLeft),
@@ -12351,19 +12632,25 @@ function irAttachEditorScrollWatch(editor){
               bbox={l:Math.round(r.left),t:Math.round(r.top),w:Math.round(r.width),h:Math.round(r.height)};
             }catch(_){}
             try{
+              // Faster drill detection: query for the back link element
+              // instead of stringifying 50K+ char textContent. The link
+              // is the canonical drill marker; falling back to the text
+              // scan is only needed if the link wasn't rendered yet,
+              // which won't be the case here (handler runs post-paint).
               var contentEl=widget._hover&&widget._hover.containerDomNode;
-              var text=contentEl?String(contentEl.textContent||''):'';
-              isDrill=text.indexOf('← Back')>=0;
+              isDrill=!!(contentEl&&contentEl.querySelector&&contentEl.querySelector('a[href*="previewBack"],a[data-href*="previewBack"]'));
             }catch(_){}
           }
-          irHERecord('editor-scroll',{
-            scrollTop:Math.round(e.scrollTop),
-            scrollLeft:Math.round(e.scrollLeft),
-            scrollTopChanged:e.scrollTopChanged,
-            scrollLeftChanged:e.scrollLeftChanged,
-            wrapperBbox:bbox,
-            isDrill:isDrill
-          });
+          if(isDrill||(bbox&&bbox.w>0)){
+            irHERecord('editor-scroll',{
+              scrollTop:Math.round(e.scrollTop),
+              scrollLeft:Math.round(e.scrollLeft),
+              scrollTopChanged:e.scrollTopChanged,
+              scrollLeftChanged:e.scrollLeftChanged,
+              wrapperBbox:bbox,
+              isDrill:isDrill
+            });
+          }
           // (Scroll-triggered reposition removed. Per user policy, the
           // drill hover should be placed at mouse cursor on first
           // pop-in only — not continuously chase the symbol or the
@@ -13026,6 +13313,13 @@ function irArmDrillSettleObserver(wrapperEl){
     }
     if(wrapperEl.__irSettleObs)return;
     if(typeof ResizeObserver!=='function')return;
+    // Originally L2/L8 skipped arming on 0×0 wrappers (91% of which timed
+    // out without firing). User reported drill hovers jumping in position
+    // afterwards — caused by genuine drills that started at 0×0 never
+    // getting their reposition observer. We now always arm, but for 0×0
+    // wrappers (where most arms are wasted) we use a short 1.5s timeout
+    // instead of the default 4s, keeping the wasted-observer cost down.
+    var armedAt0x0=(initialRect.width===0&&initialRect.height===0);
     var disposed=false;
     var ro=new ResizeObserver(function(){
       if(disposed)return;
@@ -13101,6 +13395,8 @@ function irArmDrillSettleObserver(wrapperEl){
       }
     }catch(_){}
     // Safety timeout — disconnect if wrapper never grows or never drills.
+    // 0×0 wrappers (transient initial hovers VS Code may discard) get a
+    // tighter 1.5s window since most never become drills.
     setTimeout(function(){
       if(disposed)return;
       disposed=true;
@@ -13108,7 +13404,7 @@ function irArmDrillSettleObserver(wrapperEl){
       try{if(contentMo)contentMo.disconnect();}catch(_){}
       try{delete wrapperEl.__irSettleObs;}catch(_){wrapperEl.__irSettleObs=null;}
       irHERecord('drill-settle-observer-timeout',{});
-    },4000);
+    },armedAt0x0?1500:4000);
     irHERecord('drill-settle-observer-armed',{rawW:Math.round(initialRect.width),rawH:Math.round(initialRect.height)});
   }catch(_){}
 }
@@ -13585,12 +13881,33 @@ function irWrapHoverWidgetGetPosition(widget){
             wrapperEl.__irDrillCheckTimer=setTimeout(checkDrillState,50);
           });
           contentObs.observe(contentRoot,{childList:true,characterData:true,subtree:true});
-          // Belt-and-suspenders: poll every 150ms while the wrapper is
+          // Belt-and-suspenders: poll every 1000ms while the wrapper is
           // mounted. Catches content swaps the MutationObserver misses
           // (e.g., VS Code sets innerHTML in one shot which generates
           // only a single childList mutation that may race with our
-          // observer registration).
-          wrapperEl.__irDrillPollTimer=setInterval(checkDrillState,150);
+          // observer registration). Was originally 150ms (major CPU
+          // hog: serializes textContent + touches classList + queries
+          // + setProperty 6.7×/sec). Then raised to 1000ms which caused
+          // the drill class / inline height clamp to be applied up to
+          // 1s LATE — visible as the hover "jumping" position when
+          // drilling (user-reported). 250ms is the compromise: still
+          // 4× cheaper than original yet within one render frame from
+          // VS Code's perspective so the drill-mode CSS lands before
+          // the user perceives the unclamped layout. The MutationObserver
+          // above also calls checkDrillState within 50ms of mutation,
+          // so this poll is the safety net for swaps the MO misses.
+          wrapperEl.__irDrillPollTimer=setInterval(function(){
+            try{
+              if(!wrapperEl.isConnected){
+                try{clearInterval(wrapperEl.__irDrillPollTimer);}catch(_){}
+                wrapperEl.__irDrillPollTimer=null;
+                try{if(wrapperEl.__irDrillContentObs)wrapperEl.__irDrillContentObs.disconnect();}catch(_){}
+                wrapperEl.__irDrillContentObs=null;
+                return;
+              }
+            }catch(_){}
+            checkDrillState();
+          },250);
           wrapperEl.__irDrillContentObs=contentObs;
         }
       }catch(_){}
@@ -13713,20 +14030,32 @@ function irScanAndPatchEditors(){
   }catch(_){return false}
 }
 // Try to patch immediately, then retry until at least one editor exists.
+// Exponential backoff: 200→400→800→1600→3200ms, capped at 5000ms; give up
+// after ~30s total. Previously this polled every 200ms for up to 40s
+// straight, which was a noticeable CPU drag on workspaces that never spawn
+// an editor (e.g., welcome view foregrounded).
 if(!window.__irPatchEditorRetryTimer){
   var triedCount=0;
+  var nextDelay=200;
+  var startedAt=Date.now();
+  function scheduleNextPatchAttempt(){
+    if(window.__irPatchEditorRetryTimer){
+      try{clearTimeout(window.__irPatchEditorRetryTimer);}catch(_){}
+    }
+    window.__irPatchEditorRetryTimer=setTimeout(tryPatch,nextDelay);
+    nextDelay=Math.min(5000,Math.floor(nextDelay*2));
+  }
   function tryPatch(){
     triedCount++;
-    if(irScanAndPatchEditors()||triedCount>=200){
-      try{if(window.__irPatchEditorRetryTimer)clearInterval(window.__irPatchEditorRetryTimer);}catch(_){}
+    var elapsed=Date.now()-startedAt;
+    if(irScanAndPatchEditors()||elapsed>=30000||triedCount>=20){
+      try{if(window.__irPatchEditorRetryTimer)clearTimeout(window.__irPatchEditorRetryTimer);}catch(_){}
       window.__irPatchEditorRetryTimer=null;
       return;
     }
+    scheduleNextPatchAttempt();
   }
   tryPatch();
-  if(!window.__irPatchEditorRetryTimer&&triedCount<200){
-    window.__irPatchEditorRetryTimer=setInterval(tryPatch,200);
-  }
 }
 window.__irGetPatchStatus=function(){
   try{
@@ -14011,9 +14340,15 @@ function irHoverBoxCornerSnapshot(hoverEl){
 }
 function irLogHoverBoxCorners(hoverEl,reason){
   if(!hoverEl)return null;
+  // L28: cap-first guard. The snapshot does heavy work
+  // (getBoundingClientRect + getComputedStyle + parent chain walk) and
+  // was running on every caller even after the log cap was reached —
+  // a hot path for the 57K-char hover case where measurement happens
+  // multiple times per drill paint. Skip when we wouldn't log anyway.
+  if(!window.__irBoxCornerLogCount)window.__irBoxCornerLogCount=0;
+  if(window.__irBoxCornerLogCount>=60)return null;
   var snap=irHoverBoxCornerSnapshot(hoverEl);
   if(!snap||!snap.outer||!snap.inner)return snap;
-  if(!window.__irBoxCornerLogCount)window.__irBoxCornerLogCount=0;
   if(window.__irBoxCornerLogCount<60){
     window.__irBoxCornerLogCount++;
     var o=snap.outer,i=snap.inner,d=snap.delta,f=snap.fits;
@@ -14072,9 +14407,22 @@ function irFindNearbyTypeLink(e,hover,maxX,maxY){
   }catch(_){return null}
 }
 function irUseNearbyTypeLink(e,hover,reason){
+  var ex=e&&typeof e.clientX==='number'?e.clientX|0:0;
+  var ey=e&&typeof e.clientY==='number'?e.clientY|0:0;
+  var nowTs=Date.now();
+  var cache=window.__irNearLinkCache;
+  if(cache&&cache.hover===hover&&Math.abs(cache.x-ex)<=5&&Math.abs(cache.y-ey)<=5&&(nowTs-cache.ts)<16){
+    if(cache.link){
+      try{irSetPointActiveLink(cache.link);}catch(_){}
+      try{irMarkHoverManaged(hover,true);}catch(_){}
+    }
+    return cache.link;
+  }
   var near=irFindNearbyTypeLink(e,hover,26,10);
-  if(!near||!near.link)return null;
-  irSetPointActiveLink(near.link);
+  var link=(near&&near.link)?near.link:null;
+  window.__irNearLinkCache={x:ex,y:ey,hover:hover,link:link,ts:nowTs};
+  if(!link)return null;
+  irSetPointActiveLink(link);
   try{irMarkHoverManaged(hover,true)}catch(_){}
   if(window.__irNearLinkLogCount<40){
     window.__irNearLinkLogCount++;
@@ -14468,10 +14816,26 @@ function irResetNativeHoverMutations(hoverEl){
 function irMarkNativeHoverReleased(hoverEl,reason,hideVisual){
   try{
     if(!hoverEl)return;
+    // L13 revised: VS Codes hover lifecycle can call this 3–6 times in the
+    // same ms (prune + active-switch + outside-editor-new-token, etc).
+    // Original L13 returned early to skip the whole body, but that risked
+    // a UX issue: if the first call had hideVisual=false and a subsequent
+    // call wanted hideVisual=true, the hover would remain visible until
+    // the next cycle — the user would perceive a "delayed hide" / sudden
+    // jump. Per the dedup-before-paint principle, we now ALWAYS mutate
+    // state (state mutations are idempotent or use "hide-wins" semantics
+    // for hideVisual) and only coalesce the LOG line, which is the only
+    // truly redundant work.
+    var prevReleasedAt=Number(hoverEl.__irReleasedAt)||0;
+    var nowMs=Date.now();
+    var alreadyMarkedThisFrame=prevReleasedAt && (nowMs-prevReleasedAt)<16;
     var releasedText=String(hoverEl.textContent||'');
-    hoverEl.__irReleasedAt=Date.now();
+    hoverEl.__irReleasedAt=nowMs;
     hoverEl.__irReleasedText=releasedText;
-    hoverEl.__irReleaseHideVisualRequested=!!hideVisual;
+    // hide-wins: any call asking to hide upgrades the request; never downgrade.
+    if(hideVisual || !hoverEl.__irReleaseHideVisualRequested){
+      hoverEl.__irReleaseHideVisualRequested=!!hideVisual;
+    }
     hoverEl.__irPrimaryPreviewTarget=null;
     hoverEl.__irPreviewAppliedAt=0;
     hoverEl.__irStickyUntil=0;
@@ -14480,7 +14844,7 @@ function irMarkNativeHoverReleased(hoverEl,reason,hideVisual){
     hoverEl.__irReleaseRemoveTimer=null;
     if(hoverEl.classList)hoverEl.classList.add('ir-native-released-hover');
     if(hoverEl.setAttribute)hoverEl.setAttribute('data-ir-native-released-hover','1');
-    if(window.__irHoverLifecycleLogCount<120){
+    if(!alreadyMarkedThisFrame && window.__irHoverLifecycleLogCount<120){
       window.__irHoverLifecycleLogCount++;
       irLog('renderer: native hover released retained '+(reason||'')+' hideVisual='+(hideVisual?'1':'0')+' textLen='+releasedText.length);
     }
@@ -14774,6 +15138,24 @@ function irDisposeActiveHoverForEditorTarget(e,reason){
     return true;
   }catch(_){return false}
 }
+// L19: shared dedup gate for outside/active/preview hoverguard log lines.
+// Returns true when this caller should actually fire the irLog (and updates
+// the cache to record this position). Returns false to suppress logging —
+// the surrounding code STILL runs (early returns, state mutations) so this
+// is purely a log-volume gate. ±5px / 16ms window, scoped per element.
+function irHoverGuardShouldLogDedup(el,e){
+  try{
+    var x=e&&typeof e.clientX==='number'?e.clientX|0:0;
+    var y=e&&typeof e.clientY==='number'?e.clientY|0:0;
+    var now=Date.now();
+    var last=window.__irHoverGuardOutsideLast;
+    if(last && last.el===el && Math.abs(last.x-x)<=5 && Math.abs(last.y-y)<=5 && (now-last.ts)<16){
+      return false;
+    }
+    window.__irHoverGuardOutsideLast={el:el,x:x,y:y,ts:now};
+    return true;
+  }catch(_){return true}
+}
 function irHoverGuard(e){
   try{irDisposeHiddenActiveHover('hoverguard')}catch(_){}
   if(irClosestNativePopup(e&&e.target)){
@@ -14805,7 +15187,7 @@ function irHoverGuard(e){
       && !irClosestNativePopup(e&&e.target)){
       irArmHoverSticky(activeEditorHover,IR_HOVER_EXIT_GRACE_MS);
       try{e.stopImmediatePropagation()}catch(_){}
-      if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+      if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')&&irHoverGuardShouldLogDedup(activeEditorHover,e)){
         window.__irHoverGuardOutsideLogCount++;
         irLog('renderer: hoverguard active-near-non-editor-pass event='+e.type+' target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' active={'+irHoverBrief(activeEditorHover)+'}');
       }
@@ -14829,7 +15211,7 @@ function irHoverGuard(e){
       if(!editorMoveToken&&irShouldHoldPreviewTransition(activeEditorHover,e)){
         irArmHoverSticky(activeEditorHover,IR_HOVER_EXIT_GRACE_MS);
         try{e.stopImmediatePropagation()}catch(_){}
-        if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+        if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')&&irHoverGuardShouldLogDedup(activeEditorHover,e)){
           window.__irHoverGuardOutsideLogCount++;
           irLog('renderer: hoverguard preview-transition-pass event='+e.type+' target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' active={'+irHoverBrief(activeEditorHover)+'}');
         }
@@ -14844,10 +15226,21 @@ function irHoverGuard(e){
     if(pointLink&&window.__irHoverGuardLinkLogCount<120&&(e.type==='pointerover'||e.type==='mouseover'||e.type==='pointermove'||e.type==='mousemove')){
       window.__irHoverGuardLinkLogCount++;
       irLog('renderer: hoverguard link-active "'+(pointLink.getAttribute&&pointLink.getAttribute('data-type')||'')+'" event='+e.type+' target='+irElementBrief(irEventElement(e.target))+' link='+irElementBrief(pointLink));
-    }else if(!pointLink&&window.__irHoverGuardNoLinkLogCount<120&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
-      window.__irHoverGuardNoLinkLogCount++;
-      var near=irFindNearbyTypeLink(e,insideHv,26,10);
-      irLog('renderer: hoverguard no point-link event='+e.type+' '+irEventPointBrief(e)+' target='+irElementBrief(irEventElement(e.target))+' hoverRect='+irRectBrief(insideHv)+(near?' nearest="'+(near.link.getAttribute&&near.link.getAttribute('data-type')||'')+'" dx='+near.dx+' dy='+near.dy+' rect='+near.rect:' nearest=none')+irPointWordSummary(e,insideHv));
+    }else if(!pointLink&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+      // Dedup: a single user mouse motion fires up to 3 events at the same
+      // coordinates. Coalesce by 5px / 16ms so we do not log (and do not
+      // run the irFindNearbyTypeLink scan) three times per move.
+      var hgx=e&&typeof e.clientX==='number'?e.clientX|0:0;
+      var hgy=e&&typeof e.clientY==='number'?e.clientY|0:0;
+      var hgNow=Date.now();
+      var hgLast=window.__irHoverGuardNoLinkLast;
+      var hgDup=hgLast&&hgLast.hover===insideHv&&Math.abs(hgLast.x-hgx)<=5&&Math.abs(hgLast.y-hgy)<=5&&(hgNow-hgLast.ts)<16;
+      if(!hgDup&&window.__irHoverGuardNoLinkLogCount<120){
+        window.__irHoverGuardNoLinkLogCount++;
+        window.__irHoverGuardNoLinkLast={hover:insideHv,x:hgx,y:hgy,ts:hgNow};
+        var near=irFindNearbyTypeLink(e,insideHv,26,10);
+        irLog('renderer: hoverguard no point-link event='+e.type+' '+irEventPointBrief(e)+' target='+irElementBrief(irEventElement(e.target))+' hoverRect='+irRectBrief(insideHv)+(near?' nearest="'+(near.link.getAttribute&&near.link.getAttribute('data-type')||'')+'" dx='+near.dx+' dy='+near.dy+' rect='+near.rect:' nearest=none')+irPointWordSummary(e,insideHv));
+      }
     }
     if(!pointLink&&!irHoverHasManagedContent(insideHv))return;
     if(!pointLink&&(e.type==='pointermove'||e.type==='mousemove')){
@@ -14886,7 +15279,7 @@ function irHoverGuard(e){
     var editorToken=irEventTargetTokenText(e);
     if(editorToken&&near&&irHoverContainsTokenText(managed,editorToken)){
       irArmHoverSticky(managed,IR_HOVER_EXIT_GRACE_MS);
-      if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+      if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')&&irHoverGuardShouldLogDedup(managed,e)){
         window.__irHoverGuardOutsideLogCount++;
         irLog('renderer: hoverguard outside-same-token-pass event='+e.type+' token='+JSON.stringify(editorToken)+' near='+near+' recentlyInside='+!!recentlyInside+' sticky='+!!isSticky+' target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' managed={'+irHoverBrief(managed)+'}');
       }
@@ -14914,23 +15307,39 @@ function irHoverGuard(e){
     if(irShouldHoldPreviewTransition(managed,e)){
       irArmHoverSticky(managed,IR_HOVER_EXIT_GRACE_MS);
       try{e.stopImmediatePropagation()}catch(_){}
-      if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+      if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')&&irHoverGuardShouldLogDedup(managed,e)){
         window.__irHoverGuardOutsideLogCount++;
         irLog('renderer: hoverguard outside-preview-transition-pass event='+e.type+' near='+near+' target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' managed={'+irHoverBrief(managed)+'}');
       }
       return;
     }
     if(managed.__irActivatedAt&&now-managed.__irActivatedAt<IR_HOVER_FRESH_EDITOR_GRACE_MS){
-      if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+      // L16: same dedup principle as L11 — a single user mouse motion
+      // fires up to 3 events at same coords. Outside-guard logs were
+      // repeating per event. We always RETURN here (functional behaviour
+      // unchanged); only the log is suppressed when same coords within
+      // 16ms on the same managed element.
+      var ogx0=e&&typeof e.clientX==='number'?e.clientX|0:0;
+      var ogy0=e&&typeof e.clientY==='number'?e.clientY|0:0;
+      var ogLast0=window.__irHoverGuardOutsideLast;
+      var ogDup0=ogLast0&&ogLast0.el===managed&&Math.abs(ogLast0.x-ogx0)<=5&&Math.abs(ogLast0.y-ogy0)<=5&&(now-ogLast0.ts)<16;
+      if(!ogDup0&&window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
         window.__irHoverGuardOutsideLogCount++;
+        window.__irHoverGuardOutsideLast={el:managed,x:ogx0,y:ogy0,ts:now};
         irLog('renderer: hoverguard outside-fresh-pass event='+e.type+' near='+near+' age='+(now-managed.__irActivatedAt)+' target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' managed={'+irHoverBrief(managed)+'}');
       }
       return;
     }
     if(!editorToken&&near&&(isSticky||recentlyInside)){
       irArmHoverSticky(managed,IR_HOVER_EXIT_GRACE_MS);
-      if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+      // L16: same dedup for the near-pass branch
+      var ogx1=e&&typeof e.clientX==='number'?e.clientX|0:0;
+      var ogy1=e&&typeof e.clientY==='number'?e.clientY|0:0;
+      var ogLast1=window.__irHoverGuardOutsideLast;
+      var ogDup1=ogLast1&&ogLast1.el===managed&&Math.abs(ogLast1.x-ogx1)<=5&&Math.abs(ogLast1.y-ogy1)<=5&&(now-ogLast1.ts)<16;
+      if(!ogDup1&&window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
         window.__irHoverGuardOutsideLogCount++;
+        window.__irHoverGuardOutsideLast={el:managed,x:ogx1,y:ogy1,ts:now};
         irLog('renderer: hoverguard outside-unknown-token-near-pass event='+e.type+' near='+near+' recentlyInside='+!!recentlyInside+' sticky='+!!isSticky+' target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' managed={'+irHoverBrief(managed)+'}');
       }
       return;
@@ -14953,7 +15362,7 @@ function irHoverGuard(e){
   }
   if(near){
     if(near)irArmHoverSticky(managed,IR_HOVER_EXIT_GRACE_MS);
-    if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')){
+    if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')&&irHoverGuardShouldLogDedup(managed,e)){
       window.__irHoverGuardOutsideLogCount++;
       irLog('renderer: hoverguard outside-near-pass event='+e.type+' near='+near+' editorTarget='+!!editorTarget+' recentlyInside='+!!recentlyInside+' sticky='+!!isSticky+' target='+irElementBrief(irEventElement(e&&e.target))+' '+irEventPointBrief(e)+' managed={'+irHoverBrief(managed)+'}');
     }
@@ -16279,10 +16688,16 @@ function irTouchHoverRootContent(root,reason,text){
       }
     }catch(_){}
     if(window.__irLazyHoverLifecycleLogCount<120){
+      // The currentLength>120 branch used to fire even when nothing
+      // changed (currentLength === previousLength). With every preBlock
+      // text mutation triggering this — but the host total textContent
+      // length often unchanged — we were spamming "len=N prev=N transient=0"
+      // entries that conveyed no signal. Now it only fires when length
+      // actually moved.
       var interesting=irIsTransientHoverText(sample)
         || previousLength===0
         || Math.abs(currentLength-previousLength)>24
-        || currentLength>120;
+        || (currentLength>120 && currentLength!==previousLength);
       if(interesting){
         window.__irLazyHoverLifecycleLogCount++;
         irLog('renderer: lazy-hover content '+(reason||'change')
@@ -16419,6 +16834,25 @@ function irShouldKeepRecentPendingHoverRoot(root,activeHover,pendingKeepRoot){
 function irShouldProcessHoverBlock(hoverHost,block){
   if(!hoverHost)return true;
   try{
+    // L12+L17+L18: skip hovers we should not be scanning.
+    // L18 (state-based, time-agnostic): non-renderable hovers that are
+    // not the currently active hover can be skipped immediately. The
+    // previous time-based gate (L12 60s, L17 30s) missed freshly-released
+    // opacity-zero hovers with releasedAge=0 — those were the dominant
+    // contributors to the "skip unrenderable hover scan" cap (40 lines
+    // per session). The active hover is never skipped — it may be the
+    // live target the user is interacting with.
+    // L17 stays: any released, non-active hover older than 30s is also
+    // a clear skip target.
+    try{
+      var stalActive=window.__irActiveHoverEl;
+      var isActiveStale=stalActive===hoverHost;
+      if(!isActiveStale){
+        if(!irIsRenderableHoverRoot(hoverHost)) return false;
+        var stalAt=Number(hoverHost.__irReleasedAt)||0;
+        if(stalAt && (Date.now()-stalAt) > 30000) return false;
+      }
+    }catch(_){}
     irMarkHoverRootSeen(hoverHost);
     irClearEmptyHoverRoot(hoverHost);
     var active=window.__irActiveHoverEl;
@@ -16524,7 +16958,15 @@ function irDisposeStaleHover(hoverEl,reason){
         window.__irHistoryCurrent=null;
       }
     }catch(_){}
-    if(window.__irHoverLifecycleLogCount<120){
+    // L15: same coalesce principle as L13. State mutations above are
+    // idempotent (class remove, attribute remove, irMarkNativeHoverReleased
+    // already self-coalesces) so they always run; only the log line is
+    // suppressed when called on the same element within one frame.
+    var shellCleanedLast=Number(hoverEl.__irShellCleanedAt)||0;
+    var shellCleanedNow=Date.now();
+    var shellLogged=shellCleanedLast && (shellCleanedNow-shellCleanedLast)<16;
+    hoverEl.__irShellCleanedAt=shellCleanedNow;
+    if(!shellLogged && window.__irHoverLifecycleLogCount<120){
       window.__irHoverLifecycleLogCount++;
       irLog('renderer: native hover shell cleaned '+(reason||'')+' refireGrace='+(refireGrace?'1':'0')+' retained=1 victim={'+beforeBrief+'}');
     }
@@ -18759,6 +19201,56 @@ function irDedupeHoverContent(hoverHost){
       window.__irWrapLogCount++;
       irLog('renderer: dedupe hover blocks removed='+removed);
     }
+    // L26: after dedup the wrapper may have shrunk and the user's mouse
+    // may now be outside its bounds — next mousemove would mouseleave the
+    // hover and dismiss it. Slide the wrapper toward the mouse so the
+    // cursor stays at least pad px inside. Active drill wrappers also
+    // need __irDesired updated so the layout/style observers (L23, L24)
+    // restore to this safer pose rather than dragging back to the pre-
+    // shrink desired position.
+    if(removed)irKeepMouseInsideWrapperAfterDedupe(hoverHost);
+  }catch(_){}
+}
+function irKeepMouseInsideWrapperAfterDedupe(hoverHost){
+  try{
+    if(!hoverHost)return;
+    var wrapperEl=hoverHost.closest&&hoverHost.closest('.monaco-resizable-hover');
+    if(!wrapperEl||!wrapperEl.getBoundingClientRect)return;
+    var mp=window.__irLastPointer;
+    if(!mp||typeof mp.x!=='number'||typeof mp.y!=='number')return;
+    // Force layout flush: getBoundingClientRect reads post-DOM-removal rect.
+    var r=wrapperEl.getBoundingClientRect();
+    if(r.width<20||r.height<20)return;
+    var pad=8;
+    var mx=mp.x,my=mp.y;
+    var nx=r.left,ny=r.top,nw=r.width,nh=r.height;
+    var newLeft=nx,newTop=ny;
+    var shifted=false;
+    if(mx<nx+pad){newLeft=mx-pad;shifted=true;}
+    else if(mx>nx+nw-pad){newLeft=mx-nw+pad;shifted=true;}
+    if(my<ny+pad){newTop=my-pad;shifted=true;}
+    else if(my>ny+nh-pad){newTop=my-nh+pad;shifted=true;}
+    if(!shifted)return;
+    // Viewport clamp.
+    var vw=window.innerWidth||document.documentElement.clientWidth||1440;
+    var vh=window.innerHeight||document.documentElement.clientHeight||900;
+    if(newLeft+nw>vw)newLeft=vw-nw-2;
+    if(newLeft<2)newLeft=2;
+    if(newTop+nh>vh)newTop=vh-nh-2;
+    if(newTop<2)newTop=2;
+    var rTop=Math.round(newTop);
+    var rLeft=Math.round(newLeft);
+    if(rTop===Math.round(ny)&&rLeft===Math.round(nx))return;
+    wrapperEl.style.top=rTop+'px';
+    wrapperEl.style.left=rLeft+'px';
+    // Drill wrappers: update __irDesired so L23/L24 don't drag back.
+    if(wrapperEl.__irDesired){
+      wrapperEl.__irDesired={top:rTop,left:rLeft,at:Date.now()};
+    }
+    if(window.__irWrapLogCount<20){
+      window.__irWrapLogCount++;
+      irLog('renderer: dedupe-mouse-safe-shift mouse='+mx+','+my+' from='+Math.round(nx)+','+Math.round(ny)+' to='+rLeft+','+rTop+' size='+Math.round(nw)+'x'+Math.round(nh));
+    }
   }catch(_){}
 }
 function irRemoveDuplicateHoverBlock(block){
@@ -19020,10 +19512,19 @@ function irScanRenderedMarkdown(){
 
 function irScheduleScan(){
   if(window.__irScanTimer)return;
-  window.__irScanTimer=irSetTimer(function(){
+  // L25: was setTimeout(..., 50). User reported the symptom: hover paints
+  // with all duplicate blocks (a large box), then ~50ms later our dedup
+  // shrinks it — the mouse ends up outside the smaller wrapper and the
+  // hover dismisses. setTimeout fires as a macrotask AFTER paint, so the
+  // big box is always visible briefly. rAF fires right before the next
+  // paint, so our dedup completes in the same frame as the content
+  // arrival — the user only ever sees the deduplicated (smaller) hover.
+  // Fallback to setTimeout if rAF is unavailable (test/headless env).
+  var schedule=window.requestAnimationFrame||function(cb){return setTimeout(cb,16);};
+  window.__irScanTimer=schedule(function(){
     window.__irScanTimer=null;
     try{irScanRenderedMarkdown()}catch(eScan){irLog('renderer: scan err '+(eScan&&eScan.message))}
-  },50);
+  });
 }
 
 window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
