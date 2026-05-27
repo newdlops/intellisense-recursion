@@ -1527,7 +1527,7 @@ function resolveInBackground(
             const entry = await buildResultFromFastHit(typeName, fastHit);
             if (entry) {
               defCacheSet(cacheKey, entry);
-              log.info(`[bg]   "${typeName}" → fast def ${fastHit.path}:${fastHit.line} lines=${entry.previewLineCount ?? '?'} md=${entry.preview.length} (${Date.now() - t0}ms)`);
+              log.trace(`[bg]   "${typeName}" → fast def ${fastHit.path}:${fastHit.line} lines=${entry.previewLineCount ?? '?'} md=${entry.preview.length} (${Date.now() - t0}ms)`);
               return entry;
             }
           } else if (await sidecarDefinitivelyMissing(typeName, matchUri.fsPath)) {
@@ -3108,7 +3108,10 @@ function patchSharedService(service: any) {
     // repeated hovers at the same point with the same extracted types.
     const cachedPreviews = posPreviewGet(posKey, typesKey);
     if (cachedPreviews) {
-      log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} POS-CACHE hit (${hoverMs()})`);
+      // L45: trace level — frequent hot-path event. Per-hover paint
+      // produces this for every cached repeat. info-level callers can
+      // re-enable by setting the output channel logLevel to Trace.
+      log.trace(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} POS-CACHE hit (${hoverMs()})`);
       return returnWithNativeFallback(attachPreviewsOnce(
         result,
         cachedPreviews,
@@ -3129,7 +3132,8 @@ function patchSharedService(service: any) {
         return null;
       });
       if (computed) {
-        log.info(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} INFLIGHT attached (${hoverMs()}, post=${postNativeMs()})`);
+        // L45: trace level — frequent multi-handle dedup event.
+        log.trace(`[hover] ${fileName}:${posLine}:${posChar} handle=${handle} INFLIGHT attached (${hoverMs()}, post=${postNativeMs()})`);
         return returnWithNativeFallback(attachPreviewsOnce(
           result,
           computed.previews,
@@ -3307,7 +3311,9 @@ function patchSharedService(service: any) {
       }
       if (previewsOut.length === 0) { return null; }
       const previews = previewsOut.join(HOVER_PREVIEW_SEPARATOR);
-      log.info(`[hover] previews built count=${previewsOut.length} md=${previews.length} (${hoverMs()})`);
+      // L45: trace level — fires for every hover paint. Re-enable at
+      // logLevel=Trace if diagnosing preview build behaviour.
+      log.trace(`[hover] previews built count=${previewsOut.length} md=${previews.length} (${hoverMs()})`);
       return { typesKey, previews };
     };
 
@@ -3318,7 +3324,8 @@ function patchSharedService(service: any) {
       const computed = await computePromise;
       if (computed) {
         posPreviewSet(posKey, computed.typesKey, computed.previews);
-        log.info(`[hover] done: first-hover preview attached md=${computed.previews.length} (${hoverMs()}, post=${postNativeMs()})`);
+        // L45: trace level — once-per-paint completion marker.
+        log.trace(`[hover] done: first-hover preview attached md=${computed.previews.length} (${hoverMs()}, post=${postNativeMs()})`);
         return returnWithNativeFallback(attachPreviewsOnce(
           result,
           computed.previews,
@@ -11469,6 +11476,16 @@ function irClearTimer(timer){
 }
 function irPruneDetachedHoverState(){
   try{
+    // L34: 250ms throttle. This runs at the start of every
+    // irScanRenderedMarkdown, which a mutation burst can trigger many
+    // times in a frame. Each pass does querySelectorAll over all hover
+    // roots + iterates to dispose stale ones — purely cleanup work that
+    // doesn't need to run multiple times per drill burst. The throttle
+    // collapses the 37+/burst prune calls observed in logs down to ~1.
+    var pruneNow=Date.now();
+    var lastPruneAt=Number(window.__irLastPruneAt)||0;
+    if(pruneNow-lastPruneAt<250)return;
+    window.__irLastPruneAt=pruneNow;
     var body=document.body;
     if(window.__irHistoryFor&&!body.contains(window.__irHistoryFor)){
       window.__irHistoryFor=null;
@@ -11690,6 +11707,24 @@ style.textContent=[
   '.monaco-resizable-hover:has(a[href*="previewBack"]),.monaco-resizable-hover:has(a[data-href*="previewBack"]){max-height:var(--ir-drill-max-h,48vh) !important}',
   '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-hover,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-hover{max-height:calc(var(--ir-drill-max-h,48vh) - 2px) !important}',
   '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-scrollable-element,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-scrollable-element{max-height:calc(var(--ir-drill-max-h,48vh) - 4px) !important}',
+  // L47: native virtual list for large hover bodies. content-visibility:
+  // auto makes the brower skip layout+paint for off-screen .rendered-
+  // markdown blocks (and their descendants) — turning a 57K-char drill
+  // hover from "lay out everything on every reflow" into "lay out only
+  // what is in view, plus a small lookahead area". contain-intrinsic-
+  // size tells the brower how much space to reserve when the block is
+  // skipped so the scrollbar stays accurate. Pairs with our existing
+  // L32 visibility gate (which already prevents OUR wrap walks on
+  // off-screen blocks); this rule extends the same idea to the brower
+  // engine itself for the layout/paint side. Pure CSS, applies to all
+  // hovers — brower no-ops fast when the block fits in view anyway,
+  // so there is no measurable cost on small hovers.
+  '.monaco-hover .rendered-markdown,.monaco-editor-hover .rendered-markdown{content-visibility:auto;contain-intrinsic-size:0 80px}',
+  // L48: also virtualize the syntax-highlighted code blocks. These are
+  // the dominant cost for large class hovers — many tokenized spans
+  // per line × many lines = the biggest layout work. Intrinsic height
+  // hint uses an average code-row height (18px-line × several lines).
+  '.monaco-hover .monaco-tokenized-source,.monaco-editor-hover .monaco-tokenized-source{content-visibility:auto;contain-intrinsic-size:0 200px}',
 ].join('');
 document.head.appendChild(style);
 window.__irStyleEl = style;
@@ -11794,41 +11829,14 @@ var IR_HE_FORWARDED_KINDS={
   'editor-scroll':1,
   'global-prototype-patched':1
 };
-// L20 diagnostic: drill-reposition* kinds always reach log.txt regardless
-// of telemetry being disabled (L1). User reported drill hovers visibly
-// jumping in position, and we cannot see the timing of reposition events
-// with telemetry off. Once root cause is identified and fixed, this
-// allowlist should shrink back to {}.
-var IR_HE_FORCE_LOG_KINDS={
-  'drill-reposition':1,
-  'drill-reposition-byel':1,
-  'drill-reposition-byel-skip-transient':1,
-  'drill-reposition-byel-skip-already-positioned':1,
-  'drill-reposition-skip-transient':1,
-  'drill-reposition-skip-already-positioned':1,
-  'drill-reposition-error':1,
-  'drill-reposition-byel-error':1,
-  'drill-settle-observer-fired':1,
-  'anchor-drift-observed':1,
-  'hover-widget-captured':1,
-  // L22 diagnostic: investigate drill-jump root cause. Capture the
-  // moment we clamp the wrapper height (paint → shrink), the initial
-  // height capture, and any drill class apply / remove. Compare these
-  // timestamps against drill-reposition-byel to find the actual jump
-  // vector (size change or position change).
-  'drill-class-on':1,
-  'drill-class-off':1,
-  'drill-inline-clamp':1,
-  'init-height-captured':1,
-  'drill-style-reapplied':1,
-  // L24 diagnostics
-  'resizable-layout-wrapped':1,
-  'drill-layout-wrap-reapplied':1,
-  // L24 diag step 2: trace where irAttachWrapperResizeReposition bails out
-  'attach-wrr-skip':1,
-  'attach-wrr-defer':1,
-  'attach-wrr-give-up':1
-};
+// L20-L24 diagnostic force-logs were used to root-cause drill jump
+// (L23+L24) and drill-mutation throughput (L36+L37). All fixes
+// verified via the captured logs; the diagnostic allowlist is cleared
+// here so telemetry-off users don't pay the WebSocket + disk overhead
+// for events whose timing no longer needs surfacing. If a future drill
+// regression appears, repopulate this set with the specific kinds
+// being investigated.
+var IR_HE_FORCE_LOG_KINDS={};
 function irHERecord(kind,detail){
   try{
     var forceLog=!!IR_HE_FORCE_LOG_KINDS[kind];
@@ -14708,14 +14716,13 @@ function irTypeLinkHoverIntent(e){
     irMarkHoverManaged(irClosestHover(link),true);
   }catch(_){}
 }
+// L42: window listeners alone suffice (capture phase fires window
+// before document). Was registered on both — doubled the per-move
+// handler call count for no functional gain.
 track(window,'pointerover',irTypeLinkHoverIntent,true);
 track(window,'mouseover',irTypeLinkHoverIntent,true);
 track(window,'pointermove',irTypeLinkHoverIntent,true);
 track(window,'mousemove',irTypeLinkHoverIntent,true);
-track(document,'pointerover',irTypeLinkHoverIntent,true);
-track(document,'mouseover',irTypeLinkHoverIntent,true);
-track(document,'pointermove',irTypeLinkHoverIntent,true);
-track(document,'mousemove',irTypeLinkHoverIntent,true);
 
 // Drill-down dismissal control with two layers:
 //  1) Mouse INSIDE the drill-down hover → block VS Code\\'s capture-phase
@@ -15089,6 +15096,16 @@ function irShouldHoldPreviewTransition(root,e){
 function irRememberPointerEvent(e){
   try{
     if(!e||typeof e.clientX!=='number'||typeof e.clientY!=='number')return;
+    // L43: skip near-stationary mouse events. When the user pauses on
+    // a hover, the OS still emits pointermove/mousemove at 100Hz+ and
+    // each call did getBoundingClientRect (irPointInPreviewTransitionRect)
+    // + a fresh __irLastPointer object allocation. ±2px / 16ms is well
+    // below the perception threshold for pointer movement so behaviour
+    // (drill positioning, etc.) is unaffected.
+    var lastP=window.__irLastPointer;
+    if(lastP && Math.abs(lastP.x-e.clientX)<=2 && Math.abs(lastP.y-e.clientY)<=2 && (Date.now()-lastP.at)<16){
+      return;
+    }
     var active=window.__irActiveHoverEl&&document.body&&document.body.contains(window.__irActiveHoverEl)
       ? window.__irActiveHoverEl
       : null;
@@ -15149,7 +15166,12 @@ function irHoverGuardShouldLogDedup(el,e){
     var y=e&&typeof e.clientY==='number'?e.clientY|0:0;
     var now=Date.now();
     var last=window.__irHoverGuardOutsideLast;
-    if(last && last.el===el && Math.abs(last.x-x)<=5 && Math.abs(last.y-y)<=5 && (now-last.ts)<16){
+    // L39: was ±5 / 16ms. Bumped to ±10 / 32ms — mouse jitter while
+    // reading hover content is typically much larger than 5px and the
+    // surrounding code paths (early returns + log) are pure no-ops on
+    // repeat. Wider window catches more redundant calls without
+    // changing observable hover behaviour.
+    if(last && last.el===el && Math.abs(last.x-x)<=10 && Math.abs(last.y-y)<=10 && (now-last.ts)<32){
       return false;
     }
     window.__irHoverGuardOutsideLast={el:el,x:x,y:y,ts:now};
@@ -15234,7 +15256,11 @@ function irHoverGuard(e){
       var hgy=e&&typeof e.clientY==='number'?e.clientY|0:0;
       var hgNow=Date.now();
       var hgLast=window.__irHoverGuardNoLinkLast;
-      var hgDup=hgLast&&hgLast.hover===insideHv&&Math.abs(hgLast.x-hgx)<=5&&Math.abs(hgLast.y-hgy)<=5&&(hgNow-hgLast.ts)<16;
+      // L39: ±10 / 32ms (was ±5 / 16ms). This guard is for log-volume
+      // reduction on a per-frame mousemove gauntlet — wider window
+      // suppresses jitter-driven repeats without affecting the
+      // (separately cached) link activation path.
+      var hgDup=hgLast&&hgLast.hover===insideHv&&Math.abs(hgLast.x-hgx)<=10&&Math.abs(hgLast.y-hgy)<=10&&(hgNow-hgLast.ts)<32;
       if(!hgDup&&window.__irHoverGuardNoLinkLogCount<120){
         window.__irHoverGuardNoLinkLogCount++;
         window.__irHoverGuardNoLinkLast={hover:insideHv,x:hgx,y:hgy,ts:hgNow};
@@ -15387,7 +15413,19 @@ function irPreviewTransitionWheelGuard(e){
     if(!active||!irShouldHoldPreviewTransition(active,e)||irClosestHover(e.target))return;
     var sc=irPrimaryHoverScroller(active)||active;
     var before=sc?Number(sc.scrollTop)||0:0;
-    var maxTop=sc?Math.max(0,(Number(sc.scrollHeight)||0)-(Number(sc.clientHeight)||0)):0;
+    // L29: same 250ms scrollHeight cache as irHoverInternalWheelGuard.
+    var maxTop=0;
+    if(sc){
+      var pCacheAt=Number(sc.__irMaxTopAt)||0;
+      var pNow=Date.now();
+      if(pCacheAt && (pNow-pCacheAt)<250){
+        maxTop=Number(sc.__irMaxTop)||0;
+      }else{
+        maxTop=Math.max(0,(Number(sc.scrollHeight)||0)-(Number(sc.clientHeight)||0));
+        sc.__irMaxTop=maxTop;
+        sc.__irMaxTopAt=pNow;
+      }
+    }
     var delta=Number(e&&e.deltaY)||0;
     if(sc&&maxTop>0&&delta){
       sc.scrollTop=irClamp(before+delta,0,maxTop);
@@ -15402,14 +15440,14 @@ function irPreviewTransitionWheelGuard(e){
     }
   }catch(_){}
 }
+// L42: window-only registration. The mirrored document listeners
+// fired the same handler twice per mouse event without affecting any
+// observable behaviour (handlers were idempotent + stopPropagation
+// gated downstream native listeners equally well at the window stage).
 track(window,'pointermove',irRememberPointerEvent,true);
 track(window,'mousemove',irRememberPointerEvent,true);
 track(window,'mouseover',irRememberPointerEvent,true);
 track(window,'pointerover',irRememberPointerEvent,true);
-track(document,'pointermove',irRememberPointerEvent,true);
-track(document,'mousemove',irRememberPointerEvent,true);
-track(document,'mouseover',irRememberPointerEvent,true);
-track(document,'pointerover',irRememberPointerEvent,true);
 track(window,'pointermove',irHoverGuard,true);
 track(window,'pointerover',irHoverGuard,true);
 track(window,'pointerout',irHoverGuard,true);
@@ -15418,14 +15456,6 @@ track(window,'mousemove',irHoverGuard,true);
 track(window,'mouseover',irHoverGuard,true);
 track(window,'mouseout',irHoverGuard,true);
 track(window,'mouseleave',irHoverGuard,true);
-track(document,'pointermove',irHoverGuard,true);
-track(document,'pointerover',irHoverGuard,true);
-track(document,'pointerout',irHoverGuard,true);
-track(document,'pointerleave',irHoverGuard,true);
-track(document,'mousemove',irHoverGuard,true);
-track(document,'mouseover',irHoverGuard,true);
-track(document,'mouseout',irHoverGuard,true);
-track(document,'mouseleave',irHoverGuard,true);
 function irHoverInternalWheelGuard(e){
   // Wheel events that originate INSIDE a managed hover. We want the
   // hover's internal scroller to scroll, BUT block the wheel from
@@ -15441,8 +15471,23 @@ function irHoverInternalWheelGuard(e){
     if(!scroller)return;
     var delta=Number(e&&e.deltaY)||0;
     if(!delta)return;
+    // L29: cache maxTop for 250ms. scrollHeight/clientHeight reads force
+    // a full content layout on every wheel tick — on a 57K-char drill
+    // hover this is the dominant scroll-lag source. The hover's content
+    // doesn't change during a scroll gesture, so the cached value is
+    // accurate enough; MutationObservers elsewhere can invalidate when
+    // content actually swaps.
+    var cacheAt=Number(scroller.__irMaxTopAt)||0;
+    var nowWheel=Date.now();
+    var maxTop;
+    if(cacheAt && (nowWheel-cacheAt)<250){
+      maxTop=Number(scroller.__irMaxTop)||0;
+    }else{
+      maxTop=Math.max(0,(Number(scroller.scrollHeight)||0)-(Number(scroller.clientHeight)||0));
+      scroller.__irMaxTop=maxTop;
+      scroller.__irMaxTopAt=nowWheel;
+    }
     var before=Number(scroller.scrollTop)||0;
-    var maxTop=Math.max(0,(Number(scroller.scrollHeight)||0)-(Number(scroller.clientHeight)||0));
     var next=irClamp(before+delta,0,maxTop);
     // Apply the scroll ourselves. Even if next === before (already at
     // a boundary), we still preventDefault below so the wheel doesn't
@@ -15461,10 +15506,16 @@ function irHoverInternalWheelGuard(e){
     }
   }catch(_){}
 }
+// L29: wheel handlers were registered on BOTH window and document with
+// capture=true. User reported severe scroll lag inside large drill
+// hovers — each wheel event fired up to 4 handlers, and every call
+// reads scrollHeight which forces a full content layout on the 57K-char
+// hover (=> measurable frame drop). Capture-phase listeners on window
+// already fire before any document or target-phase listener; keeping
+// only the window registrations halves the handler count without
+// changing observable behaviour.
 track(window,'wheel',irHoverInternalWheelGuard,true);
-track(document,'wheel',irHoverInternalWheelGuard,true);
 track(window,'wheel',irPreviewTransitionWheelGuard,true);
-track(document,'wheel',irPreviewTransitionWheelGuard,true);
 function irPrimaryHoverScroller(hoverEl){
   if(!hoverEl)return null;
   try{
@@ -16655,6 +16706,23 @@ function irTouchHoverRootContent(root,reason,text){
   try{
     if(!root)return;
     var now=Date.now();
+    // L36: cheap signature pre-check. Mutation bursts call this dozens
+    // of times per drill paint, and each call extracted root.textContent
+    // (a 57K — 400K char walk on large class hovers) just to update a
+    // length comparison. When the children pattern is unchanged, the
+    // text is overwhelmingly the same — skip the expensive read.
+    var touchSig=(root.childElementCount||0)+':'+
+      (root.firstElementChild?root.firstElementChild.nodeName:'_')+':'+
+      (root.lastElementChild?root.lastElementChild.nodeName:'_');
+    if(root.__irTouchSig===touchSig && (now-(Number(root.__irTouchSigAt)||0))<500){
+      // Same structure within the last 500ms — only update the change
+      // timestamp (other callers gate on it). Skip the textContent read,
+      // sample build, transient-text detection, and downstream logging.
+      root.__irContentChangedAt=now;
+      return;
+    }
+    root.__irTouchSig=touchSig;
+    root.__irTouchSigAt=now;
     root.__irContentChangedAt=now;
     irRememberVisibleHoverRect(root,reason||'content');
     var sample=String(text==null?(root.textContent||''):text).replace(/\s+/g,' ').trim();
@@ -16718,7 +16786,24 @@ function irActivateHoverRoot(root,reason){
       var releasedChanged=false;
       if(root.__irReleasedAt&&Date.now()-root.__irReleasedAt<8000){
         var releasedText=String(root.__irReleasedText||'');
-        var currentText=String(root.textContent||'');
+        // L41: avoid the textContent walk when we can rule out equality
+        // from cheap properties. The textContent walk on a 57K-char drill
+        // hover dominates this code path when running on every activation.
+        // childElementCount + last child node name change with content,
+        // so when they differ we know text differs without materializing
+        // the full string. When the cheap check is inconclusive (same
+        // structure) we still pay the full string cost — but only then.
+        var actSig=(root.childElementCount||0)+':'+
+          (root.firstElementChild?root.firstElementChild.nodeName:'_')+':'+
+          (root.lastElementChild?root.lastElementChild.nodeName:'_');
+        var prevActSig=root.__irActivationSig;
+        var currentText;
+        if(prevActSig && prevActSig!==actSig){
+          currentText='';  // structure changed → text changed; skip walk
+        }else{
+          currentText=String(root.textContent||'');
+        }
+        root.__irActivationSig=actSig;
         if(releasedText&&currentText===releasedText){
           try{
             if(root.classList)root.classList.add('hidden');
@@ -16893,11 +16978,24 @@ function irShouldProcessHoverBlock(hoverHost,block){
   }catch(_){return true}
 }
 function irRemoveInactiveHoverArtifacts(activeHover,reason){
+  // L38: 50ms throttle. Called on every hover switch + every prune
+  // pass. A burst of activations or mutation-driven prune calls used
+  // to fire this several times within a single frame — each pass does
+  // a querySelectorAll over all hover roots plus per-root predicate
+  // checks. Throttling to one pass per 50ms still cleans up promptly
+  // (sub-frame from the user's perspective) but collapses bursts. The
+  // hidden-active disposal below this guard MUST still run (it's the
+  // active hover's own state and isn't subject to the throttle).
+  var sweepNow=Date.now();
+  var lastSweepAt=Number(window.__irLastInactiveSweepAt)||0;
+  var throttled=(sweepNow-lastSweepAt)<50;
   var removed=0, artifacts=0;
   if(activeHover&&!irIsRenderableHoverRoot(activeHover)){
     irDisposeHiddenActiveHover(reason||'inactive-sweep');
     activeHover=window.__irActiveHoverEl;
   }
+  if(throttled)return;
+  window.__irLastInactiveSweepAt=sweepNow;
   try{
     var roots=document.querySelectorAll(IR_HOVER_ROOT_SELECTOR);
     var pendingKeepRoot=irPickPendingHoverRootToKeep(roots,activeHover);
@@ -17967,6 +18065,18 @@ track(document,'click',irBackControlClick,true);
 function irMakeHoverScrollable(hoverEl, resetScroll, fallbackTextLength){
   if(!hoverEl)return;
   try{
+    // L31: throttle entire-body executions. A drill mutation burst calls
+    // this 7+ times in ~10ms; each pass did a forced reflow + window
+    // resize dispatch, draining frame time. resetScroll=true calls are
+    // exempt (explicit user-driven reset must not be skipped).
+    var nowMS=Date.now();
+    var lastAt=Number(hoverEl.__irMakeScrollAt)||0;
+    if(!resetScroll && lastAt && (nowMS-lastAt)<16){
+      irEnsureHoverPointer(hoverEl);
+      irSetActiveHoverLayer(hoverEl);
+      return;
+    }
+    hoverEl.__irMakeScrollAt=nowMS;
     var scrollSignature=String(Math.max(0,fallbackTextLength||0));
     if(!resetScroll&&hoverEl.classList&&hoverEl.classList.contains('ir-scrollable')&&hoverEl.__irScrollableSignature===scrollSignature){
       irEnsureHoverPointer(hoverEl);
@@ -17993,8 +18103,21 @@ function irMakeHoverScrollable(hoverEl, resetScroll, fallbackTextLength){
       if(hoverEl.scrollTop) hoverEl.scrollTop=0;
       if(sc&&sc.scrollTop) sc.scrollTop=0;
     }
+    // L31 revised: scrollHeight + offsetHeight reads ARE needed — they
+    // commit the styles applyHoverSizeTier just wrote into layout so the
+    // internal scroller actually becomes scrollable. Removing them
+    // (initial L30) broke wheel scrolling on large hovers entirely. We
+    // keep them but the entry-throttle above already prevents the
+    // mutation-burst frame drop.
     try { var _=hoverEl.scrollHeight; var __=hoverEl.offsetHeight; } catch(_) {}
-    try { window.dispatchEvent(new Event('resize')); } catch(_) {}
+    // resize dispatch still throttled — fan-out across all listeners
+    // does not need to fire once per mutation tick.
+    var nowResize=Date.now();
+    var lastResizeAt=Number(window.__irLastHoverResizeAt)||0;
+    if(nowResize-lastResizeAt>500){
+      window.__irLastHoverResizeAt=nowResize;
+      try { window.dispatchEvent(new Event('resize')); } catch(_) {}
+    }
     hoverEl.__irScrollableSignature=scrollSignature;
   }catch(_){}
 }
@@ -19329,6 +19452,39 @@ function irAlignResizableHoverToChild(){
   // find a position model that doesn't fight VS Code's internal logic.
   return;
 }
+// L32: visibility gate. A 57K-char drill hover may contain dozens of
+// .rendered-markdown blocks but the viewport only ever shows ~10 of
+// them. Processing offscreen blocks costs the full textContent read
+// + token regex + DOM wrap per block; user-reported scroll lag on
+// large drill hovers traces to this O(N) walk over every block on
+// every scan tick. Skip a block when its rect falls outside the hover
+// host viewport plus a 400 px lookahead margin (covers fast scrolls
+// before the scroll listener re-fires).
+function irIsBlockVisibleInHover(block,hoverHost){
+  if(!block||!hoverHost||!block.getBoundingClientRect||!hoverHost.getBoundingClientRect)return true;
+  try{
+    var br=block.getBoundingClientRect();
+    var hr=hoverHost.getBoundingClientRect();
+    if(hr.height<10)return true; // hover not laid out yet — don't skip
+    var margin=400;
+    if(br.bottom<hr.top-margin)return false;
+    if(br.top>hr.bottom+margin)return false;
+    return true;
+  }catch(_){return true}
+}
+function irEnsureHoverScrollListener(hoverHost){
+  if(!hoverHost||hoverHost.__irScrollListenerAttached)return;
+  try{
+    var scroller=irPrimaryHoverScroller(hoverHost)||hoverHost;
+    if(!scroller||!scroller.addEventListener)return;
+    hoverHost.__irScrollListenerAttached=true;
+    scroller.addEventListener('scroll',function(){
+      // Re-scan so newly visible blocks get wrapped. irScheduleScan is
+      // already rAF-coalesced so multiple scroll ticks collapse.
+      try{irScheduleScan();}catch(_){}
+    },{passive:true});
+  }catch(_){}
+}
 function irScanRenderedMarkdown(){
   irDiagnoseUnwrappedHovers();
   irAlignResizableHoverToChild();
@@ -19338,8 +19494,10 @@ function irScanRenderedMarkdown(){
     try{
       var preBlock=containers[pre];
       if(!document.body.contains(preBlock))continue;
-      var preText=preBlock.textContent||'';
       var preHost=preBlock.closest('.monaco-hover, .monaco-editor-hover');
+      // L32 viewport gate before the expensive textContent read.
+      if(preHost&&!irIsBlockVisibleInHover(preBlock,preHost))continue;
+      var preText=preBlock.textContent||'';
       if(preHost&&preBlock.__irLastScanText!==preText){
         irTouchHoverRootContent(preHost,'pre-scan-text-change',preText);
       }
@@ -19349,9 +19507,33 @@ function irScanRenderedMarkdown(){
   var dedupedHosts=[];
   for(var j=0;j<containers.length;j++){var block=containers[j];
     if(!document.body.contains(block))continue;
-    var text=block.textContent||'';
     var hoverHost=block.closest('.monaco-hover, .monaco-editor-hover');
     if(!irShouldProcessHoverBlock(hoverHost,block))continue;
+    // L32 viewport gate: skip offscreen blocks BEFORE the expensive
+    // textContent read. Always allow blocks without an enclosing hover
+    // host (defensive) and always allow when the hover is too small to
+    // meaningfully have an offscreen region.
+    if(hoverHost&&!irIsBlockVisibleInHover(block,hoverHost))continue;
+    // Attach a scroll listener on the hover scroller exactly once per
+    // hover so newly-scrolled-in blocks trigger a re-scan.
+    if(hoverHost)irEnsureHoverScrollListener(hoverHost);
+    // L35: cheap signature pre-check. textContent extraction on a 57K
+    // char block is the dominant per-scan cost; in logs we see
+    // "skip-same-text" 27+ times per drill where the block hasn't
+    // changed at all but we still pay the full string materialization.
+    // Use childElementCount + first/last child node names as a fast
+    // proxy for content change. Misses character-data-only edits, but
+    // those are extremely rare in markdown hover output (VS Code rebuilds
+    // the subtree). If signature matches AND we've previously wrapped
+    // this block (has ir-type-link), skip without touching textContent.
+    var blockSig=(block.childElementCount||0)+':'+
+      (block.firstElementChild?block.firstElementChild.nodeName:'_')+':'+
+      (block.lastElementChild?block.lastElementChild.nodeName:'_');
+    if(block.__irLastScanSig===blockSig && block.querySelector('.ir-type-link')){
+      continue;
+    }
+    var text=block.textContent||'';
+    block.__irLastScanSig=blockSig;
     irCacheNativeTokenizedSourceStyle(block);
     if(hoverHost){
       var alreadyDeduped=false;
@@ -19512,15 +19694,31 @@ function irScanRenderedMarkdown(){
 
 function irScheduleScan(){
   if(window.__irScanTimer)return;
-  // L25: was setTimeout(..., 50). User reported the symptom: hover paints
-  // with all duplicate blocks (a large box), then ~50ms later our dedup
-  // shrinks it — the mouse ends up outside the smaller wrapper and the
-  // hover dismisses. setTimeout fires as a macrotask AFTER paint, so the
-  // big box is always visible briefly. rAF fires right before the next
-  // paint, so our dedup completes in the same frame as the content
-  // arrival — the user only ever sees the deduplicated (smaller) hover.
-  // Fallback to setTimeout if rAF is unavailable (test/headless env).
-  var schedule=window.requestAnimationFrame||function(cb){return setTimeout(cb,16);};
+  // L25 → L33 progression:
+  //   L25 used rAF so dedup landed before paint (avoided "big → small"
+  //   visual flicker on duplicate-heavy hovers).
+  //   L33 swaps in requestIdleCallback so the heavy scan/wrap pass yields
+  //   the main thread when the user is actively scrolling. User report
+  //   was: drill hover pops, immediate scroll stutters for ~1s until
+  //   the mutation burst finishes — main thread was blocked by our
+  //   per-mutation rAF callbacks chewing through 57K-char textContent.
+  //   With idle scheduling brower defers our work while wheel ticks are
+  //   firing; scrolling stays responsive and the wrap pass finishes
+  //   shortly after the user lifts the wheel.
+  //   The 500 ms timeout guarantees the scan still runs even if idle
+  //   time never opens (rare on busy systems) so type-link wrapping
+  //   doesn't stall indefinitely.
+  //   Fallback chain: requestIdleCallback → requestAnimationFrame →
+  //   setTimeout — last two were the pre-L33 behaviour, preserved for
+  //   test/headless environments.
+  var schedule;
+  if(typeof window.requestIdleCallback==='function'){
+    schedule=function(cb){return window.requestIdleCallback(cb,{timeout:500});};
+  }else if(typeof window.requestAnimationFrame==='function'){
+    schedule=window.requestAnimationFrame;
+  }else{
+    schedule=function(cb){return setTimeout(cb,16);};
+  }
   window.__irScanTimer=schedule(function(){
     window.__irScanTimer=null;
     try{irScanRenderedMarkdown()}catch(eScan){irLog('renderer: scan err '+(eScan&&eScan.message))}
@@ -19529,16 +19727,32 @@ function irScheduleScan(){
 
 window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
   irPruneDetachedHoverState();
+  // L37: dedupe per-hover work within a single mutation-observer
+  // callback. drill mutation bursts deliver 50+ records in one tick and
+  // most reference the same hover host — without dedup we called
+  // irTouchHoverRootContent once per record (each doing closest() walks
+  // and a textContent read). The Set fast-paths repeat hovers.
+  // We also defer irScheduleScan to once per callback at the end so a
+  // single burst can't enqueue the scan multiple times via the early
+  // returns that used to fire per-match.
+  var seenHovers=null;
+  var seenScan=false;
+  function touchOnce(hover,reason,el){
+    if(!hover)return;
+    if(!seenHovers)seenHovers=new Set?new Set():null;
+    if(seenHovers&&seenHovers.has(hover))return;
+    if(seenHovers)seenHovers.add(hover);
+    irTouchHoverRootContent(hover,reason,el?(el.textContent||''):null);
+  }
   for(var mi=0;mi<muts.length;mi++){
     var mut=muts[mi];
     var nodes=mut.addedNodes||[];
-    var activated=0;
     for(var ni=0;ni<nodes.length;ni++){
-      activated+=irActivateAddedHoverRoots(nodes[ni],'mutation-added');
+      irActivateAddedHoverRoots(nodes[ni],'mutation-added');
       try{
         var addedEl=nodes[ni]&&(nodes[ni].nodeType===1?nodes[ni]:nodes[ni].parentElement);
         var addedHover=addedEl&&addedEl.closest?addedEl.closest('.monaco-hover,.monaco-editor-hover'):null;
-        if(addedHover)irTouchHoverRootContent(addedHover,'mutation-added',addedEl.textContent||'');
+        touchOnce(addedHover,'mutation-added',addedEl);
       }catch(_){}
     }
     var target=mut.target;
@@ -19546,28 +19760,38 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
     if(targetEl&&targetEl.closest&&targetEl.closest('.rendered-markdown,.monaco-hover,.monaco-editor-hover,.ij-find-hover-tooltip')){
       try{
         var targetHover=targetEl.closest('.monaco-hover,.monaco-editor-hover');
-        if(targetHover)irTouchHoverRootContent(targetHover,'mutation-'+(mut.type||'target'),targetEl.textContent||'');
+        touchOnce(targetHover,'mutation-'+(mut.type||'target'),targetEl);
       }catch(_){}
-      irScheduleScan();
-      return;
+      seenScan=true;
+      continue;
     }
-    for(var ni=0;ni<nodes.length;ni++){
-      var n=nodes[ni];
+    for(var nj=0;nj<nodes.length;nj++){
+      var n=nodes[nj];
       if(!n||n.nodeType!==1)continue;
       if((n.matches&&n.matches('.rendered-markdown,.monaco-hover,.monaco-editor-hover,.ij-find-hover-tooltip'))||
          (n.querySelector&&n.querySelector('.rendered-markdown'))){
         try{
           var nodeHover=n.closest?n.closest('.monaco-hover,.monaco-editor-hover'):null;
           if(!nodeHover&&n.querySelector)nodeHover=n.querySelector('.monaco-hover,.monaco-editor-hover');
-          if(nodeHover)irTouchHoverRootContent(nodeHover,'mutation-query',n.textContent||'');
+          touchOnce(nodeHover,'mutation-query',n);
         }catch(_){}
-        irScheduleScan();
-        return;
+        seenScan=true;
+        break;
       }
     }
   }
+  if(seenScan)irScheduleScan();
 }));
-window.__irMarkdownObserver.observe(document.body,{childList:true,subtree:true,characterData:true});
+// L40: characterData:true was firing the observer on every keystroke
+// the user typed in the editor (each character data mutation in
+// .view-line text nodes), even though hover content updates land
+// through childList mutations (VS Code swaps entire markdown subtrees,
+// not in-place text). Dropping characterData here cuts the global
+// observer callback rate dramatically without losing real hover
+// updates. Local drill-content observers (lines 13404, 13893) keep
+// characterData:true since they cover small wrapper-only trees where
+// the extra fidelity is cheap.
+window.__irMarkdownObserver.observe(document.body,{childList:true,subtree:true});
 irScheduleScan();
 
 irLog('renderer: MutationObserver scan installed');
