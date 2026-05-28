@@ -5043,6 +5043,49 @@ suite('Hover Renderer E2E', () => {
       + `scroll=${result.largeBefore.scroller.scrollTop}->${result.largeAfterWheel.scroller.scrollTop}, `
       + `hugeScan=${Math.round(result.hugeScanMs)}ms/${Math.round(result.hugeSecondScanMs)}ms`);
   });
+
+  test(`[${lang}] pillar/bar wrapper 2-pass gate strips our keepalive (L48~L54)`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(120000);
+    await ensureExtensionCommandsReady('intellisenseRecursion.runHoverRendererHarnessForTests');
+
+    const rows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverRendererHarnessForTests',
+    );
+    const result = (rows || []).map(row => row?.value).find(value => value?.ok);
+    assert.ok(result, `Renderer harness did not run. Rows=${JSON.stringify(rows)}`);
+
+    // L48~L54 pillar/bar wrapper gate (Task #82). Synthesised stuck
+    // wrappers must trigger 2-pass cleanup, while a transient
+    // single-sweep column must keep our keepalive classes intact so a
+    // normal hover that briefly renders at 16px width is not killed
+    // before it can resize.
+    const gate = result.columnGate;
+    assert.ok(gate?.ok,
+      `Column/bar gate harness must run. ${JSON.stringify(gate)}`);
+    assert.strictEqual(gate?.column?.first?.hasKeepalive, true,
+      `First sweep on a column wrapper must NOT strip ir-keepalive (2-pass gate). ${JSON.stringify(gate?.column)}`);
+    assert.ok(gate?.column?.first?.seenAt > 0,
+      `First sweep on a column wrapper must mark __irColumnSeenAt. ${JSON.stringify(gate?.column)}`);
+    assert.strictEqual(gate?.column?.second?.hasKeepalive, false,
+      `Second sweep ≥200ms later on a still-column wrapper must strip ir-keepalive. ${JSON.stringify(gate?.column)}`);
+    assert.strictEqual(gate?.column?.second?.hasSticky, false,
+      `Second sweep on a still-column wrapper must strip ir-sticky. ${JSON.stringify(gate?.column)}`);
+    assert.strictEqual(gate?.column?.second?.hasScrollable, false,
+      `Second sweep on a still-column wrapper must strip ir-scrollable. ${JSON.stringify(gate?.column)}`);
+    assert.strictEqual(gate?.bar?.first?.hasKeepalive, true,
+      `First sweep on a bar wrapper must NOT strip ir-keepalive (2-pass gate). ${JSON.stringify(gate?.bar)}`);
+    assert.ok(gate?.bar?.first?.seenAt > 0,
+      `First sweep on a bar wrapper must mark __irColumnSeenAt (L54 bar shape). ${JSON.stringify(gate?.bar)}`);
+    assert.strictEqual(gate?.bar?.second?.hasKeepalive, false,
+      `Second sweep on a still-bar wrapper must strip ir-keepalive (L54 bar detection). ${JSON.stringify(gate?.bar)}`);
+    assert.strictEqual(gate?.transient?.first?.hasKeepalive, true,
+      `Transient single-sweep column must keep its ir-keepalive — VS Code hover initial paint passes through 16px width briefly and the 2-pass gate must not kill it. ${JSON.stringify(gate?.transient)}`);
+
+    console.log(`  column/bar gate: col[clean=${!gate?.column?.second?.hasKeepalive}], `
+      + `bar[clean=${!gate?.bar?.second?.hasKeepalive}], `
+      + `trans[preserved=${gate?.transient?.first?.hasKeepalive}]`);
+  });
 });
 
 suite('Go To Definition E2E', () => {

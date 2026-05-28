@@ -1,0 +1,105 @@
+// Pure utility helpers extracted from extension.ts (Phase 1).
+//
+// Scope:
+//   - workspace-root + language/file detection
+//   - identifier regex patterns + LRU-cached factory
+//   - definition-preview tunable constants
+//
+// Nothing in this module imports any mutable extension state — all functions
+// are side-effect-free apart from the per-identifier escape cache, which is
+// confined to this module.
+
+import * as vscode from 'vscode';
+import type { SidecarLanguage } from './sidecar';
+
+export function workspaceRootFsPath(): string | null {
+  const folders = vscode.workspace.workspaceFolders;
+  if (!folders?.length || folders[0].uri.scheme !== 'file') { return null; }
+  return folders[0].uri.fsPath;
+}
+
+export function isPythonFsPath(fsPath: string): boolean {
+  return fsPath.endsWith('.py') || fsPath.endsWith('.pyi');
+}
+
+export function isSupportedFsPath(fsPath: string): boolean {
+  return (
+    isPythonFsPath(fsPath)
+    || fsPath.endsWith('.ts')
+    || fsPath.endsWith('.tsx')
+    || fsPath.endsWith('.d.ts')
+  );
+}
+
+/**
+ * Derive the sidecar language tag from the file that triggered a lookup.
+ * Returns undefined for files we don't index (means: don't apply a language
+ * filter on the sidecar query — but we also wouldn't reach here since the
+ * fast-path is gated by isSupportedFsPath).
+ */
+export function languageOf(fsPath: string): SidecarLanguage | undefined {
+  if (isPythonFsPath(fsPath)) { return 'python'; }
+  if (fsPath.endsWith('.ts') || fsPath.endsWith('.tsx') || fsPath.endsWith('.d.ts')) {
+    return 'typescript';
+  }
+  return undefined;
+}
+
+// PascalCase / SCREAMING_SNAKE only — names shaped like parameter/method
+// (snake_case, starts lowercase) stay on the LSP path because the sidecar
+// doesn't index parameters or local variables.
+export const TYPE_SHAPED_NAME = /^[A-Z_][A-Za-z0-9_]*$/;
+export const CONSTANT_SHAPED_NAME = /^_*[A-Z][A-Z0-9_]*$/;
+export const IDENTIFIER_WORD_RE = /[A-Za-z_$][\w$]*/;
+// Reusable global-flag variant; reset .lastIndex before each use. Hoisted
+// out of nearbyHoverWordCandidateAt where it used to be re-allocated on
+// every hover/cursor probe.
+export const IDENTIFIER_WORD_RE_G = /[A-Za-z_$][\w$]*/g;
+
+// Per-identifier escaped pattern cache. Builds \b<identifier>\b regexes
+// without re-running the escape replace each call. We always return a
+// fresh RegExp so callers can mutate .lastIndex across awaits without
+// stepping on each other.
+const ESC_IDENTIFIER_CACHE_MAX = 256;
+const escIdentifierCache = new Map<string, string>();
+export function identifierWordRegex(identifier: string, flags = ''): RegExp {
+  let escaped = escIdentifierCache.get(identifier);
+  if (escaped === undefined) {
+    escaped = identifier.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (escIdentifierCache.size >= ESC_IDENTIFIER_CACHE_MAX) {
+      const first = escIdentifierCache.keys().next().value;
+      if (first !== undefined) { escIdentifierCache.delete(first); }
+    }
+    escIdentifierCache.set(identifier, escaped);
+  } else {
+    // LRU touch
+    escIdentifierCache.delete(identifier);
+    escIdentifierCache.set(identifier, escaped);
+  }
+  return new RegExp(`\\b${escaped}\\b`, flags);
+}
+
+export const HOVER_NEARBY_SYMBOL_COLUMN_RADIUS = 8;
+export const HOVER_NOISY_IDENTIFIER_MAX_LENGTH = 80;
+
+/** URI schemes whose documents are considered "real code" by the
+ * hover/preview pipeline. Filters out output channels, debug consoles,
+ * git diffs, etc. */
+export const CODE_SCHEMES = new Set(['file', 'untitled', 'vscode-userdata']);
+
+/** True when `doc` looks like a real source file we should scan/wrap. */
+export function isCodeDoc(doc: vscode.TextDocument): boolean {
+  if (!CODE_SCHEMES.has(doc.uri.scheme)) { return false; }
+  const p = doc.uri.fsPath;
+  if (p.endsWith('.log') || p.endsWith('.md') || p.endsWith('.git') || p.includes('/scm')) { return false; }
+  return true;
+}
+
+/**
+ * Definition preview extraction is intentionally more verbose than native
+ * language-server hovers: show the whole syntactic block, then let the hover
+ * widget scroll when the block is long.
+ */
+export const DEFINITION_PREVIEW_FALLBACK_LINES = 120;
+export const DEFINITION_PREVIEW_SAFETY_MAX_LINES = 10_000;
+export const DEFINITION_PREVIEW_VALUE_MAX_LINES = 600;

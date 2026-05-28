@@ -1,184 +1,184 @@
-# Handover: hover/drilldown regression
+# Handover: hover pillar + hover position + UI border — L48~L61
 
-작성 시점: 2026-05-23 KST
+작성 시점: 2026-05-28 KST (저녁)
 
 ## 목표
 
-VS Code editor native hover를 기반으로 한 symbol drilldown 흐름을 복구한다. 특히 다음 조건을 만족해야 한다.
+VS Code editor native hover의 잔존/위치/시각 회귀를 진단하고 안전한 fix를 적용한다.
 
-- editor에서 `cmd+click`으로 갈 수 있는 symbol은 hover panel 안에서도 drilldown 대상이어야 한다.
-- hover panel은 실제 native hover 위치와 내용으로 떠야 하며, 별도 테스트용 흰 DOM이나 fake hover로 통과하면 안 된다.
-- drilldown 후에는 이전 hover 내용, stale sash/handle, 빈 hover shell, native hover와 custom hover가 겹치는 UI가 남으면 안 된다.
-- 큰 hover에서 작은 hover로 전환해도 크기/스크롤/뒤로가기 위치가 깨지면 안 된다.
-- 다중 column에서 한쪽 hover가 다른쪽 column hover/intellisense를 망가뜨리면 안 된다.
-- E2E는 1회 성공이 아니라 반복 hover, drilldown, native popup 이후 hover, column 전환 후 hover까지 내구성을 봐야 한다.
+- **세로 기둥(width 16px) 또는 가로 줄(height 2px) 모양 wrapper**가 dismiss 후 visible로 남으면 안 된다.
+- 정상 hover의 transient initial paint(VS Code가 이전 활성화 dimension으로 한 frame 그리는 단계)는 죽이면 안 된다.
+- 몇 번 hover 후 hover 자체가 안 뜨는 회귀가 재발하면 안 된다.
+- hover 창이 **커서가 보고 있는 심볼을 덮거나 처음 떴을 때 심볼에서 멀리** 뜨는 회귀는 진단하고, **우리가 임의로 reposition 하지 않는다**. 드릴 hover는 의도적으로 mouse anchor 사용.
+- hover 배경이 editor 배경과 시각적으로 구분되도록 border가 있어야 한다 (light/dark theme 둘 다).
+- production log에는 fix 발동 audit trail만 남기고, 진단용 30-필드 dump는 default로 끈다.
+- E2E golden pass가 pillar/bar 시나리오(stuck cleanup + transient 보존)를 회귀 보호한다.
 
 ## 현재 상태
 
-최신 관찰 기준으로 문제는 stale content 재사용에서 한 단계 더 좁혀졌다.
+stable. L61 빌드 이후 우리 코드 책임의 회귀는 0 (drill의 의도된 mouse-anchor 제외). 남은 hover-position-anomaly 13건/5분(2.6/min)은 모두 VS Code 자체 positioning — 우리가 직접 fix하지 않음.
 
-- 이전에는 `Company` hover shell이 `BaseModel` hover 시점에 다시 살아나서 stale `Company` 내용이 보였다.
-- hidden non-empty native hover root를 identifier mismatch일 때 제거하도록 바꾼 뒤 stale `Company` 재표시는 사라졌다.
-- 현재 최신 실패는 `BaseModel` hover에서 provider probe는 `BaseModel` 내용을 반환하지만, DOM에는 숨겨진 빈 native hover shell만 남고 실제 hover가 뜨지 않는 `missing-hover`다.
+핵심 검증 (L61 빌드 후 ~5분 세션):
 
-최신 E2E 실패 요약:
+- `hover-position-anomaly`: 13건 (covers-cursor 12, far-from-cursor 1)
+- **`wrapPositionedOnce`**: 13/13 false → **모두 VS Code 자체** (drill false positive 제거됨)
+- `column-wrapper-detected`: 2건, `cleaned`: 1건 — pillar fix 정상
+- `force-preview-cleanup`: 3건 — A-cleanup 정상
+- 사용자 회귀 보고: drill 정상, 첫 hover의 covers/far는 VS Code 자체
 
-```text
-symbol: BaseModel
-reason: missing-hover
-rawHoverRoots:
-  className: "monaco-hover fade-in hidden"
-  textLength: 0
-  rect: 0x0
-provider probe:
-  expected BaseModel markdown exists
-missingExpectedTextFragments:
-  "class BaseModel", "def save"
-absentTextFragments:
-  "class Company", "STATUS_ACTIVE"
+## 완료한 작업 (L48~L61 + E2E)
+
+### Pillar/empty hover 회귀 (L48~L55) + E2E
+
+| Patch | 내용 | 파일 |
+|---|---|---|
+| **L48** | `irResetWrapperPositionState` 강화 — height/maxHeight + ir-drill-hover class + inner monaco-hover style 정리 | `src/extension.ts` (~line 11083) |
+| **L49** | `skip unrenderable hover root` 진단. L55에서 retire | (retired) |
+| **L50** | `force preview hover visible failed` 진단. L55에서 retire | (retired) |
+| **L51** | A) force-preview-failed root keepalive cleanup. B) inactive sweep loop에 column-wrapper detection fold (width<60 && height>40) | `src/extension.ts` (~line 15200) |
+| **L52** | column-wrapper-cleaned 발동 (당시) display:none + ir-stale-hover → 호버 안 뜸 회귀 야기 | (수정됨) |
+| **L53** | cleanup 안전화 — 2-pass gate(200ms), action 약화(inner class만, wrapper 안 건드림) | `src/extension.ts` (~line 15967) |
+| **L54** | 가로 줄(bar) detection 추가(height<20 && width>200). force-preview-cleanup 500ms 2-pass gate | `src/extension.ts` (~line 15920) |
+| **L55** | 진단 force-log 정리 (unrenderable / force-preview-failed retire) | `src/extension.ts` (~line 10534) |
+| **Refactor** | `irScanNarrowHoverWrappers` 별도 함수로 추출 + `testHooks.scanNarrowHoverWrappers` 노출 | `src/extension.ts` (~line 15782, 17020) |
+| **E2E** | `runHoverRendererHarnessForTests`에 column/bar gate verification step. 새 test `pillar/bar wrapper 2-pass gate strips our keepalive (L48~L54)` | `src/extension.ts` (~line 4703), `src/test/suite/hover.test.ts` (~line 5045) |
+
+### Hover position 진단 (L56~L57, L59, L61)
+
+| Patch | 내용 |
+|---|---|
+| **L56** | `hover-position-anomaly` 진단 force-log 추가 — active-switch 시점 mouse pos + wrapper rect 비교, covers-cursor (mouse inside wrap) / far-from-cursor (>150px) 분류 |
+| **L57** | A) covers-cursor reposition fix (mouse.y+24px). B) far gate 150 → 80px. → L59에서 A revert |
+| **L59** | L57의 하드코딩 reposition 제거 — 11/11 covers-cursor가 VS Code 자체, 우리 override가 anchor 의도와 항상 일치하지 않음. 진단만 유지. `hover-position-fixed` kind retire |
+| **L61** | 진단에서 drill wrapper 제외 — `ir-drill-hover` / `__irDesired` / `__irPositionedOnce` 중 하나라도 있으면 skip. drill의 mouse anchor는 의도된 동작 ([[feedback_mouse_anchored_drill]] memory rule) |
+
+### UI 시각 개선 (L58, L60)
+
+| Patch | 내용 | 위치 |
+|---|---|---|
+| **L58** | `.monaco-resizable-hover`에 1px solid border (var(--vscode-editorHoverWidget-border) fallback chain) + border-radius 3px | `src/extension.ts` (~line 10358) |
+| **L60** | 2px로 확대 + fallback chain `focusBorder` 우선으로 (theme별 강조 색). border-radius 4px | 동일 |
+
+## 핵심 진단 데이터 (history)
+
+### Pillar 패턴 (L51~L54)
+
+```
+column 모양: wrapRect w=16, h=181~648  inner: ir-keepalive ir-sticky ir-scrollable
+bar    모양: wrapRect w=680, h=2       inner: ir-keepalive ...
+wrapPositionedOnce=false  ← VS Code가 wrapper width:16px inline set, 우리 안 만짐
+inner에 우리 keepalive 잔존 → sweep prune 막힘 → visible로 영구 잔존
 ```
 
-즉 현재 상태는 "틀린 이전 hover가 보이는 문제"는 줄었고, "native command/refire 이후 빈 placeholder만 남고 실제 hover fill이 안 되는 문제"가 남아 있다.
+### Hover position anomaly 패턴 (L56~L61)
 
-## 최근 변경
-
-주요 변경 파일:
-
-- `src/extension.ts`
-- `src/test/suite/hover.test.ts`
-- `src/test/runTest.ts`
-
-`src/extension.ts` 변경 핵심:
-
-- `irPickReusableNativeHoverTarget(identifier)`에서 active visible native hover shell은 재사용하지 않도록 했다.
-- native hover fallback reuse는 released/hidden/collapsed shell 중심으로 제한했다.
-- `scheduleRendererNativeHoverFallback(...)`에 stale preview state, stale anchor, cooldown 체크를 넣었다.
-- `window.irShowHoverFallback`에서 stale pointer, pointer-inside-hover, token mismatch, missing pointer token을 거부하도록 했다.
-- `first`, `pos-cache`, `native-only` source에서는 `irApplyFallbackIntoReusableNativeHover`를 비활성화했다.
-- hidden non-empty native hover root가 현재 identifier와 맞지 않는 내용을 갖고 있으면 reset이 아니라 제거/quarantine하도록 바꿨다.
-- external hover artifact 탐지에서 VS Code workbench split/sidebar/panel scrollable을 hover artifact로 오탐하지 않도록 제외했다.
-- hover sash metrics에서 decorations overview ruler나 hover 외부의 global sash를 제외했다.
-- keybinding recorder 탐지를 더 좁혀서 실제 editor/native edit context를 recorder로 오탐하지 않게 했다.
-- `cleanupNativeHoverInteractionStateForTests`에서 hidden empty native shell은 release-mark 하지 않고 그대로 보존하도록 바꿨다.
-  - 이유: 빈 placeholder를 `ir-native-released-hover`로 표시하면 다음 native hover fill을 막는 것으로 보였다.
-
-`src/test/suite/hover.test.ts` 변경 핵심:
-
-- native hover geometry 검사에서 visible hover root, content match, stale content, empty shell, external artifact, sash alignment를 더 엄격히 보도록 확장했다.
-- keybinding recorder recovery가 실제 editor를 닫지 않도록 `closeAllEditors` 경로를 제거했다.
-- recorder 판정은 prompt text와 line count 조건이 맞을 때만 인정하도록 좁혔다.
-- golden pass는 `Company -> BaseModel` 등 반복 hover/drilldown 내구성을 보는 방향으로 확장 중이다.
-
-## 실행한 검증
-
-컴파일:
-
-```bash
-npm run compile
+```
+covers-cursor 대다수: wrap.x = anchor token x (일정), mouse.x는 다른 token (200-400px 차이)
+                     wrap.width=670 → mouse 흡수 → covers
+dy (mouse.y - wrap.y) 두 cluster: ~190 (h/3), ~285 (h/2)
+mouse type: pointerover (12/12) → 새 token으로 이동 직후 활성화
+모두 wrapPositionedOnce=false → VS Code 자체 positioning
 ```
 
-여러 번 통과했다.
+= 사용자가 mouse를 token A→B로 빠르게 이동 시 wrap-left는 A 기준 + mouse는 B 위 → cursor 덮음. VS Code의 native 동작.
 
-주요 E2E:
+### Drill의 의도된 mouse-anchor (memory rule)
 
-```bash
-env IR_E2E_FILES=hover.test.js IR_E2E_GREP="actual native hover survives repeated drill-downs and native popups" npm test
+drill-down hover (`ir-drill-hover` class)는 의도적으로 mouse가 wrapper upper-third에 위치 (line ~11577). 사용자가 link 클릭 후 micro-mouse-moves로 bbox 벗어나지 않게 하기 위함. [[feedback_mouse_anchored_drill]] 에 saved.
+
+## 진단 force-log 정책 (L61 시점)
+
+`IR_HE_FORCE_LOG_KINDS` + `IR_HE_FORWARDED_KINDS` 등록 kind:
+
+**유지** (production audit trail):
+
+- `force-preview-cleanup` — A-cleanup 발동
+- `column-wrapper-detected` — pillar/bar 발견 (shape: "column" | "bar")
+- `column-wrapper-cleaned` — 2-pass cleanup 발동 (ageMs)
+- `wrapper-state-reset` — L48 reset 발동
+- `hover-position-anomaly` — covers-cursor / far-from-cursor 진단 (drill 제외)
+- 기타 drill/back-restore 등
+
+**Retired** (회귀 재발 시 재추가):
+
+- `unrenderable-hover-diag` (L49 → L55 retire)
+- `force-preview-failed-diag` (L50 → L55 retire)
+- `hover-position-fixed` (L57 → L59 retire)
+
+## E2E 새 test
+
+`src/test/suite/hover.test.ts` Hover Renderer E2E suite에 추가:
+
+- `test('[python] pillar/bar wrapper 2-pass gate strips our keepalive (L48~L54)')`
+- 시나리오 3종:
+  1. column 안정 stuck (width 16 × height 180) → scan → 250ms 대기 → 두 번째 scan → keepalive 제거 검증
+  2. bar 안정 stuck (width 680 × height 2) → 동일 흐름 (L54 가로 줄 검증)
+  3. transient column → 한 번 scan → 즉시 dismiss → keepalive 보존 검증 (L53 회귀 보호)
+- 격리: `hooks.scanNarrowHoverWrappers(reason)` 만 호출 (sweep 전체 안 함)
+- harness가 inline style을 `setProperty(..., 'important')`로 강제해 VS Code의 `.monaco-resizable-hover` CSS rule이 dimension override하지 않게 함
+
+## UI border 정책 (L60 시점)
+
+`.monaco-resizable-hover`에 적용:
+
+```css
+border: 2px solid var(--vscode-focusBorder,
+                     var(--vscode-editorHoverWidget-border,
+                                  rgba(128,128,128,0.85))) !important;
+border-radius: 4px !important;
 ```
 
-관찰된 실패 흐름:
-
-1. `Company -> get_owner`, `BaseModel -> save`, `TimestampedModel -> BaseModel` 구간까지 진행된 뒤, 나중에 `Company` 재방문에서 hover rect가 `2x0` 비슷하게 collapse된 적이 있었다.
-2. reusable native hover shell injection을 막은 뒤에는 `BaseModel` 위치에서 stale `Company` 내용이 보였다.
-3. hidden non-empty mismatch root 제거 후 stale `Company`는 사라졌지만, `BaseModel` 위치에서 visible hover가 아예 뜨지 않는 `missing-hover`가 남았다.
-4. hidden empty shell을 release-mark하지 않도록 바꾼 최신 패치 이후에도 E2E는 `BaseModel`에서 `missing-hover`로 실패했다.
-
-최신 실패에서 중요한 로그 포인트:
-
-```text
-native hover renderer-pointer request result -> BaseModel:
-  ok: true
-  reason: pointer-events-dispatched
-  hoverCount: 0
-  rawHoverRoots[0]:
-    className: "monaco-hover fade-in hidden"
-    textLength: 0
-    visible: false
-    released: false
-
-native hover focus retry result -> BaseModel:
-  command: editor.action.showHover
-  ok: false
-  reason: missing-hover
-
-native hover focus retry result -> BaseModel:
-  command: workbench.action.showHover
-  ok: false
-  reason: missing-hover
-
-native hover focus retry result -> BaseModel:
-  command: editor.action.showDefinitionPreviewHover
-  ok: false
-  reason: missing-hover
-```
-
-## 현재 의심 지점
-
-가장 가능성이 높은 지점은 native hover shell lifecycle이다.
-
-- renderer pointer event와 hover command는 호출된다.
-- provider probe는 expected markdown을 반환한다.
-- DOM에는 `.monaco-hover.fade-in.hidden` 빈 shell이 존재한다.
-- 하지만 VS Code native hover controller가 그 shell을 fill/show하지 않는다.
-
-현재 막힌 부분은 "provider는 살아 있고 native command도 실행되지만 native DOM materialization이 되지 않는 상태"다.
-
-주의할 점:
-
-- stale non-empty shell을 재사용하면 다시 이전 symbol 내용이 보일 가능성이 크다.
-- 모든 VS Code sash/handle을 지우는 방식은 금지해야 한다. hover에 속한 sash만 다루거나, hover sash 자체를 붙이지 않는 방향이어야 한다.
-- 테스트용 DOM이나 fake hover를 workbench 전체에 뿌리면 live 작업 창까지 망가진다. 테스트 DOM은 반드시 intellisense-recursion E2E window/test renderer에만 국한해야 한다.
-
-## 다음 수리 방향
-
-1. 최신 E2E 로그에서 `BaseModel` provider 결과가 반환된 직후 native hover controller가 왜 shell을 fill하지 않는지 로그를 더 붙인다.
-   - pointer target
-   - active editor identity
-   - active hover controller command 결과
-   - raw hover root 생성/삭제/hidden 전환 시점
-   - provider result와 DOM fill 사이 시간
-
-2. 빈 hidden native shell이 있을 때의 controlled fallback을 검토한다.
-   - source가 `first`, `pos-cache`, `native-only`이고
-   - visible hover가 없고
-   - 현재 identifier와 맞는 fresh provider markdown이 있고
-   - stale non-empty shell을 재사용하지 않는 경우에만
-   - 빈 native shell에 preview markdown을 주입하거나 native hover 구조를 새로 구성한다.
-
-3. 위 fallback을 넣는다면 `irApplyFallbackIntoReusableNativeHover`의 과거 방식으로 돌아가면 안 된다.
-   - non-empty mismatched shell은 절대 재사용하지 않는다.
-   - collapsed/stale shell에 내용을 덮어쓰지 않는다.
-   - 실제 hover rect와 symbol anchoring을 E2E에서 바로 검증한다.
-
-4. E2E golden pass는 다음을 계속 강제해야 한다.
-   - `BaseModel` hover에서 `class BaseModel`, `def save`가 보인다.
-   - 같은 hover에서 `class Company`, `STATUS_ACTIVE`가 보이면 즉시 실패한다.
-   - visible hover root가 1개여야 한다.
-   - empty hover shell이나 native/custom 중첩 hover가 symbol 근처에 보이면 즉시 실패한다.
-   - hover sash/handle이 hover rect 밖 또는 stale 위치에 남으면 실패한다.
-   - 반복 hover와 drilldown 후에도 같은 검사를 반복한다.
-
-## 작업 시 주의
-
-- 현재 worktree는 이미 dirty 상태다. 관련 없는 변경을 revert하지 말 것.
-- `.codeidx/mcp-server.json`, `.lh/package.json.json`, `.vscode/.auto-import-cache/index.bin`, `log.txt` 등은 이번 hover 수정과 직접 관련 없는 변경 또는 생성물일 수 있다.
-- `src/extension.ts`에는 큰 변경이 많이 들어가 있으므로, 다음 작업자는 `git diff src/extension.ts`를 먼저 훑고 hover lifecycle 관련 변경만 건드리는 것이 안전하다.
-- E2E는 실제 native hover DOM을 봐야 한다. 왼쪽 상단 테스트용 흰 박스나 fake fallback을 golden pass로 인정하면 안 된다.
+- 2px stroke (L58 1px는 light theme에서 안 보임)
+- `focusBorder` 우선 → theme별 강조 색 (보통 파랑 계열)
+- box-sizing:border-box, 680px width budget에 흡수
 
 ## 빠른 재현 명령
 
 ```bash
-npm run compile
-env IR_E2E_FILES=hover.test.js IR_E2E_GREP="actual native hover survives repeated drill-downs and native popups" npm test
+# 컴파일/빌드
+npx tsc -p ./ --noEmit
+npm run bundle
+
+# E2E (pillar/bar gate test만)
+IR_E2E_GREP="pillar/bar wrapper" npm run test:python
+# 기대: 1 passing, "column/bar gate: col[clean=true], bar[clean=true], trans[preserved=true]"
+
+# 진단 force-log 확인 (live session log.txt 분석)
+awk -v s="<activate-line>" 'NR>=s' log.txt | grep -c "hover-position-anomaly"
+awk -v s="<activate-line>" 'NR>=s' log.txt | grep -c "column-wrapper-detected"
 ```
 
-현재 기대 결과는 pass가 아니라 `BaseModel`에서 `missing-hover`가 재현되는 것이다. 다음 수정 후에는 이 지점이 먼저 바뀌는지 확인해야 한다.
+## 작업 시 주의 (memory rules)
+
+`/Users/lky/.claude/projects/-Users-lky-project-intellisense-recursion/memory/` rule 두 개가 hover 코드 만질 때 적용:
+
+1. **Dedup before paint** (`feedback_dedupe_before_paint.md`) — hover/preview 최적화 시 dedup 결정이 paint 전에 끝나야 함. paint 후 dedup하면 인터페이스가 갑작스럽게 변하는 것처럼 보임.
+2. **Mouse-anchored drill** (`feedback_mouse_anchored_drill.md`) — drill hover의 wrapper position을 firstAnchor / wrapper rect에 lock하면 안 됨. mouse-based positioning은 의도된 사항. **L57 하드코딩 reposition을 L59에서 revert한 이유와 직결**.
+
+기타:
+
+- `column-wrapper-detected/cleaned`의 200ms 2-pass gate는 의도된 안전장치. 짧게 줄이면 L52 회귀(호버 안 뜸) 재발 가능.
+- `force-preview-cleanup`의 500ms 2-pass gate도 동일.
+- bar detection threshold(`height<20 && width>200`)는 false positive 위험.
+- inner의 우리 클래스(`ir-keepalive`/`ir-sticky`/`ir-scrollable`) 없는 wrapper는 cleanup 대상 아님. VS Code 자체 wrapper에 hands off.
+- `hover-position-anomaly` 진단에서 drill wrapper 제외 (L61). drill의 covers-cursor는 의도된 동작.
+- VS Code 자체 hover positioning의 covers/far 회귀는 우리가 override하면 부작용 (L57 → L59 revert 경험). 진단만 누적.
+
+## 남은 회귀 (미해결)
+
+| 회귀 | 빈도 | 상태 |
+|---|---|---|
+| 첫 hover가 cursor를 덮음 (VS Code 자체) | 2.4건/분 | 진단 중, 직접 fix 시 부작용 |
+| 첫 hover가 심볼에서 멀음 (~80-150px 떨어짐) | 0.2건/분 | 진단으로 가끔 잡힘 |
+| scroll-restore re-fire null anchor error | 드물게 1건/세션 | 별도 issue, hover position과 무관 |
+
+VS Code 자체 positioning의 어디서 (anchor source, hover controller layout) 잘못되는지 정확히 파악하기 전까지 진단만 누적.
+
+## 컴파일/빌드
+
+```bash
+npx tsc -p ./ --noEmit   # type check만
+npm run bundle           # tsc + esbuild 둘 다
+```
+
+L48~L61 + E2E 반영 모두 type-check + bundle 통과 확인됨.
