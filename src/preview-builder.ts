@@ -25,6 +25,7 @@ import * as fs from 'node:fs/promises';
 import {
   DEFINITION_PREVIEW_FALLBACK_LINES,
   DEFINITION_PREVIEW_SAFETY_MAX_LINES,
+  HOVER_HIGHLIGHT_MAX_LINES,
 } from './util';
 import {
   SKIP_WORDS,
@@ -181,6 +182,26 @@ export function rememberPreviewLocations(
   return previewLoc;
 }
 
+// L84 (2026-05-30): lightweight rendering for large code previews. #2 hover-jank
+// was root-caused to VS Code synchronously TextMate-tokenizing huge hover code
+// fences — a genuine 1,657-line class (company.py:242-1898, ~59K chars) blocked the
+// renderer main thread up to 2.4s. Highlight only the head (what's visible when the
+// hover opens) and render the long tail as a PLAIN fence (no language tag → no
+// tokenization), so the off-screen lines cost ~nothing while 100% of the content
+// and the code-block layout are preserved. Small previews are highlighted whole.
+// The two adjacent fences render as one continuous code area with a hairline gap at
+// the highlight boundary. Deterministic (same code → same split), so block dedupe
+// keys stay stable.
+function renderPreviewCodeFences(lang: string, code: string): string {
+  const lines = code.split('\n');
+  if (lines.length <= HOVER_HIGHLIGHT_MAX_LINES) {
+    return `\`\`\`${lang}\n${code}\n\`\`\``;
+  }
+  const head = lines.slice(0, HOVER_HIGHLIGHT_MAX_LINES).join('\n');
+  const tail = lines.slice(HOVER_HIGHLIGHT_MAX_LINES).join('\n');
+  return `\`\`\`${lang}\n${head}\n\`\`\`\n\`\`\`\n${tail}\n\`\`\``;
+}
+
 export function buildDefinitionPreviewResult(
   typeName: string,
   defUri: vscode.Uri,
@@ -192,7 +213,7 @@ export function buildDefinitionPreviewResult(
   const previewBlock = collectDefinitionPreview(defDoc, resolvedStartLine, hintedEndLine);
   const relPath = vscode.workspace.asRelativePath(defUri);
   const lang = defDoc.languageId || 'python';
-  const preview = `\`${typeName}\` — *${relPath}:${previewBlock.definitionLine + 1}*\n\`\`\`${lang}\n${previewBlock.code}\n\`\`\``;
+  const preview = `\`${typeName}\` — *${relPath}:${previewBlock.definitionLine + 1}*\n${renderPreviewCodeFences(lang, previewBlock.code)}`;
   const location = rememberPreviewLocations(typeName, defUri, previewBlock);
   return {
     preview,
@@ -255,7 +276,7 @@ export async function buildDefinitionPreviewResultFromRawFile(
   const previewBlock = collectDefinitionPreview(rawDoc, resolvedStartLine, hintedEndLine);
   const relPath = vscode.workspace.asRelativePath(defUri);
   const lang = rawDoc.languageId || 'python';
-  const preview = `\`${typeName}\` — *${relPath}:${previewBlock.definitionLine + 1}*\n\`\`\`${lang}\n${previewBlock.code}\n\`\`\``;
+  const preview = `\`${typeName}\` — *${relPath}:${previewBlock.definitionLine + 1}*\n${renderPreviewCodeFences(lang, previewBlock.code)}`;
   const location = rememberPreviewLocations(typeName, defUri, previewBlock);
   return {
     preview,

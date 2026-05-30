@@ -1392,6 +1392,76 @@ function findSharedHoverService(): any | null {
   return null;
 }
 
+// L87 (2026-05-30): virtual-tail content channel for large hovers (custom scroller).
+// STEP 1 — channel proof. When a preview is large, stash the FULL markdown into a
+// renderer global via CDP (window.__irPreviewStash[id]) and PREPEND a detectable
+// text marker. The preview is still returned WHOLE here (no perf change yet); this
+// only proves the ext->renderer content channel + that the marker survives VS Code's
+// markdown renderer and is found by renderer-patch, BEFORE step 2 head-splits to send
+// VS Code just the head. Single main-renderer (mainWsRef) path; multi-window later.
+// Ext-host change → needs a window reload to take effect.
+const IR_VTAIL_THRESHOLD = 8000;
+let irVtailCounter = 0;
+async function irStashLargePreviewForChannelTest(previews: string): Promise<string> {
+  try {
+    if (!previews || previews.length < IR_VTAIL_THRESHOLD) { return previews; }
+    if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) { return previews; }
+    const id = 'v' + (++irVtailCounter);
+    // L87 step 2 — head-split. L84 (renderPreviewCodeFences) emits a large code preview as a
+    // head fence (highlighted) + a "```\n```\n" boundary + a plain tail fence. Send VS Code ONLY
+    // the head (tiny → instant sync render); stash the plain TAIL TEXT and let the renderer append
+    // it as a plain <pre> OFF the sync path (idle). No boundary (small or multi-block preview) =>
+    // no split: stash the whole thing, render unchanged (mode=full).
+    const VTAIL_BOUNDARY = '```\n```\n';
+    const boundaryIdx = previews.indexOf(VTAIL_BOUNDARY);
+    let headToSend = previews;
+    let stashContent = previews;
+    let mode = 'full';
+    if (boundaryIdx >= 0) {
+      headToSend = previews.slice(0, boundaryIdx + 3); // through the head fence's closing ```
+      const afterHead = previews.slice(boundaryIdx + 3); // "\n```\n<TAIL>\n```" (+ maybe trailing blocks)
+      const tOpen = afterHead.indexOf('```\n');
+      if (tOpen >= 0) {
+        const tStart = tOpen + 4;
+        const tEnd = afterHead.lastIndexOf('\n```');
+        const tail = (tEnd > tStart) ? afterHead.slice(tStart, tEnd) : afterHead.slice(tStart);
+        if (tail.length > 0) { stashContent = tail; mode = 'split'; }
+      }
+    }
+    // mainWsRef is the MAIN-PROCESS inspector socket in production (findInspectorWebSocketUrlForPid),
+    // so window.* there is the main process, NOT a renderer. v240 used webContents.executeJavaScript and
+    // the stash was invisible to the patch (stashLen:-1) — executeJavaScript runs in a DIFFERENT world.
+    // The patch is injected, and __irHostWindowMeta is pushed, via webContents.debugger.sendCommand(
+    // 'Runtime.evaluate') (extension.ts ~2267/2271) and the patch reads those globals — so that is the
+    // patch's world. Use the same channel. In the test path mainWsRef IS the renderer (eval directly).
+    // awaitPromise so the stash lands before we return the head (renderer reads it when the marker renders).
+    const rendererCode = `try{window.__irPreviewStash=window.__irPreviewStash||{};window.__irPreviewStash[${JSON.stringify(id)}]=${JSON.stringify(stashContent)};}catch(_){}`;
+    // L87 diag: v240 (executeJavaScript) and v241 (debugger.sendCommand) BOTH showed the patch
+    // reading stashLen:-1. Return a diagnostic so we know WHY: wins=window count, att=#with
+    // debugger attached, sent=#sendCommand-evaluate succeeded, rb=Object.keys(__irPreviewStash)
+    // length AS SEEN BY the sendCommand execution context. If rb>=1 but the patch reads -1 =>
+    // execution-WORLD mismatch (the patch runs in a different context than debugger's default).
+    const diagExpr = `(async function(){var d={wins:0,att:0,sent:0,rb:-2,errs:[]};try{var BW=require('electron').BrowserWindow;var c=${JSON.stringify(rendererCode)};var ws=BW.getAllWindows();d.wins=ws.length;for(var i=0;i<ws.length;i++){var w=ws[i];try{var a=!!(w&&w.webContents&&w.webContents.debugger&&w.webContents.debugger.isAttached());if(a){d.att++;await w.webContents.debugger.sendCommand('Runtime.evaluate',{expression:c,returnByValue:true});d.sent++;var r=await w.webContents.debugger.sendCommand('Runtime.evaluate',{expression:'(window.__irPreviewStash?Object.keys(window.__irPreviewStash).length:-1)',returnByValue:true});d.rb=(r&&r.result&&typeof r.result.value!=='undefined')?r.result.value:-3;}}catch(e){d.errs.push(String(e&&e.message||e).slice(0,60));}}}catch(e){d.errs.push('o:'+String(e&&e.message||e).slice(0,60));}return JSON.stringify(d);})()`;
+    const expr = mainWsRefIsRendererTarget ? rendererCode + ';1' : diagExpr;
+    let diag: any = '(none)';
+    // includeCommandLineAPI:true is what exposes `require` in this Electron main-process
+    // inspector context — the patch-injection eval passes it (2056/2295/2491); v242 omitted it
+    // and the stash script died with "require is not defined" (diag wins:0). Match the injection.
+    try { const res = await cdpRequest(mainWsRef, 'Runtime.evaluate', { expression: expr, awaitPromise: true, returnByValue: true, includeCommandLineAPI: true }, 2500); diag = res?.result?.value; } catch (e) { diag = 'cdp-err:' + String(e).slice(0, 80); }
+    log.info(`[hover] vtail stash id=${id} mode=${mode} stashLen=${stashContent.length} headLen=${headToSend.length} fullLen=${previews.length} diag=${diag} (L87)`);
+    if (mode === 'split') {
+      // Send VS Code just the head + the marker; the renderer renders the stashed tail. Marker
+      // PREPENDED (top, on-screen) so the viewport-gated scan detects it — appended would sit below
+      // the head fence (off-screen) and never be scanned.
+      return '`IRVTAIL:' + id + ':' + stashContent.length + ':split`\n\n' + headToSend;
+    }
+    return '`IRVTAIL:' + id + ':' + previews.length + ':full`\n\n' + previews;
+  } catch (err) {
+    log.warn(`[hover] vtail stash failed: ${err}`);
+    return previews;
+  }
+}
+
 // ── Patch $provideHover ──
 
 function patchSharedService(service: any) {
@@ -1413,6 +1483,16 @@ function patchSharedService(service: any) {
         return keys.length > 0 && !keys.some(key => existingKeys.has(key));
       });
     const dedupedPreviews = previewBlocks.join(HOVER_PREVIEW_SEPARATOR);
+    // L85 (2026-05-30): is the large hover content OURS or NATIVE? 3 v=237 captures
+    // showed ~59K hovers (demo_company_service) with NO source-block build log →
+    // the bloat may be the native LSP hover, which L84 (our-preview fence split)
+    // cannot touch. native = existing LSP content len, ours = our deduped preview
+    // len, blocks = our block count, split = count of L84 head/tail splits engaged.
+    // Retire once ours-vs-native is settled.
+    try {
+      const splitCount = (dedupedPreviews.match(/```\n```/g) || []).length;
+      log.info(`[hover] attach native=${existingText.length} ours=${dedupedPreviews.length} blocks=${previewBlocks.length} split=${splitCount}`);
+    } catch { /* diag must never break the hover */ }
     if (!dedupedPreviews) {
       return hoverRange ? { ...res, range: hoverRange ?? res?.range } : res;
     }
@@ -1973,9 +2053,10 @@ function patchSharedService(service: any) {
         posPreviewSet(posKey, computed.typesKey, computed.previews);
         // L45: trace level — once-per-paint completion marker.
         log.trace(`[hover] done: first-hover preview attached md=${computed.previews.length} (${hoverMs()}, post=${postNativeMs()})`);
+        const deliverPreviews = await irStashLargePreviewForChannelTest(computed.previews);
         return returnWithNativeFallback(attachPreviewsOnce(
           result,
-          computed.previews,
+          deliverPreviews,
           position,
           hoveredInternalRange,
           deliveryGroupKey,

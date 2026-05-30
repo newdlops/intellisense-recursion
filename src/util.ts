@@ -103,3 +103,10 @@ export function isCodeDoc(doc: vscode.TextDocument): boolean {
 export const DEFINITION_PREVIEW_FALLBACK_LINES = 120;
 export const DEFINITION_PREVIEW_SAFETY_MAX_LINES = 10_000;
 export const DEFINITION_PREVIEW_VALUE_MAX_LINES = 600;
+// L84 (2026-05-30): how many lines of a code preview get syntax-highlighted (the
+// head — what's visible when the hover first opens). Lines beyond this render as a
+// PLAIN fence so VS Code skips TextMate tokenization of huge off-screen blocks —
+// the #2 hover-jank cause (a genuine 1,657-line class blocked the renderer ~2.4s
+// during synchronous render). Full content + code-block layout preserved; only the
+// scrolled-out tail loses colour. Tunable.
+export const HOVER_HIGHLIGHT_MAX_LINES = 120;

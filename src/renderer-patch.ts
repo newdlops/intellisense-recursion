@@ -17,7 +17,7 @@
 // Cross-module dependencies: none. The string is opaque to TS — embedded
 // JS comments / banners inside it are NOT TS structure.
 
-export const RENDERER_PATCH_VERSION = 235;
+export const RENDERER_PATCH_VERSION = 246;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -415,6 +415,11 @@ style.textContent=[
   // per line × many lines = the biggest layout work. Intrinsic height
   // hint uses an average code-row height (18px-line × several lines).
   '.monaco-hover .monaco-tokenized-source,.monaco-editor-hover .monaco-tokenized-source{content-visibility:auto;contain-intrinsic-size:0 200px}',
+  // L86 reverted (v240): content-visibility on plain code blocks did NOT reduce the
+  // render block — the cost is VS Code PARSING the 59K markdown + building the DOM +
+  // our scan, not off-screen LAYOUT (which content-visibility skips), and width:
+  // max-content forces full-content measurement anyway. The real fix is rendering
+  // LESS content initially (L87+ custom virtual scroller). See log-analysis.md #2.
 ].join('');
 document.head.appendChild(style);
 window.__irStyleEl = style;
@@ -535,7 +540,13 @@ var IR_HE_FORWARDED_KINDS={
   'editor-proto-patched':1,
   'editor-scroll-watched':1,
   'editor-scroll':1,
-  'global-prototype-patched':1
+  'global-prototype-patched':1,
+  'main-thread-longtask':1,
+  'ir-sync-longtask':1,
+  'vtail-channel-test':1,
+  'vtail-stash-visible':1,
+  'vtail-tail-rendered':1,
+  'vtail-windowed':1
 };
 // L20-L24 diagnostic force-logs were used to root-cause drill jump
 // (L23+L24) and drill-mutation throughput (L36+L37). All fixes
@@ -612,7 +623,18 @@ var IR_HE_FORCE_LOG_KINDS={
   'initial-reposition-error':1,
   // L68 diagnostic: force-log anchor-moved (content swap re-position) so we
   // can confirm fast symbol-to-symbol moves re-anchor. Demote once stable.
-  'initial-reposition-anchor-moved':1
+  'initial-reposition-anchor-moved':1,
+  // L83 (2026-05-30): main-thread block instrumentation for #2 staging budget
+  // outliers (5× reason=budget ms 641-952 = a ~562ms silent gap starving the
+  // settle poll + hard timer). main-thread-longtask = Long Tasks API (any task
+  // >=100ms + browser attribution); ir-sync-longtask = our own wrapped heavy sync
+  // fns (scan/wrap, markdown MO burst) at >=50ms. Retire once the blocker lands.
+  'main-thread-longtask':1,
+  'ir-sync-longtask':1,
+  'vtail-channel-test':1,
+  'vtail-stash-visible':1,
+  'vtail-tail-rendered':1,
+  'vtail-windowed':1
 };
 function irHERecord(kind,detail){
   try{
@@ -1305,6 +1327,7 @@ function irStageHover(wrapperEl){
     wrapperEl.__irStaging=true;
     wrapperEl.__irStageSig=sig;
     wrapperEl.__irStageStart=Date.now();
+    window.__irActiveStageWrapper=wrapperEl;   // L83: correlate main-thread longtasks with active staging
     wrapperEl.__irStagePrevRect=null;
     wrapperEl.classList.add('ir-hover-staging');
     // Hard fail-safe: reveal no matter what shortly after the budget, even if
@@ -1345,6 +1368,7 @@ function irStageReveal(wrapperEl,reason){
     }
     wrapperEl.__irStageRevealedSig=wrapperEl.__irStageSig||wrapperEl.__irStageRevealedSig;
     wrapperEl.__irStaging=false;
+    try{if(window.__irActiveStageWrapper===wrapperEl)window.__irActiveStageWrapper=null;}catch(_){}
     wrapperEl.__irStageSig=null;
     wrapperEl.__irStagePrevRect=null;
     try{if(wrapperEl.classList)wrapperEl.classList.remove('ir-hover-staging');}catch(_){}
@@ -1361,6 +1385,50 @@ function irStageReveal(wrapperEl,reason){
       }catch(_){}
     }
   }catch(_){try{if(wrapperEl&&wrapperEl.classList)wrapperEl.classList.remove('ir-hover-staging');}catch(__){}}
+}
+// ── L83 (2026-05-30): main-thread block instrumentation (#2 staging outliers) ──
+// v=235 showed 5 hover-stage-reveal reason=budget with ms 641-952: a ~562ms gap
+// with ZERO logs right after hover formation starved the 40ms settle poll AND the
+// 620ms hard timer, so the reveal slipped past the 500ms ceiling. The gap is NOT
+// the L82 strobe (collapse count 0 in those seconds). To find what blocks the
+// loop: the Long Tasks API reports any task >=IR_LONGTASK_MIN_MS with the browser's
+// own attribution, and irTimeSync wraps our heaviest synchronous suspects (the
+// 57K-char navigable-name wrap scan — see irScheduleScan's own comment — and the
+// markdown MutationObserver burst) so a longtask can be pinned on OUR code vs VS
+// Code's hover render. Diagnostic only; retire (like L55) once the blocker lands.
+var IR_LONGTASK_MIN_MS=100;       // report main-thread tasks at/over this (ms)
+var IR_SYNC_LONGTASK_MIN_MS=50;   // report our own wrapped sync fns at/over this (ms)
+function irNowMs(){try{return (window.performance&&performance.now)?performance.now():Date.now();}catch(_){return Date.now();}}
+function irStageElapsedNow(){
+  try{var w=window.__irActiveStageWrapper;if(w&&w.__irStaging&&w.__irStageStart)return Date.now()-w.__irStageStart;}catch(_){}
+  return -1;
+}
+function irTimeSync(label,fn){
+  var t0=irNowMs();
+  try{return fn();}
+  finally{
+    try{var dur=irNowMs()-t0;if(dur>=IR_SYNC_LONGTASK_MIN_MS)irHERecord('ir-sync-longtask',{fn:String(label),durMs:Math.round(dur),staging:irStageElapsedNow()});}catch(_){}
+  }
+}
+function irInstallLongTaskObserver(){
+  try{
+    if(window.__irLongTaskObs)return;
+    if(typeof window.PerformanceObserver!=='function')return;
+    var obs=new PerformanceObserver(function(list){
+      try{
+        var ents=list.getEntries();
+        for(var i=0;i<ents.length;i++){
+          var e=ents[i];
+          if((e.duration|0)<IR_LONGTASK_MIN_MS)continue;
+          var attr='';
+          try{var a=e.attribution&&e.attribution[0];if(a)attr=String(a.name||'')+'/'+String(a.containerType||'')+'/'+String(a.containerName||a.containerId||'');}catch(_){}
+          irHERecord('main-thread-longtask',{durMs:Math.round(e.duration),startMs:Math.round(e.startTime),name:String(e.name||''),attribution:attr,staging:irStageElapsedNow()});
+        }
+      }catch(_){}
+    });
+    try{obs.observe({entryTypes:['longtask']});}catch(_){try{obs.observe({type:'longtask',buffered:true});}catch(__){}}
+    window.__irLongTaskObs=obs;
+  }catch(_){}
 }
 // L80 (2026-05-30): proactive width-freeze for the #3 re-preview churn.
 //
@@ -9520,7 +9588,88 @@ function irEnsureHoverScrollListener(hoverHost){
     },{passive:true});
   }catch(_){}
 }
+// L87 step 3 (2026-05-31): windowed virtual scroller for the stashed tail. Step 2
+// rendered the whole tail (~1500 lines) as one plain pre in idle -> a ~520ms block
+// (moved off the sync path but still a stutter). This renders ONLY the visible line
+// window into the DOM, with top/bottom spacer divs preserving the full scroll height,
+// and re-renders the window on scroll. DOM stays ~50 lines regardless of total size,
+// so there is no big layout. Mounts inside the hover scroller; the head (highlighted)
+// is already painted above it by VS Code. Tail lines are plain text (no drill links yet
+// -- a later refinement re-scans the visible window for navigable type names).
+function irRenderVtailWindowed(block,tailText,id){
+  try{
+    var lines=tailText.split('\n');
+    var total=lines.length;
+    var scroller=(block.closest&&(block.closest('.monaco-scrollable-element')||block.closest('.monaco-hover')))||block.parentElement;
+    if(!scroller)return;
+    var wrap=document.createElement('div');wrap.className='ir-vtail-scroller';wrap.setAttribute('style','margin:0;padding:0');
+    var topSp=document.createElement('div');topSp.setAttribute('style','height:0;margin:0;padding:0');
+    var win=document.createElement('pre');win.className='ir-vtail-window';win.setAttribute('style','margin:0;padding:0;white-space:pre');
+    var winCode=document.createElement('code');win.appendChild(winCode);
+    var botSp=document.createElement('div');botSp.setAttribute('style','height:0;margin:0;padding:0');
+    wrap.appendChild(topSp);wrap.appendChild(win);wrap.appendChild(botSp);
+    block.appendChild(wrap);
+    // measure line height from a few probe lines (padding is 0 so height/N is the row height)
+    var probeN=Math.min(5,total)||1;
+    winCode.textContent=lines.slice(0,probeN).join('\n')||' ';
+    var lh=18;try{var h=win.getBoundingClientRect().height;if(h>0)lh=h/probeN;}catch(_){}
+    if(!(lh>=6&&lh<=60))lh=18;
+    var BUFFER=12;var lastS=-1,lastE=-1;
+    function render(){
+      try{
+        if(!document.body.contains(wrap))return;
+        var scRect=scroller.getBoundingClientRect();
+        var wRect=wrap.getBoundingClientRect();
+        var scTop=scroller.scrollTop||0;
+        var vpH=scroller.clientHeight||scRect.height||400;
+        var tailOffset=(wRect.top-scRect.top)+scTop;   // wrap offset within the scrollable content (stable)
+        var relTop=scTop-tailOffset;
+        var start=Math.max(0,Math.floor(relTop/lh)-BUFFER);
+        var end=Math.min(total,Math.ceil((relTop+vpH)/lh)+BUFFER);
+        if(end<start)end=start;
+        if(start===lastS&&end===lastE)return;
+        lastS=start;lastE=end;
+        winCode.textContent=lines.slice(start,end).join('\n');
+        topSp.style.height=Math.round(start*lh)+'px';
+        botSp.style.height=Math.round(Math.max(0,total-end)*lh)+'px';
+      }catch(_){}
+    }
+    lastS=-1;lastE=-1;render();
+    var pend=false;
+    var onScroll=function(){if(pend)return;pend=true;(window.requestAnimationFrame||function(f){return setTimeout(f,16);})(function(){pend=false;render();});};
+    try{scroller.addEventListener('scroll',onScroll,{passive:true});}catch(_){}
+    irHERecord('vtail-windowed',{id:id,total:total,lh:Math.round(lh)});
+  }catch(_){}
+}
+// L87 (2026-05-30): virtual-tail channel test (step 1). The extension prepends an
+// IRVTAIL:<id>:<len> marker to large previews and stashes the full markdown into
+// window.__irPreviewStash[id] via CDP. Detect the marker, confirm the stash arrived
+// with the expected length, log it, and remove the visible marker element. Proves the
+// ext->renderer content channel before step 2 (head-split + render tail from stash).
+function irHandleVtailMarker(block,text){
+  var m=/IRVTAIL:(v[0-9]+):([0-9]+):(split|full)/.exec(text);
+  if(!m)return;
+  var id=m[1];
+  if(block.__irVtailLastId===id)return;   // already handled this marker id (block may be reused across hovers)
+  block.__irVtailLastId=id;
+  var expectedLen=parseInt(m[2],10)||0;var mode=m[3];
+  var stash=null;try{stash=window.__irPreviewStash&&window.__irPreviewStash[id];}catch(_){}
+  var stashLen=(typeof stash==='string')?stash.length:-1;
+  irHERecord('vtail-channel-test',{id:id,mode:mode,expectedLen:expectedLen,stashLen:stashLen,match:(stashLen===expectedLen)});
+  // remove the visible marker element
+  try{var codes=block.querySelectorAll('code');for(var i=0;i<codes.length;i++){if((codes[i].textContent||'').indexOf('IRVTAIL:')>=0){var p=codes[i].parentNode;if(p)p.removeChild(codes[i]);break;}}}catch(_){}
+  // L87 step 2: render the stashed plain tail OFF the sync path (idle), appended after the head.
+  // The head (highlighted) already painted via VS Code's tiny sync render; this fills in the rest.
+  if(mode==='split'&&typeof stash==='string'&&stash.length>0&&!block.__irVtailRendered){
+    block.__irVtailRendered=true;
+    irRenderVtailWindowed(block,stash,id);   // L87 step 3: windowed (visible-lines-only) render
+  }
+}
 function irScanRenderedMarkdown(){
+  // L87 channel proof (direct, marker-independent): does THIS patch (its JS world)
+  // see the stash the extension set via debugger.sendCommand? Log when the key count
+  // grows. If keys>=1 here, the ext->renderer content channel is confirmed end-to-end.
+  try{var __vs=window.__irPreviewStash;var __vk=__vs?Object.keys(__vs).length:-1;if(__vk>=1&&window.__irVtailStashLogN!==__vk){window.__irVtailStashLogN=__vk;irHERecord('vtail-stash-visible',{keys:__vk});}}catch(_){}
   irDiagnoseUnwrappedHovers();
   irAlignResizableHoverToChild();
   var containers=document.querySelectorAll('.monaco-hover .rendered-markdown, .monaco-editor-hover .rendered-markdown, .ij-find-hover-tooltip .rendered-markdown');
@@ -9533,6 +9682,7 @@ function irScanRenderedMarkdown(){
       // L32 viewport gate before the expensive textContent read.
       if(preHost&&!irIsBlockVisibleInHover(preBlock,preHost))continue;
       var preText=preBlock.textContent||'';
+      if(preText.indexOf('IRVTAIL:')>=0){try{irHandleVtailMarker(preBlock,preText);}catch(_){}}
       if(preHost&&preBlock.__irLastScanText!==preText){
         irTouchHoverRootContent(preHost,'pre-scan-text-change',preText);
       }
@@ -9773,11 +9923,12 @@ function irScheduleScan(){
   }
   window.__irScanTimer=schedule(function(){
     window.__irScanTimer=null;
-    try{irScanRenderedMarkdown()}catch(eScan){irLog('renderer: scan err '+(eScan&&eScan.message))}
+    try{irTimeSync('scan',irScanRenderedMarkdown)}catch(eScan){irLog('renderer: scan err '+(eScan&&eScan.message))}
   });
 }
 
 window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
+  var __moT0=irNowMs();   // L83: time the markdown MO burst (a #2 block suspect on 57K-char content)
   irPruneDetachedHoverState();
   // L37: dedupe per-hover work within a single mutation-observer
   // callback. drill mutation bursts deliver 50+ records in one tick and
@@ -9837,6 +9988,7 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
     }
   }
   if(seenScan)irScheduleScan();
+  try{var __moDur=irNowMs()-__moT0;if(__moDur>=IR_SYNC_LONGTASK_MIN_MS)irHERecord('ir-sync-longtask',{fn:'markdown-mo',durMs:Math.round(__moDur),muts:muts&&muts.length,staging:irStageElapsedNow()});}catch(_){}
 }));
 // L40: characterData:true was firing the observer on every keystroke
 // the user typed in the editor (each character data mutation in
@@ -9848,6 +10000,7 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
 // characterData:true since they cover small wrapper-only trees where
 // the extra fidelity is cheap.
 window.__irMarkdownObserver.observe(document.body,{childList:true,subtree:true});
+try{irInstallLongTaskObserver();}catch(_){}   // L83: #2 main-thread block instrumentation
 irScheduleScan();
 
 irLog('renderer: MutationObserver scan installed');
