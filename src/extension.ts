@@ -4547,6 +4547,12 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
           hasSticky:    !!(s.inner.classList && s.inner.classList.contains('ir-sticky')),
           hasScrollable:!!(s.inner.classList && s.inner.classList.contains('ir-scrollable')),
           seenAt:       Number(s.wrap.__irColumnSeenAt || 0),
+          // L79: a content-bearing column pillar is remediated by clearing the
+          // stuck inline width (so the stylesheet re-expands it) instead of
+          // stripping our keepalive classes — captured so the gate test can
+          // assert the width-restore path rather than the legacy class-strip.
+          widthRestored: !!s.wrap.__irColumnWidthRestored,
+          inlineWidth:   String(s.wrap.style && s.wrap.style.width || ''),
           rect:         r ? { w: Math.round(r.width), h: Math.round(r.height) } : null,
           inQuery:      matches,
           styleDisplay: String(s.wrap.style && s.wrap.style.display || ''),
@@ -4589,8 +4595,23 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
         // not have stripped our classes on the first pass.
         try { t.wrap.parentNode && t.wrap.parentNode.removeChild(t.wrap); } catch(_) {}
 
+        // ── freeze gate (L81) — a CONTENT column with a known last-good width
+        // must be width-FROZEN (min-width floor) by the sweep so the 16px sliver
+        // never paints, instead of waiting for the reactive L79 restore. This is
+        // the engagement check L80 lacked (it hooked the style observer, which
+        // never saw the computed collapse → 0 width-freeze events in v=233).
+        var f = buildStuckWrapper('column');
+        f.wrap.__irLastGoodWidth = 600;   // simulate a previously-healthy hover
+        hooks.scanNarrowHoverWrappers('harness-freeze-1');
+        var freezeAfter = {
+          frozen:   !!f.wrap.__irWidthFrozen,
+          minWidth: String(f.wrap.style && f.wrap.style.minWidth || ''),
+        };
+        try { f.wrap.parentNode && f.wrap.parentNode.removeChild(f.wrap); } catch(_) {}
+
         columnGateResult = {
           ok: true,
+          freeze: freezeAfter,
           column: { first: colAfter1, second: colAfter2 },
           bar:    { first: barAfter1, second: barAfter2 },
           transient: { first: transAfter1 }

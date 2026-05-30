@@ -17,7 +17,7 @@
 // Cross-module dependencies: none. The string is opaque to TS — embedded
 // JS comments / banners inside it are NOT TS structure.
 
-export const RENDERER_PATCH_VERSION = 212;
+export const RENDERER_PATCH_VERSION = 235;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -365,6 +365,12 @@ style.textContent=[
   '.monaco-hover.ir-native-released-hover,.monaco-editor-hover.ir-native-released-hover{visibility:hidden !important;pointer-events:none !important}',
   '.ir-hover-artifact-hidden{display:none !important;visibility:hidden !important;pointer-events:none !important;opacity:0 !important}',
   '.ir-stale-hover{display:none !important;visibility:hidden !important;pointer-events:none !important}',
+  // L76 (2026-05-29): staging — hide the wrapper while it forms (content
+  // render + sizing + our reposition) and reveal it only once settled (or at
+  // the ~500ms budget). visibility:hidden keeps layout/sizing live (rect stays
+  // measurable) so the settle-check works while invisible. The user never sees
+  // the collapse/0x0/reposition flicker; they see a finished hover.
+  '.monaco-resizable-hover.ir-hover-staging{visibility:hidden !important}',
   '.ir-empty-hover-root{opacity:0 !important;pointer-events:none !important}',
   '.ir-empty-hover-root *{pointer-events:none !important}',
   // Drilled hover height clamp via CSS :has() — when our [← Back] link
@@ -491,6 +497,11 @@ var IR_HE_FORWARDED_KINDS={
   'drill-reposition-byel-skip-transient':1,
   'drill-reposition-skip-already-positioned':1,
   'drill-reposition-byel-skip-already-positioned':1,
+  'initial-reposition':1,
+  'initial-reposition-error':1,
+  'initial-reposition-skip':1,
+  'initial-reposition-skip-transient':1,
+  'initial-reposition-anchor-moved':1,
   'drill-style-reapplied':1,
   'drill-settle-observer-armed':1,
   'drill-settle-observer-fired':1,
@@ -513,6 +524,11 @@ var IR_HE_FORWARDED_KINDS={
   'force-preview-cleanup':1,
   'column-wrapper-detected':1,
   'column-wrapper-cleaned':1,
+  'column-wrapper-width-restored':1,
+  'width-collapse-transition':1,
+  'width-freeze':1,
+  'hidden-active-zero-rect-skip':1,
+  'hover-stage-reveal':1,
   'hover-position-anomaly':1,
   'drill-body-observer-installed':1,
   'editor-captured-via-map':1,
@@ -544,6 +560,37 @@ var IR_HE_FORCE_LOG_KINDS={
   'force-preview-cleanup':1,
   'column-wrapper-detected':1,
   'column-wrapper-cleaned':1,
+  'column-wrapper-width-restored':1,
+  // L72 (2026-05-29): width=16px collapse TRANSITION diagnostic — fires only
+  // on a collapsed<->normal boundary crossing (bounded volume). Captures the
+  // exact moment L71's residual width collapse happens. See the transition
+  // logger in irAttachStyleObserverToWrapper.
+  'width-collapse-transition':1,
+  // L80 (2026-05-30): proactive width-freeze audit — fires when we hold a
+  // collapsing-but-content-present wrapper at its last-good width (phase=hold)
+  // and when we release that floor once content rebuilt / timed out
+  // (phase=release). The root of the #3 re-preview churn is VS Code rebuilding
+  // an already-shown hover on same-anchor re-fires (mouse drift + hover delay),
+  // which transiently collapses the wrapper to a 16px sliver; freezing the
+  // width makes that rebuild invisible instead of band-aiding it after the fact
+  // (L79). Force-logged to confirm it engages and to measure hold duration.
+  'width-freeze':1,
+  // L74 (2026-05-29): transient zero-rect skip audit — fires when we leave a
+  // 0x0-but-content-present hover alone (VS Code mid-swap) instead of releasing
+  // it. Force-logged so we can confirm it engages (unlike L73, which was 0).
+  'hidden-active-zero-rect-skip':1,
+  // L78 (2026-05-30): force-preview transient zero-rect keep-alive audit — fires
+  // when irForcePreviewHoverVisible lands on a 0x0-but-content-present root (VS
+  // Code mid content-swap / link re-wrap) and we keep it alive + hold off the
+  // release instead of returning the hard failure that let the revive→dispose
+  // path RELEASE the drilled hover. phase=force-keepalive (force-preview branch)
+  // or dispose-hold (release guard). Force-logged because the L74 dispose guard
+  // fired 0× for this path across 28 observed zero-rect force-preview failures.
+  'force-preview-zero-rect-transient':1,
+  // L76 (2026-05-29): staging reveal audit — fires when a staged (hidden-until-
+  // settled) hover is revealed, with reason (settled/budget/hard-cap/...) + ms.
+  // Force-logged to confirm staging engages and measure reveal latency.
+  'hover-stage-reveal':1,
   // L56 (2026-05-28): diagnose hover-covers-symbol / hover-far-from-symbol
   // user-reported regression. Only fires when the active-switch detects
   // an actual anomaly (mouse inside wrapper, or distance > 80px), so
@@ -552,7 +599,20 @@ var IR_HE_FORCE_LOG_KINDS={
   // L57 hardcoded reposition that emitted it. Diagnostic still flows
   // through hover-position-anomaly above; if a positioning fix is ever
   // reintroduced here, restore this kind to either set.
-  'hover-position-anomaly':1
+  'hover-position-anomaly':1,
+  // L62 (2026-05-28): symbol-anchored initial-hover reposition replaces
+  // L57's mouse-anchored override. Audit trail so we can verify when
+  // our fix engages (vs leaving the wrapper at VS Code's anchor).
+  'initial-reposition':1,
+  // L62 diagnostic: skip + error force-logged temporarily so we can see
+  // why irRepositionInitialHover exits when telemetry is off. Demote to
+  // forwarded-only once the v=213 wire-in is confirmed to engage.
+  'initial-reposition-skip':1,
+  'initial-reposition-skip-transient':1,
+  'initial-reposition-error':1,
+  // L68 diagnostic: force-log anchor-moved (content swap re-position) so we
+  // can confirm fast symbol-to-symbol moves re-anchor. Demote once stable.
+  'initial-reposition-anchor-moved':1
 };
 function irHERecord(kind,detail){
   try{
@@ -1139,25 +1199,383 @@ function irOnEditorCaptured(widget){
 // the style was changed by something other than us. Looking at the
 // wrapper subtree directly (no widget handle needed) so this also works
 // from the body MutationObserver fallback path.
+// L68 (2026-05-29): has the live hover anchor moved away from the symbol we
+// last positioned this wrapper for? The content-hover widget is a reused
+// singleton — when the user moves to a NEW symbol the content swaps in place
+// (no dismiss), so our one-shot __irInitialPositioned and the style
+// observer's __irDesired would otherwise pin the wrapper at the OLD symbol's
+// coordinates while VS Code fills in the new symbol's content ("content
+// changes, position doesn't"). Comparing the widget's current getPosition()
+// against __irPositionedForPos detects the swap so we can re-run the
+// symbol-anchored placement for the new symbol.
+function irHoverAnchorMoved(wrapperEl){
+  try{
+    var prev=wrapperEl&&wrapperEl.__irPositionedForPos;
+    if(!prev)return false;
+    var hw=window.__irCapturedHoverWidget;
+    if(!hw||typeof hw.getPosition!=='function')return false;
+    var gp=hw.getPosition();
+    var a=gp&&gp.position;
+    if(!a)return false;
+    // L71 (2026-05-29): a hover anchors to a WORD/symbol RANGE, not a single
+    // column. Moving the cursor within the same identifier keeps the same
+    // range but reports a different column — that is NOT a symbol swap and
+    // must not trigger a follow-the-cursor reposition. Before L71 the column
+    // check fired on every micro-move inside one symbol, so the hover jumped
+    // char-by-char (each reposition coinciding with VS Code's re-render
+    // width-collapse) — exactly the user-reported "위치가 char단위로 갱신되며
+    // width collapse". Compare the RANGE when both the stored and the live
+    // anchor carry one; only a different range is a real swap. Fall back to
+    // line/column when range info is absent (e.g. the L64 DOM-target fallback
+    // positioned us without a word range) so the L68 swap detection still
+    // works there.
+    var live=gp.range;
+    if(live&&prev.range){
+      return live.startLineNumber!==prev.range.startLineNumber
+        ||live.startColumn!==prev.range.startColumn
+        ||live.endLineNumber!==prev.range.endLineNumber
+        ||live.endColumn!==prev.range.endColumn;
+    }
+    return a.lineNumber!==prev.lineNumber||a.column!==prev.column;
+  }catch(_){return false;}
+}
+// L73 (2026-05-29): is the pointer still within the word RANGE the currently
+// shown hover is anchored to? Used to suppress redundant native-hover refires
+// when the user micro-moves WITHIN the same symbol. Re-firing in that case
+// makes VS Code re-render the hover into a fresh .monaco-hover element which we
+// then re-scan/re-size (a reflow); that repeated reflow is what collapsed the
+// wrapper width to 16px / 0x0 on every micro-move (v=225 width-collapse diag).
+// Range (vs the old text-containment check) is authoritative AND distinguishes
+// different occurrences of a same-named symbol — a different position yields a
+// different range, so a real relocation still refires (no "stuck at first
+// occurrence" regression). Conservative: returns false whenever the anchor
+// range or the pointer's editor position can't be resolved, so a refire that
+// is actually needed is never suppressed.
+function irPointerWithinActiveHoverAnchor(e){
+  try{
+    var hw=window.__irCapturedHoverWidget;
+    if(!hw||typeof hw.getPosition!=='function')return false;
+    var gp=hw.getPosition();
+    var range=gp&&gp.range;
+    if(!range)return false;
+    var ed=hw._editor;
+    if(!ed||typeof ed.getTargetAtClientPoint!=='function')return false;
+    var ptr=window.__irLastPointer;
+    var x=(e&&typeof e.clientX==='number')?e.clientX:(ptr&&typeof ptr.x==='number'?ptr.x:null);
+    var y=(e&&typeof e.clientY==='number')?e.clientY:(ptr&&typeof ptr.y==='number'?ptr.y:null);
+    if(typeof x!=='number'||typeof y!=='number')return false;
+    var tgt=ed.getTargetAtClientPoint(x,y);
+    var pos=tgt&&tgt.position;
+    if(!pos)return false;
+    if(pos.lineNumber<range.startLineNumber||pos.lineNumber>range.endLineNumber)return false;
+    if(pos.lineNumber===range.startLineNumber&&pos.column<range.startColumn)return false;
+    if(pos.lineNumber===range.endLineNumber&&pos.column>range.endColumn)return false;
+    return true;
+  }catch(_){return false;}
+}
+// ── L76: reveal-when-settled staging ──────────────────────────────────────
+// User directive (2026-05-29): "호버를 너무 민감하게 띄울 필요는 없으니 500ms
+// 예산으로 hover 위치 계산을 다 끝내고 렌더링을 끝낸 뒤에 보여주자." Instead of
+// guarding each transient (collapse / 0x0 / reposition-jump) — which kept
+// missing (L73, L74 both 0 engagement) — we hide the wrapper for its whole
+// formation and reveal it once, settled. The formation (content render + size +
+// our reposition) still runs while hidden (visibility:hidden keeps layout), so
+// the user only ever sees the finished hover.
+var IR_HOVER_STAGE_BUDGET_MS=500;   // hard ceiling: never hide longer than this
+var IR_HOVER_STAGE_POLL_MS=40;      // settle-check cadence
+var IR_WIDTH_FREEZE_MAX_MS=600;     // L80: max time to hold a frozen width before forced release
+var IR_WIDTH_FREEZE_OSC_WINDOW_MS=80;   // L82: a re-freeze within this of a release = premature release (oscillation)
+var IR_WIDTH_FREEZE_OSC_LATCH=3;        // L82: consecutive rapid re-freezes before we latch the floor
+var IR_WIDTH_FREEZE_LATCH_MAX_MS=8000;  // L82: backstop — release a latched floor after this even without a dismiss
+var IR_WIDTH_FREEZE_LATCH_POLL_MS=250;  // L82: slow poll cadence while latched (floor is static, no per-frame work)
+function irHoverContentSig(wrapperEl){
+  try{
+    var inner=wrapperEl.querySelector?wrapperEl.querySelector('.monaco-hover,.monaco-editor-hover'):null;
+    var t=inner?String(inner.textContent||''):'';
+    return t.length+':'+t.slice(0,40)+':'+t.slice(-20);
+  }catch(_){return '';}
+}
+function irStageHover(wrapperEl){
+  try{
+    if(!wrapperEl||!wrapperEl.classList)return;
+    var sig=irHoverContentSig(wrapperEl);
+    if(!sig||sig.indexOf('0:')===0)return;            // no content yet — wait
+    if(wrapperEl.__irStageRevealedSig===sig)return;   // this exact content already shown
+    if(wrapperEl.__irStaging){wrapperEl.__irStageSig=sig;return;} // mid-session: keep budget clock
+    wrapperEl.__irStaging=true;
+    wrapperEl.__irStageSig=sig;
+    wrapperEl.__irStageStart=Date.now();
+    wrapperEl.__irStagePrevRect=null;
+    wrapperEl.classList.add('ir-hover-staging');
+    // Hard fail-safe: reveal no matter what shortly after the budget, even if
+    // the poll dies / tab backgrounds. Guarantees no "hover never shows".
+    if(wrapperEl.__irStageHardTimer){try{clearTimeout(wrapperEl.__irStageHardTimer);}catch(_){}}
+    wrapperEl.__irStageHardTimer=setTimeout(function(){try{irStageReveal(wrapperEl,'hard-cap');}catch(_){}},IR_HOVER_STAGE_BUDGET_MS+120);
+    irStageSettleCheck(wrapperEl);
+  }catch(_){try{irStageReveal(wrapperEl,'error');}catch(_){}}
+}
+function irStageSettleCheck(wrapperEl){
+  try{
+    if(!wrapperEl||!wrapperEl.__irStaging)return;
+    if(!document.body||!document.body.contains(wrapperEl)){irStageReveal(wrapperEl,'detached');return;}
+    var elapsed=Date.now()-(wrapperEl.__irStageStart||0);
+    if(elapsed>=IR_HOVER_STAGE_BUDGET_MS){irStageReveal(wrapperEl,'budget');return;}
+    var r=wrapperEl.getBoundingClientRect();
+    var inner=wrapperEl.querySelector?wrapperEl.querySelector('.monaco-hover,.monaco-editor-hover'):null;
+    var hasContent=!!(inner&&String(inner.textContent||'').trim().length>0);
+    var notCollapsed=r.width>=60&&r.height>=20;       // not 16px column / 0x0 / bar
+    var prev=wrapperEl.__irStagePrevRect;
+    var stable=!!(prev&&Math.abs(prev.w-r.width)<=2&&Math.abs(prev.h-r.height)<=2);
+    if(notCollapsed&&hasContent&&stable){irStageReveal(wrapperEl,'settled');return;}
+    wrapperEl.__irStagePrevRect={w:r.width,h:r.height};
+    wrapperEl.__irStageTimer=setTimeout(function(){try{irStageSettleCheck(wrapperEl);}catch(_){try{irStageReveal(wrapperEl,'error');}catch(__){}}},IR_HOVER_STAGE_POLL_MS);
+  }catch(_){try{irStageReveal(wrapperEl,'error');}catch(__){}}
+}
+function irStageReveal(wrapperEl,reason){
+  try{
+    if(!wrapperEl)return;
+    if(wrapperEl.__irStageTimer){try{clearTimeout(wrapperEl.__irStageTimer);}catch(_){}wrapperEl.__irStageTimer=null;}
+    if(wrapperEl.__irStageHardTimer){try{clearTimeout(wrapperEl.__irStageHardTimer);}catch(_){}wrapperEl.__irStageHardTimer=null;}
+    var was=!!wrapperEl.__irStaging;
+    var ms=Date.now()-(wrapperEl.__irStageStart||0);
+    // Per the directive: finish computing the position BEFORE revealing, so the
+    // hover appears already at its final spot (no post-reveal jump).
+    if(was&&(reason==='settled'||reason==='budget')){
+      try{var ed=(window.__irCapturedHoverWidget&&window.__irCapturedHoverWidget._editor)||window.__irCapturedEditor;if(ed)irRepositionInitialHover(ed,wrapperEl);}catch(_){}
+    }
+    wrapperEl.__irStageRevealedSig=wrapperEl.__irStageSig||wrapperEl.__irStageRevealedSig;
+    wrapperEl.__irStaging=false;
+    wrapperEl.__irStageSig=null;
+    wrapperEl.__irStagePrevRect=null;
+    try{if(wrapperEl.classList)wrapperEl.classList.remove('ir-hover-staging');}catch(_){}
+    if(was)irHERecord('hover-stage-reveal',{reason:String(reason||''),ms:ms});
+    // L77: the hover is now shown & stable — run the deferred navigable-name
+    // wrap. Schedule on idle so the reveal paints first; the scan finds the
+    // wrapper no longer staging and wraps it once. (textContent is unchanged by
+    // wrapping, so this does not re-enter staging.)
+    if(was){
+      try{
+        var doDeferredWrap=function(){try{irScheduleScan();}catch(_){}};
+        if(typeof window.requestIdleCallback==='function')window.requestIdleCallback(doDeferredWrap,{timeout:300});
+        else setTimeout(doDeferredWrap,60);
+      }catch(_){}
+    }
+  }catch(_){try{if(wrapperEl&&wrapperEl.classList)wrapperEl.classList.remove('ir-hover-staging');}catch(__){}}
+}
+// L80 (2026-05-30): proactive width-freeze for the #3 re-preview churn.
+//
+// Root cause (v=232 log trace): while a hover is shown, the pointer drifts
+// slowly WITHIN the same word; VS Code's hover delay (~300ms) re-fires
+// $provideHover at the same word-anchor every ~2s (pos-cache hit — NOT our
+// renderer refire, so the L73 refire guard never sees it). Each re-fire makes
+// VS Code REBUILD the hover DOM, which transiently collapses the wrapper to a
+// 16px sliver via our width:min(max-content,680px) rule while the inner content
+// is mid-rebuild. L79 restores the width REACTIVELY (after a >=200ms 2-pass
+// sweep) — the user still sees the sliver flash, and the re-stage settle stalls
+// to the 500ms budget. Freezing the width PROACTIVELY makes the rebuild
+// invisible: a min-width floor at the last-good width beats VS Code's width:16px
+// (min-width wins over width) WITHOUT fighting it frame-by-frame, so the box
+// stays at its prior size while the content rebuilds, then we release the floor
+// once the inner content is back (so a genuinely smaller/larger next render
+// still sizes naturally). Only engages on a content-present collapse of a
+// wrapper WE positioned — empty shells (real dismiss) are left alone.
+function irReleaseWidthFreeze(wrapperEl,reason){
+  if(!wrapperEl||!wrapperEl.__irWidthFrozen)return;
+  try{wrapperEl.style.removeProperty('min-width');}catch(_){}
+  wrapperEl.__irWidthFrozen=false;
+  wrapperEl.__irFreezeLatched=false;                 // L82: a release ends the latch; a re-freeze re-evaluates it
+  wrapperEl.__irLastFreezeReleaseAt=Date.now();      // L82: anchor for the oscillation window in irFreezeWidth
+  var ageMs=Date.now()-(wrapperEl.__irWidthFrozenAt||Date.now());
+  irHERecord('width-freeze',{phase:'release',reason:String(reason||''),ageMs:ageMs});
+}
+function irScheduleWidthFreezeReleaseCheck(wrapperEl){
+  var tries=0;
+  var raf=window.requestAnimationFrame?function(f){return window.requestAnimationFrame(f);}:function(f){return setTimeout(f,16);};
+  function check(){
+    try{
+      if(!wrapperEl.__irWidthFrozen)return;
+      var ageMs=Date.now()-(wrapperEl.__irWidthFrozenAt||Date.now());
+      // L82 (2026-05-30): latched freeze = persistent pillar. Do NOT release on
+      // content-ready. The inner-width gate below is structurally always-true for
+      // the pillar: the inner .monaco-hover is width:max-content, so it measures
+      // its own text width (hundreds of px) even while the WRAPPER computes
+      // width:min(max-content,680px)→16px. Releasing the floor therefore just re-
+      // exposes the 16px sliver and we re-freeze on the next frame — the 510-cycle
+      // 16↔670 strobe seen in the v=234 capture (1,019 freeze events in 43s).
+      // irFreezeWidth latches once it has watched us re-freeze right after a release
+      // IR_WIDTH_FREEZE_OSC_LATCH times; from then we hold the floor at last-good
+      // width (a stable, readable box) until the dismiss/clear path drops it, with a
+      // backstop so a detached/forgotten floor can't outlive the hover. Poll slowly
+      // while latched — the floor is static, no per-frame work to do.
+      if(wrapperEl.__irFreezeLatched){
+        if(ageMs>IR_WIDTH_FREEZE_LATCH_MAX_MS){irReleaseWidthFreeze(wrapperEl,'latch-timeout');return;}
+        setTimeout(check,IR_WIDTH_FREEZE_LATCH_POLL_MS);
+        return;
+      }
+      tries++;
+      // The inner .monaco-hover is width:max-content (content-sized) and is NOT
+      // stretched by the wrapper's min-width floor, so its width is an honest
+      // "content rebuilt" signal that the floor cannot mask — for a GENUINE
+      // transient (the wrapper stays wide after release, so we never re-freeze).
+      var innerReady=false;
+      try{var fi=wrapperEl.querySelector('.monaco-hover,.monaco-editor-hover');innerReady=!!(fi&&fi.getBoundingClientRect().width>=60&&String(fi.textContent||'').length>0);}catch(_){}
+      if(innerReady){irReleaseWidthFreeze(wrapperEl,'content-ready');return;}
+      if(ageMs>IR_WIDTH_FREEZE_MAX_MS||tries>40){irReleaseWidthFreeze(wrapperEl,'timeout');return;}
+      raf(check);
+    }catch(_){try{irReleaseWidthFreeze(wrapperEl,'error');}catch(__){}}
+  }
+  raf(check);
+}
+function irFreezeWidth(wrapperEl,floorW){
+  if(!wrapperEl||wrapperEl.__irWidthFrozen)return;
+  var w=Math.round(floorW);
+  if(!(w>=60))return;
+  if(w>680)w=680;                                   // never exceed the 680px width budget
+  // L82 (2026-05-30): oscillation detector. A re-freeze landing within
+  // IR_WIDTH_FREEZE_OSC_WINDOW_MS of the last release means that release was
+  // premature — content-ready fired but the wrapper immediately re-collapsed (a
+  // persistent 16px pillar, not a transient rebuild). Count consecutive rapid
+  // re-freezes; at IR_WIDTH_FREEZE_OSC_LATCH, latch so the release check stops
+  // letting go and the strobe ends. A genuine transient releases once and never
+  // re-freezes (the box stays wide), so osc resets to 0 and behaviour is unchanged.
+  var now=Date.now();
+  if(wrapperEl.__irLastFreezeReleaseAt&&(now-wrapperEl.__irLastFreezeReleaseAt)<IR_WIDTH_FREEZE_OSC_WINDOW_MS){
+    wrapperEl.__irFreezeOsc=(wrapperEl.__irFreezeOsc|0)+1;
+  }else{
+    wrapperEl.__irFreezeOsc=0;
+  }
+  var latched=((wrapperEl.__irFreezeOsc|0)>=IR_WIDTH_FREEZE_OSC_LATCH);
+  wrapperEl.__irFreezeLatched=latched;
+  try{wrapperEl.style.setProperty('min-width',w+'px','important');}catch(_){return;}
+  wrapperEl.__irWidthFrozen=true;
+  wrapperEl.__irWidthFrozenAt=now;
+  irHERecord('width-freeze',{phase:'hold',w:w,osc:(wrapperEl.__irFreezeOsc|0),latched:latched});
+  irScheduleWidthFreezeReleaseCheck(wrapperEl);
+}
+// L81 (2026-05-30): centralised freeze decision, called from EVERY path that
+// can witness the collapse. L80 only hooked the style observer, which fires on
+// wrapper STYLE-attribute mutations — but v=233 live showed the real 16px
+// pillar is COMPUTED (width:min(max-content,680px) recomputing when the inner
+// content transiently narrows during VS Code's rebuild), not an inline-style
+// write, so the style observer never saw it (0 width-freeze events; the 9 style-
+// observer collapses were all 0×0 display:none dismisses). The collapse IS seen
+// by the ResizeObserver/content-MO reposition path (irRepositionInitialHover's
+// collapse guard logged 6 rawW:16 content pillars) and the periodic sweep
+// (column-wrapper-detected w:16 ×15). So freeze from there instead.
+function irMaybeFreezeCollapsedWidth(wrapperEl){
+  try{
+    if(!wrapperEl||wrapperEl.__irWidthFrozen)return;
+    if(String(wrapperEl.style.display||'')==='none')return;   // real dismiss, not a pillar
+    var r=wrapperEl.getBoundingClientRect();
+    // Pillar/column collapse only: narrow width but real height. Excludes the
+    // 0×0 dismiss (height<=40) and the height<20 bar (a min-width floor can't fix
+    // a height collapse). Matches irScanNarrowHoverWrappers' column shape.
+    if(!(r.width<60&&r.height>40))return;
+    var inner=wrapperEl.querySelector?wrapperEl.querySelector('.monaco-hover,.monaco-editor-hover'):null;
+    if(!inner||String(inner.textContent||'').length===0)return;   // empty shell = not the pillar bug
+    if((wrapperEl.__irLastGoodWidth|0)<60)return;                 // no known-good width to hold
+    irFreezeWidth(wrapperEl,wrapperEl.__irLastGoodWidth);
+  }catch(_){}
+}
 function irAttachStyleObserverToWrapper(wrapperEl){
   if(!wrapperEl||wrapperEl.__irStyleObs)return;
   if(typeof MutationObserver!=='function')return;
   var styleReapplyPending=false;
   var styleObs=new MutationObserver(function(){
     try{
+      // L72 (2026-05-29): width-collapse TRANSITION diagnostic. L71 stopped
+      // the char-by-char anchor follow, but the user still sees the width
+      // collapse to a 16px column on micro-moves. The periodic sweep only
+      // samples the collapsed state after the fact; this fires at the exact
+      // style mutation crossing the collapsed<->normal boundary, so PAIRED
+      // events bracket the collapse DURATION and record what set the width
+      // (inline value), the content state, and whether a point-wrap re-fire
+      // or our navigable-name wrapping just ran. Pure observation, no behavior
+      // change; bounded to transitions to avoid per-mutation spam.
+      try{
+        var dgR=wrapperEl.getBoundingClientRect();
+        var dgCol=(dgR.width<60||dgR.height<20);
+        // L80: continuously remember the last healthy (non-collapsed) width so a
+        // later transient collapse can be frozen to it. Skip while frozen (the
+        // floored width is not the natural content width).
+        if(!dgCol&&dgR.width>=60&&!wrapperEl.__irWidthFrozen){wrapperEl.__irLastGoodWidth=Math.round(dgR.width);}
+        if(dgCol!==!!wrapperEl.__irDiagCollapsed){
+          wrapperEl.__irDiagCollapsed=dgCol;
+          // L79 (2026-05-30): recovering to normal width ends a collapse episode
+          // — clear the one-shot guard so a LATER pillar on this (reused) wrapper
+          // can be width-restored again. See irScanNarrowHoverWrappers.
+          if(!dgCol){try{delete wrapperEl.__irColumnWidthRestored;}catch(_){wrapperEl.__irColumnWidthRestored=0;}}
+          var dgInner=wrapperEl.querySelector?wrapperEl.querySelector('.monaco-hover'):null;
+          var dgCls=[];
+          try{if(dgInner&&dgInner.classList){['ir-keepalive','ir-sticky','ir-scrollable','ir-size-small','ir-size-medium','ir-size-large','fade-in'].forEach(function(c){if(dgInner.classList.contains(c))dgCls.push(c);});}}catch(_){}
+          var dgPtr=window.__irLastPointer;
+          var dgNow=Date.now();
+          irHERecord('width-collapse-transition',{
+            to:dgCol?'collapsed':'normal',
+            rect:{w:Math.round(dgR.width),h:Math.round(dgR.height)},
+            inlineW:String(wrapperEl.style.width||''),
+            inlineMaxW:String(wrapperEl.style.maxWidth||''),
+            inlineH:String(wrapperEl.style.height||''),
+            inlineTop:String(wrapperEl.style.top||''),
+            inlineLeft:String(wrapperEl.style.left||''),
+            inlineMinW:String(wrapperEl.style.minWidth||''),
+            inlineDisplay:String(wrapperEl.style.display||''),
+            inlineVisibility:String(wrapperEl.style.visibility||''),
+            hasDesired:!!wrapperEl.__irDesired,
+            initPositioned:!!wrapperEl.__irInitialPositioned,
+            innerTextLen:dgInner?String(dgInner.textContent||'').length:-1,
+            innerClasses:dgCls,
+            ptr:dgPtr?{x:dgPtr.x,y:dgPtr.y,ageMs:(dgPtr.at?dgNow-dgPtr.at:-1),type:String(dgPtr.type||'')}:null,
+            msSincePointWrap:window.__irLastPointWrapAt?(dgNow-window.__irLastPointWrapAt):-1,
+            msSinceWrap:window.__irLastWrapAt?(dgNow-window.__irLastWrapAt):-1
+          });
+          // L80/L81: try to freeze from the style-observer transition too. This
+          // covers the case where VS Code writes an inline width:16px (a style
+          // mutation this observer DOES see, e.g. v=232). The dominant COMPUTED
+          // collapse (v=233) is invisible to this observer and is handled on the
+          // reposition-guard + sweep paths via the same helper.
+          if(dgCol)irMaybeFreezeCollapsedWidth(wrapperEl);
+        }
+      }catch(_){}
       if(styleReapplyPending)return;
       var desired=wrapperEl.__irDesired;
       if(!desired)return;
-      // Only re-apply for drilled wrappers (with ← Back link). Initial
-      // hovers shouldn't be tugged toward our mouse-anchored desired pose.
-      var hasBackStyle=!!wrapperEl.querySelector('a[href*="previewBack"],a[data-href*="previewBack"]');
-      if(!hasBackStyle){
-        try{var tStyle=String(wrapperEl.textContent||'');if(tStyle.indexOf('← Back')>=0)hasBackStyle=true;}catch(_){}
-      }
-      if(!hasBackStyle)return;
+      // L69 (2026-05-29): hands-off while the wrapper is collapsed / mid-
+      // resize. During a content swap VS Code transiently shrinks the
+      // content-hover to ~scrollbar width (16px column) or a thin bar.
+      // Re-pinning top/left or running the L68 anchor-moved branch here
+      // keeps our __irDesired glued to that collapsed shell and (via the
+      // anchor-moved -> irRepositionInitialHover call) spins a transient-
+      // skip retry loop every frame VS Code mutates the style — exactly the
+      // v=221 "width narrowing" regression (62% of collapsed columns carried
+      // __irDesired vs 17% before). Returning lets VS Code's
+      // width:min(max-content,680px) recover the size; the resize observer
+      // re-runs our placement once it is full again. This only ever fires
+      // for wrappers WE positioned (foreign overlays never get __irDesired
+      // or this observer), so other extensions' overlays are untouched.
+      var soRect=null;
+      try{soRect=wrapperEl.getBoundingClientRect();}catch(_){}
+      if(soRect&&(soRect.width<60||soRect.height<20))return;
+      // L62 (2026-05-28): re-apply for BOTH drill and initial wrappers.
+      // The earlier hasBackStyle gate was added when initial hovers used
+      // a mouse-anchored override (L57, retired in L59) that the user
+      // disliked. The new initial-hover reposition (L62) is symbol-
+      // anchored and viewport-clamped — it needs the same protection
+      // against VS Code's _resizableNode.layout() rewriting top/left.
       var curTop=parseInt(wrapperEl.style.top,10);
       var curLeft=parseInt(wrapperEl.style.left,10);
       if(curTop===desired.top&&curLeft===desired.left)return;
+      // L68: VS Code wrote a different top/left. If the hover content has
+      // swapped to a NEW symbol, this mutation is VS Code moving to the new
+      // anchor — do NOT pin it back to the old symbol. Drop our stale state
+      // and re-run symbol-anchored placement for the new symbol instead.
+      if(irHoverAnchorMoved(wrapperEl)){
+        try{delete wrapperEl.__irDesired;}catch(_){wrapperEl.__irDesired=undefined;}
+        wrapperEl.__irInitialPositioned=false;
+        irHERecord('initial-reposition-anchor-moved',{via:'style-obs'});
+        try{irRepositionInitialHover((window.__irCapturedHoverWidget&&window.__irCapturedHoverWidget._editor)||window.__irCapturedEditor,wrapperEl);}catch(_){}
+        return;
+      }
       // Stop re-applying once the desired pose is older than 4s — the
       // hover may have been re-purposed for a fresh non-drill render.
       if(Date.now()-desired.at>4000)return;
@@ -1191,12 +1609,37 @@ function irAttachStyleObserverToWrapper(wrapperEl){
 function irResetWrapperPositionState(wrapperEl,reason){
   try{
     if(!wrapperEl)return;
+    // L76: a reset means VS Code dismissed/cleared this wrapper — drop staging
+    // state (and reveal) so a dismissed-mid-stage hover never sticks hidden and
+    // a later re-show stages fresh. Runs before the early-return below because a
+    // staged wrapper may not yet carry __irDesired/positioned flags.
+    try{
+      if(wrapperEl.__irStaging||wrapperEl.__irStageRevealedSig||(wrapperEl.classList&&wrapperEl.classList.contains('ir-hover-staging'))){
+        if(wrapperEl.__irStageTimer){try{clearTimeout(wrapperEl.__irStageTimer);}catch(_){}wrapperEl.__irStageTimer=null;}
+        if(wrapperEl.__irStageHardTimer){try{clearTimeout(wrapperEl.__irStageHardTimer);}catch(_){}wrapperEl.__irStageHardTimer=null;}
+        if(wrapperEl.classList)wrapperEl.classList.remove('ir-hover-staging');
+        wrapperEl.__irStaging=false;
+        wrapperEl.__irStageSig=null;
+        wrapperEl.__irStageRevealedSig=null;
+        wrapperEl.__irStagePrevRect=null;
+      }
+    }catch(_){}
+    // L80: a dismiss/clear releases any held width-freeze floor and drops the
+    // last-good-width memory so a re-shown hover freezes against its own size.
+    try{
+      if(wrapperEl.__irWidthFrozen){try{wrapperEl.style.removeProperty('min-width');}catch(_){}wrapperEl.__irWidthFrozen=false;}
+      wrapperEl.__irWidthFrozenAt=0;
+      wrapperEl.__irLastGoodWidth=0;
+      wrapperEl.__irFreezeLatched=false;   // L82: new content/anchor — re-evaluate the latch from scratch
+      wrapperEl.__irFreezeOsc=0;
+      wrapperEl.__irLastFreezeReleaseAt=0;
+    }catch(_){}
     var hasDrillHeight=false;
     try{
       hasDrillHeight=!!(wrapperEl.style&&(wrapperEl.style.height||wrapperEl.style.maxHeight))
         ||!!(wrapperEl.classList&&wrapperEl.classList.contains('ir-drill-hover'));
     }catch(_){}
-    if(!wrapperEl.__irPositionedOnce&&!wrapperEl.__irDesired&&!hasDrillHeight)return;
+    if(!wrapperEl.__irPositionedOnce&&!wrapperEl.__irInitialPositioned&&!wrapperEl.__irDesired&&!hasDrillHeight)return;
     try{wrapperEl.style.removeProperty('top');}catch(_){}
     try{wrapperEl.style.removeProperty('left');}catch(_){}
     try{wrapperEl.style.removeProperty('max-width');}catch(_){}
@@ -1220,9 +1663,12 @@ function irResetWrapperPositionState(wrapperEl,reason){
       }
     }catch(_){}
     try{delete wrapperEl.__irPositionedOnce;}catch(_){wrapperEl.__irPositionedOnce=undefined;}
+    try{delete wrapperEl.__irInitialPositioned;}catch(_){wrapperEl.__irInitialPositioned=undefined;}
+    try{delete wrapperEl.__irPositionedForPos;}catch(_){wrapperEl.__irPositionedForPos=undefined;}
     try{delete wrapperEl.__irDesired;}catch(_){wrapperEl.__irDesired=undefined;}
     try{delete wrapperEl.__irReposRetries;}catch(_){wrapperEl.__irReposRetries=undefined;}
     try{delete wrapperEl.__irReposByelRetries;}catch(_){wrapperEl.__irReposByelRetries=undefined;}
+    try{delete wrapperEl.__irInitReposRetries;}catch(_){wrapperEl.__irInitReposRetries=undefined;}
     try{
       if(wrapperEl.__irStyleObs&&typeof wrapperEl.__irStyleObs.disconnect==='function'){
         wrapperEl.__irStyleObs.disconnect();
@@ -1277,21 +1723,29 @@ function irAttachWrapperResizeReposition(widget){
             }
             return;
           }
-          // Drill-only: initial hovers stay at VS Code's natural position
-          // (anchored to the symbol). Only drilled wrappers (with ← Back
-          // link) follow the mouse — narrow enough not to hit viewport
-          // clamp once our JS width clamp shrinks them.
+          // L62: route based on drill vs initial content. Drill wrappers
+          // (← Back link) go to mouse-anchored reposition. Initial hovers
+          // (no Back link) go to symbol-anchored reposition with viewport
+          // clamp. Both use widget._editor — the most reliable editor
+          // handle (does not depend on __irCapturedEditor being populated
+          // via the Map.prototype.set prototype patch, which misses
+          // editors that existed before patch install).
           var contentEl=widget._hover&&widget._hover.containerDomNode;
           if(!contentEl)return;
           var hasBack=!!contentEl.querySelector('a[href*="previewBack"],a[data-href*="previewBack"]');
           if(!hasBack){
             var txt=String(contentEl.textContent||'');
-            if(txt.indexOf('← Back')<0)return;
+            if(txt.indexOf('← Back')>=0)hasBack=true;
           }
           var now=Date.now();
           if(now-lastReposAt<300)return;
           lastReposAt=now;
-          irRepositionDrilledHover(widget._editor||window.__irCapturedEditor,widget);
+          var ed=widget._editor||window.__irCapturedEditor;
+          if(hasBack){
+            irRepositionDrilledHover(ed,widget);
+          }else{
+            try{irRepositionInitialHover(ed,wrapperEl);}catch(_){}
+          }
         }catch(_){}
       },60);
     });
@@ -2064,6 +2518,13 @@ function irArmDrillSettleObserver(wrapperEl){
         if(ed0)irRepositionDrilledHoverByElement(ed0,wrapperEl);
         return;
       }
+      // L62: settled initial hover — reposition immediately so it lands
+      // above/below the symbol and stays inside the viewport. Still arm
+      // the observer below to catch later drill content swaps.
+      try{
+        var edInit0=window.__irCapturedEditor;
+        if(edInit0)irRepositionInitialHover(edInit0,wrapperEl);
+      }catch(_){}
       // Fall through: arm observer to catch a later content swap.
     }
     if(wrapperEl.__irSettleObs)return;
@@ -2084,7 +2545,7 @@ function irArmDrillSettleObserver(wrapperEl){
         // but has no ← Back link yet, KEEP observing (don't disconnect)
         // — we may catch the next resize that follows content arrival.
         var r=wrapperEl.getBoundingClientRect();
-        if(r.width<60||r.height<60)return;
+        if(r.width<60||r.height<20)return; // L70: collapse = column(w<60) || bar(h<20); short hovers must reposition
         var hasBackInner=!!wrapperEl.querySelector('a[href*="previewBack"],a[data-href*="previewBack"]');
         if(!hasBackInner){
           try{var t=String(wrapperEl.textContent||'');if(t.indexOf('← Back')>=0)hasBackInner=true;}catch(_){}
@@ -2092,11 +2553,17 @@ function irArmDrillSettleObserver(wrapperEl){
         if(!hasBackInner){
           // Initial hover (no back link). Check if we just came from a
           // back-button click — if so, restore at the drill's position
-          // for a smooth transition. Else leave VS Code's natural pose.
+          // for a smooth transition. Otherwise (L62) reposition the
+          // initial hover to a symbol-anchored, viewport-clamped pose.
           if(irMaybeApplyBackRestore(wrapperEl)){
             disposed=true;
             try{ro.disconnect();}catch(_){}
             try{delete wrapperEl.__irSettleObs;}catch(_){wrapperEl.__irSettleObs=null;}
+          }else{
+            try{
+              var edInitR=window.__irCapturedEditor;
+              if(edInitR)irRepositionInitialHover(edInitR,wrapperEl);
+            }catch(_){}
           }
           return;
         }
@@ -2122,7 +2589,7 @@ function irArmDrillSettleObserver(wrapperEl){
           if(disposed)return;
           try{
             var r=wrapperEl.getBoundingClientRect();
-            if(r.width<60||r.height<60)return;
+            if(r.width<60||r.height<20)return; // L70: collapse = column(w<60) || bar(h<20); short hovers must reposition
             var hasBackMo=!!wrapperEl.querySelector('a[href*="previewBack"],a[data-href*="previewBack"]');
             if(!hasBackMo){
               try{var tMo=String(wrapperEl.textContent||'');if(tMo.indexOf('← Back')>=0)hasBackMo=true;}catch(_){}
@@ -2133,6 +2600,12 @@ function irArmDrillSettleObserver(wrapperEl){
                 try{ro.disconnect();}catch(_){}
                 try{contentMo.disconnect();}catch(_){}
                 try{delete wrapperEl.__irSettleObs;}catch(_){wrapperEl.__irSettleObs=null;}
+              }else{
+                // L62: reposition initial hover (symbol-anchored, viewport-clamped).
+                try{
+                  var edInitMo=window.__irCapturedEditor;
+                  if(edInitMo)irRepositionInitialHover(edInitMo,wrapperEl);
+                }catch(_){}
               }
               return;
             }
@@ -2264,6 +2737,326 @@ function irRepositionDrilledHoverByElement(editor,wrapperEl){
     });
   }catch(err){
     try{irHERecord('drill-reposition-byel-error',{err:String(err).slice(0,100)});}catch(_){}
+  }
+}
+// L66 (2026-05-29): foreign hover-overlay guard.
+// Originally intended to catch "hover-on-hover" (a nested hover triggered
+// while the pointer is over existing hover content). EMPIRICAL FINDING
+// (v=219 telemetry): the common def-lookup hover-on-hover REUSES VS Code's
+// single content-hover wrapper (content swaps in place, like drill), so
+// there is no second overlay and this guard never fired for it — that case
+// surfaces as no-natural-pos and is now resolved by L67 (widget anchor) or
+// left at VS Code's placement. The guard is kept because it still correctly
+// covers GENUINELY SEPARATE overlays stacked over the editor (peek view, a
+// standalone .monaco-hover tooltip): when the last pointer sits over a
+// hover/list overlay OTHER than the wrapper we're about to reposition, the
+// anchor is not our editor symbol, so we skip and leave VS Code's placement
+// (drill rule [[feedback_mouse_anchored_drill]]).
+//
+// Detection runs LIVE at reposition time (not via a stored pointer flag)
+// to stay immune to the synthetic mouseover/mouseout boundary events that
+// Chromium dispatches when a fresh hover paints under a stationary cursor:
+// walk the hit-test stack under the last pointer and report a "foreign"
+// overlay only when it is a hover/list overlay OTHER than wrapperEl. The
+// covers-cursor case (the new wrapper itself sitting under the cursor) is
+// intentionally NOT treated as foreign — that one we still symbol-anchor
+// (now via L67).
+function irPointerOverForeignHoverOverlay(wrapperEl){
+  try{
+    if(!wrapperEl||typeof document.elementsFromPoint!=='function')return false;
+    var ptr=window.__irLastPointer;
+    if(!ptr||typeof ptr.x!=='number'||typeof ptr.y!=='number')return false;
+    var stack=document.elementsFromPoint(ptr.x,ptr.y);
+    if(!stack||!stack.length)return false;
+    for(var i=0;i<stack.length;i++){
+      var el=stack[i];
+      if(!el||!el.closest)continue;
+      var overlay=el.closest('.monaco-resizable-hover')||el.closest('.monaco-hover')||el.closest('.monaco-list');
+      if(!overlay)continue;
+      // The wrapper being repositioned sitting under the cursor is the
+      // covers-cursor case, not hover-on-hover — skip it, keep walking.
+      if(overlay===wrapperEl)continue;
+      if(wrapperEl.contains&&wrapperEl.contains(overlay))continue;
+      if(overlay.contains&&overlay.contains(wrapperEl))continue;
+      return true;
+    }
+    return false;
+  }catch(_){return false;}
+}
+// L62 (2026-05-28): Initial (non-drill) hover positioning.
+// User report: hovers appear neither above nor below the symbol — they
+// cover the cursor, and large hovers extend past the VS Code window.
+// Root cause: VS Code measures hover content at a smaller size than what
+// our CSS finally expands it to (max 680px × 48vh), so its anchor calc
+// is for a hover that ends up larger; the bigger wrapper then overlaps
+// the symbol and/or spills past the viewport edge.
+//
+// Fix: anchor on the SYMBOL screen position (via __irHoverNaturalPosition
+// + editor.getScrolledVisiblePosition), prefer above-symbol placement,
+// fall back to below if above doesn't fit, else clamp to viewport. Drill
+// hovers stay mouse-anchored (separate __irPositionedOnce flag, see
+// [[feedback_mouse_anchored_drill]] memory rule). The L57 attempt used
+// mouse position and was reverted in L59 because mouse and the hovered
+// symbol can be on different tokens — using the symbol position avoids
+// that whole class of mismatches.
+function irRepositionInitialHover(editor,wrapperEl){
+  try{
+    if(!wrapperEl||!wrapperEl.getBoundingClientRect){irHERecord('initial-reposition-skip',{reason:'no-wrapper'});return;}
+    // Skip drill wrappers — drill goes through irRepositionDrilledHover*.
+    var hasBackInit=!!wrapperEl.querySelector('a[href*="previewBack"],a[data-href*="previewBack"]');
+    if(!hasBackInit){
+      try{var tInit=String(wrapperEl.textContent||'');if(tInit.indexOf('← Back')>=0)hasBackInit=true;}catch(_){}
+    }
+    if(hasBackInit)return;
+    // L69 (2026-05-29): bail out BEFORE the one-shot / anchor-moved
+    // bookkeeping while the wrapper is collapsed or mid-resize. The
+    // post-measurement transient guard below already skips placement on a
+    // collapsed wrapper, but it runs AFTER the L68 anchor-moved branch has
+    // deleted __irDesired and cleared __irInitialPositioned — so a
+    // reposition that fires during VS Code's content-swap collapse would
+    // churn our state (desired flips true->false) and re-queue retries every
+    // frame, which fed the v=221 column-collapse storm. Checking here keeps
+    // our positioning state intact until the wrapper settles.
+    // L70 (2026-05-29): "collapsed" is width<60 (16px column) OR height<20
+    // (the 2-4px bar) — the SAME contract as the style observer guard
+    // (irAttachStyleObserverToWrapper) and the column/bar detector. The
+    // earlier height<60 over-rejected normal SHORT hovers: a 670x32 one-line
+    // type hover is fully rendered, not transient, yet was never moved (v=222
+    // success min height was 94). Worse, the style observer guard uses <20,
+    // so it passed height=32 into its anchor-moved branch which called back
+    // here only to hit height<60 and skip+retry — the v=222 670x32
+    // skip-transient churn loop (23 events in one frame). Aligning both
+    // guards to height<20 breaks the loop and lets short hovers reposition.
+    var preRect=null;
+    try{preRect=wrapperEl.getBoundingClientRect();}catch(_){}
+    if(preRect&&(preRect.width<60||preRect.height<20)){
+      irHERecord('initial-reposition-skip-transient',{rawW:Math.round(preRect.width),rawH:Math.round(preRect.height),phase:'pre-oneshot'});
+      // L81: this guard is the PROVEN sighting of the content-bearing 16px pillar
+      // (RO + content-MO feed it; v=233 logged 6 rawW:16 here). Freeze the width
+      // so the sliver never paints while we wait out the transient + retry.
+      try{irMaybeFreezeCollapsedWidth(wrapperEl);}catch(_){}
+      var preRetries=(wrapperEl.__irInitReposRetries||0);
+      if(preRetries<3){
+        wrapperEl.__irInitReposRetries=preRetries+1;
+        setTimeout(function(){try{irRepositionInitialHover(editor,wrapperEl);}catch(_){}},200);
+      }
+      return;
+    }
+    // One-shot per initial hover wrapper. Separate flag from
+    // __irPositionedOnce (drill flag) so a later initial→drill content
+    // swap can still trigger the drill reposition path.
+    if(wrapperEl.__irInitialPositioned){
+      // L68: the wrapper is a reused singleton; allow re-positioning when
+      // its content swapped to a new symbol (live anchor moved). Without
+      // this the one-shot keeps the hover at the previous symbol's coords.
+      if(!irHoverAnchorMoved(wrapperEl))return;
+      try{delete wrapperEl.__irDesired;}catch(_){wrapperEl.__irDesired=undefined;}
+      wrapperEl.__irInitialPositioned=false;
+      irHERecord('initial-reposition-anchor-moved',{via:'reposition'});
+    }
+    // L66: leave hover-on-hover (nested) hovers mouse-anchored — see
+    // irPointerOverForeignHoverOverlay. Skipping here keeps the L64/L65
+    // DOM fallback from flinging the hover onto a bogus editor token that
+    // happens to sit under the source overlay.
+    if(irPointerOverForeignHoverOverlay(wrapperEl)){
+      irHERecord('initial-reposition-skip',{reason:'overlay-anchor'});
+      return;
+    }
+    // L63: prefer the editor remembered at getPosition wrap time — it
+    // is the editor that actually owns the current hover (correct
+    // column, correct viewport). The passed editor param is fallback
+    // for cases where the getPosition wrap has not fired yet.
+    var useEditor=window.__irHoverNaturalEditor||editor;
+    var anchor=window.__irHoverNaturalPosition;
+    var pos=anchor&&anchor.position?anchor.position:null;
+    var editorSrc=window.__irHoverNaturalEditor?'wrap':(editor?'arg':'none');
+    var posSrc=pos?'wrap':'none';
+    // L67 (2026-05-29): stationary-first-hover anchor recovery.
+    // irWrapHoverWidgetGetPosition only populates __irHoverNaturalPosition
+    // when VS Code itself calls the wrapped getPosition() AFTER our wrap
+    // installed. When a hover opens under an ALREADY-stationary cursor, VS
+    // Code positions the widget before the prototype-patch sniffer captures
+    // it, so the wrap lands too late, the cache stays empty, and we emit
+    // no-natural-pos — leaving the hover covering the cursor (v=219 telemetry
+    // showed this as the dominant no-natural-pos cause once hover-on-hover
+    // was ruled out). The content-hover widget is a reused singleton
+    // (window.__irCapturedHoverWidget); calling its getPosition() ourselves
+    // returns the live anchor regardless of capture timing (and back-fills
+    // the cache as a side effect of the wrap). This authoritative source is
+    // preferred over the L64/L65 pixel-under-pointer fallback below.
+    if(!pos||!useEditor||typeof useEditor.getScrolledVisiblePosition!=='function'){
+      var hw=window.__irCapturedHoverWidget;
+      if(hw&&typeof hw.getPosition==='function'){
+        try{
+          var gp=hw.getPosition();
+          if(!pos&&gp&&gp.position){pos={lineNumber:gp.position.lineNumber,column:gp.position.column};posSrc='widget';}
+        }catch(_){}
+        if((!useEditor||typeof useEditor.getScrolledVisiblePosition!=='function')&&hw._editor&&typeof hw._editor.getScrolledVisiblePosition==='function'){
+          useEditor=hw._editor;editorSrc='widget';
+        }
+      }
+    }
+    // L64: column-change fallback. When widget capture missed (common
+    // after opening a new editor column / split), __irHoverNaturalEditor
+    // and __irHoverNaturalPosition are null. Locate the host editor by
+    // finding the .monaco-editor under the last pointer, then derive
+    // the symbol target from getTargetAtClientPoint. This makes our
+    // reposition independent of the prototype-patch widget capture.
+    //
+    // L65: covers-cursor case — VS Code's natural hover wrapper has
+    // already painted ON TOP of the cursor, so elementFromPoint(x,y)
+    // returns the hover wrapper itself (no .monaco-editor ancestor) and
+    // the L64 single-element lookup fails with no-natural-pos. Walk the
+    // hit-test stack via elementsFromPoint and skip any node inside the
+    // hover/list overlays to reach the underlying editor.
+    if((!useEditor||typeof useEditor.getScrolledVisiblePosition!=='function')||!pos){
+      var ptr=window.__irLastPointer;
+      if(ptr&&typeof ptr.x==='number'&&typeof ptr.y==='number'){
+        var domEditor=null;
+        var domEd=null;
+        try{
+          var stack=(document.elementsFromPoint)?document.elementsFromPoint(ptr.x,ptr.y):[];
+          if((!stack||stack.length===0)&&document.elementFromPoint){
+            var only=document.elementFromPoint(ptr.x,ptr.y);
+            if(only)stack=[only];
+          }
+          for(var si=0;si<stack.length;si++){
+            var stEl=stack[si];
+            if(!stEl||!stEl.closest)continue;
+            // Skip hover overlays — the wrapper we're trying to relocate
+            // is the very thing covering the cursor right now.
+            if(stEl.closest('.monaco-resizable-hover'))continue;
+            if(stEl.closest('.monaco-hover'))continue;
+            if(stEl.closest('.monaco-list'))continue;
+            var maybeEd=stEl.closest('.monaco-editor');
+            if(maybeEd){domEd=maybeEd;break;}
+          }
+          if(domEd){
+            try{if(typeof irListAllCodeEditors==='function'){
+              var allEds=irListAllCodeEditors();
+              for(var aei=0;aei<allEds.length;aei++){
+                var cand=allEds[aei];
+                var cn=cand&&cand.getDomNode&&cand.getDomNode();
+                if(cn&&(cn===domEd||(cn.contains&&cn.contains(domEd)))){domEditor=cand;break;}
+              }
+            }}catch(_){}
+            if(!domEditor){try{domEditor=irFindWidgetOnElement(domEd);}catch(_){}}
+          }
+        }catch(_){}
+        if(domEditor&&typeof domEditor.getScrolledVisiblePosition==='function'){
+          if(!useEditor||typeof useEditor.getScrolledVisiblePosition!=='function'){useEditor=domEditor;editorSrc='dom';}
+          if(!pos&&typeof domEditor.getTargetAtClientPoint==='function'){
+            try{
+              var tgt=domEditor.getTargetAtClientPoint(ptr.x,ptr.y);
+              if(tgt&&tgt.position){pos={lineNumber:tgt.position.lineNumber,column:tgt.position.column};posSrc='dom-target';}
+            }catch(_){}
+          }
+        }
+      }
+    }
+    if(!useEditor||typeof useEditor.getScrolledVisiblePosition!=='function'){irHERecord('initial-reposition-skip',{reason:'no-editor'});return;}
+    if(!pos){irHERecord('initial-reposition-skip',{reason:'no-natural-pos'});return;}
+    var visible=null;
+    try{visible=useEditor.getScrolledVisiblePosition({lineNumber:pos.lineNumber,column:pos.column});}catch(_){}
+    if(!visible){irHERecord('initial-reposition-skip',{reason:'no-visible',pos:pos});return;}
+    var editorDom=useEditor.getDomNode&&useEditor.getDomNode();
+    if(!editorDom){irHERecord('initial-reposition-skip',{reason:'no-editor-dom'});return;}
+    // Some captured "editors" are inner code-block mini-editors inside
+    // hover content — their getDomNode returns an object that fails the
+    // getBoundingClientRect call. Validate before invoking so we don't
+    // throw inside the resize callback and spin retries.
+    if(typeof editorDom.getBoundingClientRect!=='function'){irHERecord('initial-reposition-skip',{reason:'no-editor-rect'});return;}
+    var editorRect=editorDom.getBoundingClientRect();
+    var symbolScreenTop=editorRect.top+visible.top;
+    var symbolScreenLeft=editorRect.left+visible.left;
+    var lineHeight=visible.height||18;
+    var wrapperRect=wrapperEl.getBoundingClientRect();
+    var rawH=wrapperRect.height;
+    var rawW=wrapperRect.width;
+    // Skip transient/mid-resize state — retry after the wrapper settles.
+    // L70: collapse = width<60 (column) || height<20 (bar); see entry guard.
+    if(rawW<60||rawH<20){
+      irHERecord('initial-reposition-skip-transient',{rawW:Math.round(rawW),rawH:Math.round(rawH)});
+      try{irMaybeFreezeCollapsedWidth(wrapperEl);}catch(_){}   // L81: hold width through the transient
+      var retries=(wrapperEl.__irInitReposRetries||0);
+      if(retries<3){
+        wrapperEl.__irInitReposRetries=retries+1;
+        setTimeout(function(){
+          try{irRepositionInitialHover(editor,wrapperEl);}catch(_){}
+        },200);
+      }
+      return;
+    }
+    wrapperEl.__irInitReposRetries=0;
+    // L81: healthy measurement on the reposition path — remember it as the
+    // last-good width so a later collapse on this wrapper can be frozen to it,
+    // independent of whether the style observer happened to fire.
+    if(!wrapperEl.__irWidthFrozen&&rawW>=60)try{wrapperEl.__irLastGoodWidth=Math.round(rawW);}catch(_){}
+    var viewportH=(window.innerHeight||document.documentElement.clientHeight||900);
+    var viewportW=(window.innerWidth||document.documentElement.clientWidth||1440);
+    var hoverH=rawH,hoverW=rawW;
+    // Prefer above the symbol; fall back to below; else clamp to viewport.
+    var topAbove=symbolScreenTop-hoverH-2;
+    var topBelow=symbolScreenTop+lineHeight+2;
+    var placement='above';
+    var top;
+    if(topAbove>=2){
+      top=topAbove;
+    }else if(topBelow+hoverH+2<=viewportH){
+      top=topBelow;placement='below';
+    }else{
+      var roomAbove=symbolScreenTop;
+      var roomBelow=viewportH-(symbolScreenTop+lineHeight);
+      if(roomAbove>=roomBelow){
+        top=Math.max(2,topAbove);placement='above-clamped';
+      }else{
+        top=topBelow;placement='below-clamped';
+      }
+      if(top<2)top=2;
+      if(top+hoverH+2>viewportH)top=Math.max(2,viewportH-hoverH-2);
+    }
+    var left=symbolScreenLeft;
+    if(left+hoverW+2>viewportW)left=viewportW-hoverW-2;
+    if(left<2)left=2;
+    var roundedTop=Math.round(top);
+    var roundedLeft=Math.round(left);
+    wrapperEl.style.top=roundedTop+'px';
+    wrapperEl.style.left=roundedLeft+'px';
+    wrapperEl.__irDesired={top:roundedTop,left:roundedLeft,at:Date.now()};
+    wrapperEl.__irInitialPositioned=true;
+    // L68: remember which symbol we positioned for, so a later content swap
+    // (new symbol in the reused wrapper) is detected by irHoverAnchorMoved.
+    // L71: also store the word RANGE so a micro-move WITHIN this symbol is
+    // not mistaken for a swap. Prefer the anchor we actually used
+    // (__irHoverNaturalPosition carries a cloned range); fall back to the
+    // live widget range. Null when neither provides one (DOM-target path).
+    var posdRange=null;
+    try{
+      var posdAnchor=window.__irHoverNaturalPosition;
+      if(posdAnchor&&posdAnchor.range){
+        posdRange={startLineNumber:posdAnchor.range.startLineNumber,startColumn:posdAnchor.range.startColumn,endLineNumber:posdAnchor.range.endLineNumber,endColumn:posdAnchor.range.endColumn};
+      }else{
+        var posdHw=window.__irCapturedHoverWidget;
+        if(posdHw&&typeof posdHw.getPosition==='function'){
+          var posdGp=posdHw.getPosition();
+          if(posdGp&&posdGp.range)posdRange={startLineNumber:posdGp.range.startLineNumber,startColumn:posdGp.range.startColumn,endLineNumber:posdGp.range.endLineNumber,endColumn:posdGp.range.endColumn};
+        }
+      }
+    }catch(_){}
+    wrapperEl.__irPositionedForPos={lineNumber:pos.lineNumber,column:pos.column,range:posdRange};
+    try{irAttachStyleObserverToWrapper(wrapperEl);}catch(_){}
+    irHERecord('initial-reposition',{
+      placement:placement,
+      editorSrc:editorSrc,posSrc:posSrc,
+      top:roundedTop,left:roundedLeft,
+      hoverW:Math.round(hoverW),hoverH:Math.round(hoverH),
+      symbolTop:Math.round(symbolScreenTop),symbolLeft:Math.round(symbolScreenLeft),
+      lineHeight:Math.round(lineHeight),
+      viewport:{w:viewportW,h:viewportH},
+      hoverRectBefore:irRectTriplet(wrapperEl)
+    });
+  }catch(err){
+    try{irHERecord('initial-reposition-error',{err:String(err).slice(0,100)});}catch(_){}
   }
 }
 try{irInstallDrillBodyObserver();}catch(_){}
@@ -2459,6 +3252,12 @@ function irWrapHoverWidgetGetPosition(widget){
       var natural=widget.__irGetPositionOrig.apply(this,arguments);
       if(natural&&natural.position){
         window.__irHoverNaturalPosition=irClonePositionForFreeze(natural);
+        // L63: remember the editor that owns this hover. Required for
+        // correct getScrolledVisiblePosition in irRepositionInitialHover
+        // — the body-MO path otherwise falls back to __irCapturedEditor
+        // which may be a stale mini-editor (captured from a code-block
+        // inside a previous hover) or wrong column's editor.
+        try{if(widget._editor)window.__irHoverNaturalEditor=widget._editor;}catch(_){}
       }
       return natural;
     }catch(_){
@@ -3873,6 +4672,58 @@ function irRememberPointerEvent(e){
       screenY:(typeof e.screenY==='number'?e.screenY:e.clientY+wsy),
       at:Date.now(),type:String(e.type||'')
     };
+    // L65: pre-cache the hover natural editor + symbol position on
+    // token-cross events (mouseover/pointerover fire on element boundary
+    // crossings, not on every pointermove). Bridges the race window
+    // where the resizable hover widget gets painted before
+    // irWrapHoverWidgetGetPosition has fired and __irHoverNaturalEditor
+    // / Position are still null — irRepositionInitialHover would
+    // otherwise fall back to the L64 DOM lookup, which itself fails
+    // when the wrapper is covering the cursor (elementFromPoint returns
+    // the wrapper). Pre-caching the editor/position at the last
+    // pre-hover mouseover sidesteps both holes.
+    irPrecacheHoverNaturalContext(e);
+  }catch(_){}
+}
+function irPrecacheHoverNaturalContext(e){
+  try{
+    var ty=String(e&&e.type||'');
+    if(ty!=='mouseover'&&ty!=='pointerover')return;
+    var tgt=e&&e.target;
+    if(!tgt||!tgt.closest)return;
+    // Skip events fired inside hover overlays — drill mouse drift would
+    // otherwise overwrite the cache with a position inside the hover
+    // wrapper instead of the editor token that triggered the hover.
+    if(tgt.closest('.monaco-resizable-hover'))return;
+    if(tgt.closest('.monaco-hover'))return;
+    if(tgt.closest('.monaco-list'))return;
+    var edEl=tgt.closest('.monaco-editor');
+    if(!edEl)return;
+    var ed=null;
+    try{
+      if(typeof irListAllCodeEditors==='function'){
+        var allEds=irListAllCodeEditors();
+        for(var ai=0;ai<allEds.length;ai++){
+          var cand=allEds[ai];
+          var cn=cand&&cand.getDomNode&&cand.getDomNode();
+          if(cn&&(cn===edEl||(cn.contains&&cn.contains(edEl)))){ed=cand;break;}
+        }
+      }
+    }catch(_){}
+    if(!ed){try{ed=irFindWidgetOnElement(edEl);}catch(_){}}
+    if(!ed||typeof ed.getTargetAtClientPoint!=='function')return;
+    var x=e.clientX, y=e.clientY;
+    if(typeof x!=='number'||typeof y!=='number')return;
+    var tgtPos=null;
+    try{tgtPos=ed.getTargetAtClientPoint(x,y);}catch(_){}
+    if(!tgtPos||!tgtPos.position)return;
+    // Widget-capture path (irWrapHoverWidgetGetPosition) will overwrite
+    // these with its own clone when getPosition() finally runs — both
+    // values agree at token granularity, so the overwrite is harmless.
+    window.__irHoverNaturalEditor=ed;
+    window.__irHoverNaturalPosition={
+      position:{lineNumber:tgtPos.position.lineNumber,column:tgtPos.position.column}
+    };
   }catch(_){}
 }
 function irDisposeActiveHoverForEditorTarget(e,reason){
@@ -4050,6 +4901,23 @@ function irHoverGuard(e){
   var editorTarget=irIsHoverRelocationEvent(e)&&irEventTargetsEditorSurface(e);
   if(editorTarget){
     var editorToken=irEventTargetTokenText(e);
+    // L73 (2026-05-29): range-based same-symbol guard. If the pointer is still
+    // inside the shown hover's anchor word RANGE, keep the hover as-is — do NOT
+    // release+refire. The release+refire paths below re-render the hover into a
+    // fresh .monaco-hover that we re-scan/re-size (reflow); that repeated reflow
+    // on micro-moves is what collapsed the wrapper width to 16px / 0x0 (v=225
+    // width-collapse-transition diag). The irHoverContainsTokenText check below
+    // missed this (the hover body need not contain the symbol name); range is
+    // authoritative and still refires on a real relocation to a different
+    // position (so no "stuck at first occurrence" regression).
+    if(irPointerWithinActiveHoverAnchor(e)){
+      irArmHoverSticky(managed,IR_HOVER_EXIT_GRACE_MS);
+      if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')&&irHoverGuardShouldLogDedup(managed,e)){
+        window.__irHoverGuardOutsideLogCount++;
+        irLog('renderer: hoverguard outside-same-anchor-pass event='+e.type+' token='+JSON.stringify(editorToken)+' managed={'+irHoverBrief(managed)+'}');
+      }
+      return;
+    }
     if(editorToken&&near&&irHoverContainsTokenText(managed,editorToken)){
       irArmHoverSticky(managed,IR_HOVER_EXIT_GRACE_MS);
       if(window.__irHoverGuardOutsideLogCount<80&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='mouseover')&&irHoverGuardShouldLogDedup(managed,e)){
@@ -5175,6 +6043,12 @@ function irHoverRootVisibility(root){
   try{
     if(!root)return {visible:false,reason:'missing'};
     if(!document.body||!document.body.contains(root))return {visible:false,reason:'detached'};
+    // L76: a wrapper we're staging is intentionally hidden by us until it
+    // settles — report it visible so the dispose / force-visible / unrenderable
+    // sweeps (all routed through this fn) leave it alone instead of fighting the
+    // staging (and disposing the about-to-show hover). irStageReveal clears the
+    // class when done; the hard-cap timer guarantees it never sticks hidden.
+    try{if(root.closest&&root.closest('.monaco-resizable-hover.ir-hover-staging'))return {visible:true,reason:'staging'};}catch(_){}
     if(irIsStaleHoverRoot(root))return {visible:false,reason:'stale'};
     var cls=root.classList;
     if(cls&&(cls.contains('hidden')||cls.contains('ir-stale-hover')))return {visible:false,reason:'hidden-class'};
@@ -5243,8 +6117,41 @@ function irForcePreviewHoverVisible(root,reason){
     try{irMakeHoverScrollable(root,false,String(root.textContent||'').length)}catch(_){}
     var visibility=irHoverRootVisibility(root);
     if(visibility&&visibility.visible){
+      try{root.__irForceZeroRectSkips=0;root.__irZeroRectTransientUntil=0;}catch(_){}
       irRememberVisibleHoverRect(root,reason||'force-visible');
       return true;
+    }
+    // L78 (2026-05-30): a force-visible that resolves to a 'zero-rect' root
+    // STILL carrying activating content is the transient collapse VS Code emits
+    // mid content-swap / link re-wrap (v=230: full-size hover → wrap 530 links
+    // → width-collapse to 0x0 → recovers in ~70ms). Returning false here is read
+    // by the revive→dispose path as a hard failure, so the hover gets RELEASED
+    // and the user sees the drilled content vanish. The L74 __irZeroRectSkips
+    // guard in irDisposeHiddenActiveHover never engages for this path: at its
+    // entry the root still reads as 'hidden-class', so its zero-rect-only match
+    // is bypassed (verified — that skip fired 0× across 28 zero-rect force-
+    // preview failures). At this single choke point all revive/preview paths
+    // funnel through: for a bounded number of attempts keep the hover un-hidden,
+    // stamp a short grace window the dispose path honours (so it will NOT
+    // release the transient), nudge a reflow re-check next frame, and report
+    // success. Counter + window reset on the next genuinely-visible measurement.
+    if(visibility&&visibility.reason==='zero-rect'&&irHoverRootHasActivatingContent(root)){
+      var fzSkips=(root.__irForceZeroRectSkips||0);
+      if(fzSkips<10){
+        root.__irForceZeroRectSkips=fzSkips+1;
+        try{root.__irZeroRectTransientUntil=Date.now()+250;}catch(_){}
+        irHERecord('force-preview-zero-rect-transient',{phase:'force-keepalive',skips:fzSkips+1,reason:String(reason||''),textLen:String(root.textContent||'').length});
+        try{
+          if(!root.__irForceZeroRectRAF){
+            root.__irForceZeroRectRAF=requestAnimationFrame(function(){
+              try{root.__irForceZeroRectRAF=0;}catch(_){}
+              try{if(document.body&&document.body.contains(root))irForcePreviewHoverVisible(root,(reason||'force')+'-zr-retry');}catch(_){}
+            });
+          }
+        }catch(_){}
+        return true;
+      }
+      try{root.__irZeroRectTransientUntil=0;}catch(_){}
     }
     if(window.__irHiddenActiveHoverLogCount<80){
       window.__irHiddenActiveHoverLogCount++;
@@ -5458,9 +6365,40 @@ function irDisposeHiddenActiveHover(reason){
     var active=window.__irActiveHoverEl;
     if(!active||!document.body||!document.body.contains(active))return false;
     var visibility=irHoverRootVisibility(active);
-    if(visibility&&visibility.visible)return false;
+    if(visibility&&visibility.visible){try{if(active.__irZeroRectSkips)active.__irZeroRectSkips=0;}catch(_){}return false;}
+    // L74 (2026-05-29): a 'zero-rect' hover (display:block + visible, but
+    // momentarily 0x0) that STILL holds substantial content is a transient
+    // layout state during VS Code's content swap — NOT a dismiss. v=226 diag:
+    // these carried textLen up to 57k, were connected+active, and recovered to
+    // full size within ~70ms; yet releasing/disposing them here kicked off a
+    // release->revive churn that flickered the hover empty (the user-reported
+    // "내용이 안보이는" / 0x0 collapse). Leave a transient zero-rect alone for a
+    // bounded number of sweeps so VS Code's own relayout wins. The counter
+    // resets the moment it becomes visible again (above); a genuinely stuck or
+    // emptied hover still falls through after the cap.
+    if(visibility&&visibility.reason==='zero-rect'&&irHoverRootHasActivatingContent(active)){
+      var zrSkips=(active.__irZeroRectSkips||0);
+      if(zrSkips<10){
+        active.__irZeroRectSkips=zrSkips+1;
+        irHERecord('hidden-active-zero-rect-skip',{skips:zrSkips+1,reason:String(reason||'')});
+        return false;
+      }
+    }
     if(irReviveRecentlyManagedHover(active,reason||'hidden-active'))return false;
     if(irReviveRecentlyAppliedHover(active,reason||'hidden-active'))return false;
+    // L78 (2026-05-30): the revive paths above route through
+    // irForcePreviewHoverVisible, which stamps __irZeroRectTransientUntil when
+    // it lands on a 0x0-but-content-present root (VS Code mid content-swap /
+    // link re-wrap). Releasing inside that grace window is exactly the drill-
+    // time "content vanishes" regression: the transient recovers to full size
+    // on its own (~70ms) once VS Code relayouts, and force-preview already left
+    // it un-hidden — so holding here is enough to let it reappear. Bounded by
+    // the grace window + the force-preview skip counter; a genuinely stuck
+    // hover still falls through to release once both lapse.
+    if(active.__irZeroRectTransientUntil&&Date.now()<active.__irZeroRectTransientUntil&&irHoverRootHasActivatingContent(active)){
+      irHERecord('force-preview-zero-rect-transient',{phase:'dispose-hold',reason:String(reason||'')});
+      return false;
+    }
     if(irReleaseNativeHiddenHover(active,'hidden-active-'+(reason||''),visibility&&visibility.reason))return true;
     if(window.__irHiddenActiveHoverLogCount<80){
       window.__irHiddenActiveHoverLogCount++;
@@ -5881,6 +6819,11 @@ function irScanNarrowHoverWrappers(reason){
       var cwWrap=cwWraps[cwI];
       var cwStyle=cwWrap&&cwWrap.style?cwWrap.style:null;
       if(cwStyle&&(cwStyle.display==='none'||cwStyle.visibility==='hidden'))continue;
+      // L80: a frozen wrapper is being held at its last-good width by a min-width
+      // floor (proactive width-freeze); its rect is >=60 so it won't match the
+      // column test below anyway, but skip explicitly so the reactive restore
+      // never strips the floor mid-hold.
+      if(cwWrap.__irWidthFrozen)continue;
       var cwRect=cwWrap.getBoundingClientRect?cwWrap.getBoundingClientRect():null;
       if(!cwRect)continue;
       var cwIsColumn=cwRect.width<60&&cwRect.height>40;
@@ -5910,8 +6853,17 @@ function irScanNarrowHoverWrappers(reason){
         wrapPositionedOnce:!!cwWrap.__irPositionedOnce,
         wrapHasDesired:!!cwWrap.__irDesired,
         innerTextLen:cwInnerText.length,
-        innerClasses:cwInnerClasses
+        innerClasses:cwInnerClasses,
+        msSincePointWrap:window.__irLastPointWrapAt?(Date.now()-window.__irLastPointWrapAt):-1,
+        msSinceWrap:window.__irLastWrapAt?(Date.now()-window.__irLastWrapAt):-1
       });
+      // L81: backstop freeze on the sweep — the MOST-proven sighting of the 16px
+      // pillar (v=233: column-wrapper-detected w:16 ×15). Freezing holds the width
+      // immediately; once frozen the wrapper measures >=60 so the top-of-loop
+      // __irWidthFrozen guard skips it next pass (no conflict with L79 restore). No
+      // freeze without a known-good width, so a never-healthy wrapper still falls
+      // through to L79 restore / class-strip below.
+      if(cwShape==='column')irMaybeFreezeCollapsedWidth(cwWrap);
       var cwInnerHasOurClasses=cwInnerClasses.some(function(c){
         return c==='ir-keepalive'||c==='ir-sticky'||c==='ir-scrollable';
       });
@@ -5921,22 +6873,57 @@ function irScanNarrowHoverWrappers(reason){
         if(!cwSeenAt||cwAgeMs<200){
           try{cwWrap.__irColumnSeenAt=Date.now();}catch(_){}
         }else{
-          try{
-            if(cwInner&&cwInner.classList){
-              cwInner.classList.remove(
-                'ir-keepalive','ir-sticky','ir-scrollable',
-                'ir-size-small','ir-size-medium','ir-size-large',
-                'ir-empty-hover-root','ir-native-released-hover'
-              );
-            }
-          }catch(_){}
-          try{delete cwWrap.__irColumnSeenAt;}catch(_){cwWrap.__irColumnSeenAt=0;}
-          irHERecord('column-wrapper-cleaned',{
-            sweepReason:String(reason||''),
-            shape:cwShape,
-            ageMs:cwAgeMs,
-            removedInnerClasses:cwInnerClasses
-          });
+          // L79 (2026-05-30): a PERSISTENT column pillar (≥200ms, 2-pass) that
+          // still holds content is a LIVE hover VS Code stuck at scrollbar width
+          // — inline width:16px overrides the stylesheet min(max-content,680px),
+          // so it never self-recovers (v231 timeline: pillars stuck 5.5s and up
+          // to 16.7s as a 16px vertical sliver while wrapDisplay=block, content
+          // present). The original remedy below (strip our keepalive classes)
+          // abandons a live hover WITHOUT restoring its width — the user keeps
+          // seeing the sliver. For a content-bearing column, clear the stuck
+          // inline width ONCE so the stylesheet re-expands it. One-shot per
+          // collapse episode (__irColumnWidthRestored, cleared by the style
+          // observer on the to:normal transition) so we never fight VS Code's
+          // resize frame-by-frame; an empty/stale shell, a horizontal bar, or a
+          // pillar that re-collapses within 1s of a restore falls through to the
+          // class-strip. Clearing width (not re-pinning top/left) avoids the
+          // v=221 position-loop regression L69 guards against.
+          var cwHasContent=String(cwInnerText||'').trim().length>0;
+          var cwRestoredRecently=cwWrap.__irColumnWidthRestored&&(Date.now()-cwWrap.__irColumnWidthRestored<1000);
+          if(cwShape==='column'&&cwHasContent&&!cwRestoredRecently){
+            var cwClearedW=cwStyle?String(cwStyle.width||''):'';
+            try{
+              cwWrap.style.removeProperty('width');
+              cwWrap.style.removeProperty('min-width');
+            }catch(_){}
+            try{cwWrap.__irColumnWidthRestored=Date.now();}catch(_){}
+            try{delete cwWrap.__irColumnSeenAt;}catch(_){cwWrap.__irColumnSeenAt=0;}
+            irHERecord('column-wrapper-width-restored',{
+              sweepReason:String(reason||''),
+              shape:cwShape,
+              ageMs:cwAgeMs,
+              innerTextLen:String(cwInnerText||'').length,
+              clearedInlineW:cwClearedW,
+              inlineMaxW:cwStyle?String(cwStyle.maxWidth||''):''
+            });
+          }else{
+            try{
+              if(cwInner&&cwInner.classList){
+                cwInner.classList.remove(
+                  'ir-keepalive','ir-sticky','ir-scrollable',
+                  'ir-size-small','ir-size-medium','ir-size-large',
+                  'ir-empty-hover-root','ir-native-released-hover'
+                );
+              }
+            }catch(_){}
+            try{delete cwWrap.__irColumnSeenAt;}catch(_){cwWrap.__irColumnSeenAt=0;}
+            irHERecord('column-wrapper-cleaned',{
+              sweepReason:String(reason||''),
+              shape:cwShape,
+              ageMs:cwAgeMs,
+              removedInnerClasses:cwInnerClasses
+            });
+          }
         }
       }
       break;
@@ -6587,6 +7574,9 @@ function irWrapWordAtPoint(e){
   if(span){
     irSetPointActiveLink(span);
     irMarkHoverManaged(hover,true);
+    // L72 diag: stamp so width-collapse-transition can correlate a collapse
+    // with a just-fired point-wrap (def-lookup) re-render.
+    try{window.__irLastPointWrapAt=Date.now();}catch(_){}
     if(window.__irPointWrapLogCount<20){
       window.__irPointWrapLogCount++;
       irLog('renderer: point-wrap "'+info.word+'" event='+(e&&e.type||'')+' hasCandidates='+hasCandidateSet+' known='+candidateKnown+' lower='+lowerCallable+' decorator='+decoratorContext+' blockText='+(block?String(block.textContent||'').length:0)+' hoverRect='+irRectBrief(hover));
@@ -8308,7 +9298,17 @@ window.irShowHoverFallback=function(identifier,md,opts){
 };
 
 var irLastContainerCount=0;
-var IR_HOVER_DOM_DEDUPE_ENABLED=true;
+// L75 (2026-05-29): TEMPORARILY DISABLED to test the user's hypothesis that
+// the DOM dedupe is the root cause of the size-collapse / content-truncation /
+// "내용 안보임". irDedupeHoverContent runs inside the scan AFTER sizing: it
+// (a) runs 5 regexes over each block's FULL textContent (up to ~57k chars) on
+// every scan pass — a freeze on large hovers re-scanned in the MutationObserver
+// loop, (b) REMOVES duplicate .rendered-markdown blocks (can eat content), and
+// (c) shrinks the wrapper + rewrites __irDesired afterward (irKeepMouseInside-
+// WrapperAfterDedupe), fighting the size we just determined. Flip back to true
+// to re-enable. If the test confirms dedupe is the cause, the real fix is to
+// dedupe BEFORE paint / once per content (not every scan) rather than off.
+var IR_HOVER_DOM_DEDUPE_ENABLED=false;
 
 function irNormalizeHoverDedupeText(text){
   return String(text||'')
@@ -8616,6 +9616,19 @@ function irScanRenderedMarkdown(){
     var types=irCollectHoverLinkNames(candidateText,skip,deferEagerWrap);
     irSetHoverLinkCandidates(block,types);
     block.__irLastScanText=text;
+    // L77 (2026-05-29): defer the heavy navigable-name wrapping while this hover
+    // is staging (hidden & forming). Inserting the .ir-type-link spans (hundreds
+    // on a large hover — v=229 saw wrapped=553) is a big reflow that, together
+    // with the scan/size feedback loop, churns the wrapper into the width-
+    // collapse and stops it settling inside the 500ms staging budget (v=229: 81%
+    // revealed at budget, often still collapsed). makeScrollable (sizing) has
+    // already run above, so the hover still settles to size; irStageReveal then
+    // schedules a scan to wrap the now-shown, stable hover. Wrapping leaves
+    // textContent unchanged, so the post-reveal wrap never re-stages.
+    if(block.closest&&block.closest('.monaco-resizable-hover.ir-hover-staging')){
+      block.__irWrapDeferred=true;
+      continue;
+    }
     var existingLinks=block.querySelectorAll?block.querySelectorAll('.ir-type-link').length:0;
     if(window.__irScanLogCount<20&&(text.length>800||types.length||existingLinks)){
       window.__irScanLogCount++;
@@ -8716,6 +9729,10 @@ function irScanRenderedMarkdown(){
         irSetActiveHoverLayer(hoverHost);
       }
     }
+    // L72 diag: stamp so width-collapse-transition can correlate a collapse
+    // with our just-completed navigable-name wrapping (DOM rewrite of the
+    // hover content, a candidate trigger for VS Code's relayout collapse).
+    if(wrappedCount>0){try{window.__irLastWrapAt=Date.now();}catch(_){}}
     if(window.__irWrapLogCount<20&&(wrappedCount>0||types.length>0)){
       window.__irWrapLogCount++;
       irLog('renderer: wrap text='+text.length+' types='+types.length+' wrapped='+wrappedCount+' sample='+types.slice(0,10).join(','));
@@ -8778,6 +9795,10 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
     if(seenHovers&&seenHovers.has(hover))return;
     if(seenHovers)seenHovers.add(hover);
     irTouchHoverRootContent(hover,reason,el?(el.textContent||''):null);
+    // L76: content changed in this hover — stage it (hide until settled) so the
+    // formation flicker isn't shown. Idempotent: irStageHover no-ops if this
+    // exact content is already staging or already revealed.
+    try{var stWrap=hover.closest&&hover.closest('.monaco-resizable-hover');if(stWrap)irStageHover(stWrap);}catch(_){}
   }
   for(var mi=0;mi<muts.length;mi++){
     var mut=muts[mi];

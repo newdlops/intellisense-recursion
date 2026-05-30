@@ -5067,12 +5067,21 @@ suite('Hover Renderer E2E', () => {
       `First sweep on a column wrapper must NOT strip ir-keepalive (2-pass gate). ${JSON.stringify(gate?.column)}`);
     assert.ok(gate?.column?.first?.seenAt > 0,
       `First sweep on a column wrapper must mark __irColumnSeenAt. ${JSON.stringify(gate?.column)}`);
-    assert.strictEqual(gate?.column?.second?.hasKeepalive, false,
-      `Second sweep ≥200ms later on a still-column wrapper must strip ir-keepalive. ${JSON.stringify(gate?.column)}`);
-    assert.strictEqual(gate?.column?.second?.hasSticky, false,
-      `Second sweep on a still-column wrapper must strip ir-sticky. ${JSON.stringify(gate?.column)}`);
-    assert.strictEqual(gate?.column?.second?.hasScrollable, false,
-      `Second sweep on a still-column wrapper must strip ir-scrollable. ${JSON.stringify(gate?.column)}`);
+    assert.strictEqual(gate?.column?.first?.widthRestored, false,
+      `First sweep on a column wrapper must NOT remediate yet (2-pass gate). ${JSON.stringify(gate?.column)}`);
+    // L79 (2026-05-30): a persistent CONTENT-bearing 16px column is a live hover
+    // VS Code stuck at scrollbar width — the 2-pass gate now RESTORES its width
+    // (clears the stuck inline width so the stylesheet re-expands it) instead of
+    // stripping our keepalive and abandoning the hover. So the second sweep must
+    // record a width-restore and clear the inline width while the hover stays
+    // alive (keepalive preserved). (Empty shells / bars still fall to class-strip
+    // — see the bar assertions below, which are unchanged.)
+    assert.strictEqual(gate?.column?.second?.widthRestored, true,
+      `Second sweep ≥200ms later on a still-column wrapper must width-restore (L79). ${JSON.stringify(gate?.column)}`);
+    assert.strictEqual(gate?.column?.second?.inlineWidth, '',
+      `Second sweep must clear the stuck inline width so the stylesheet re-expands it (L79). ${JSON.stringify(gate?.column)}`);
+    assert.strictEqual(gate?.column?.second?.hasKeepalive, true,
+      `Second sweep must PRESERVE the live hover (width-restored, not abandoned) (L79). ${JSON.stringify(gate?.column)}`);
     assert.strictEqual(gate?.bar?.first?.hasKeepalive, true,
       `First sweep on a bar wrapper must NOT strip ir-keepalive (2-pass gate). ${JSON.stringify(gate?.bar)}`);
     assert.ok(gate?.bar?.first?.seenAt > 0,
@@ -5081,10 +5090,19 @@ suite('Hover Renderer E2E', () => {
       `Second sweep on a still-bar wrapper must strip ir-keepalive (L54 bar detection). ${JSON.stringify(gate?.bar)}`);
     assert.strictEqual(gate?.transient?.first?.hasKeepalive, true,
       `Transient single-sweep column must keep its ir-keepalive — VS Code hover initial paint passes through 16px width briefly and the 2-pass gate must not kill it. ${JSON.stringify(gate?.transient)}`);
+    // L81: the freeze must actually engage. L80 hooked the style observer, which
+    // never witnessed the COMPUTED 16px collapse (v=233: 0 width-freeze events),
+    // so the proactive freeze was dead code. This drives the proven sweep path
+    // and asserts the wrapper gets a min-width floor at its last-good width.
+    assert.strictEqual(gate?.freeze?.frozen, true,
+      `Freeze gate: a content column with a known last-good width must be width-frozen by the sweep (L81 engagement). ${JSON.stringify(gate?.freeze)}`);
+    assert.strictEqual(gate?.freeze?.minWidth, '600px',
+      `Freeze gate: the min-width floor must equal the last-good width. ${JSON.stringify(gate?.freeze)}`);
 
-    console.log(`  column/bar gate: col[clean=${!gate?.column?.second?.hasKeepalive}], `
+    console.log(`  column/bar gate: col[widthRestored=${gate?.column?.second?.widthRestored}], `
       + `bar[clean=${!gate?.bar?.second?.hasKeepalive}], `
-      + `trans[preserved=${gate?.transient?.first?.hasKeepalive}]`);
+      + `trans[preserved=${gate?.transient?.first?.hasKeepalive}], `
+      + `freeze[frozen=${gate?.freeze?.frozen}, minW=${gate?.freeze?.minWidth}]`);
   });
 });
 
