@@ -17,7 +17,7 @@
 // Cross-module dependencies: none. The string is opaque to TS — embedded
 // JS comments / banners inside it are NOT TS structure.
 
-export const RENDERER_PATCH_VERSION = 270;
+export const RENDERER_PATCH_VERSION = 271;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -434,14 +434,21 @@ style.textContent=[
   // footprint. Either way, drilled hover never grows BIGGER than the
   // initial. Inner .monaco-hover and .monaco-scrollable-element track
   // the wrapper with the usual 2/4px insets.
-  // Drill hover scales with content up to 48vh (same as initial). For
-  // small drill content (single fn), wrapper stays compact via
-  // height:max-content. For large content (Company-scale class), wrapper
-  // grows to 48vh and scrolls internally — previously hard-clamped at
-  // 162px which cut off most of the content.
-  '.monaco-resizable-hover:has(a[href*="previewBack"]),.monaco-resizable-hover:has(a[data-href*="previewBack"]){max-height:var(--ir-drill-max-h,48vh) !important}',
-  '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-hover,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-hover{max-height:calc(var(--ir-drill-max-h,48vh) - 2px) !important}',
-  '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-scrollable-element,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-scrollable-element{max-height:calc(var(--ir-drill-max-h,48vh) - 4px) !important}',
+  // L104b (2026-06-01): drill hover must size IDENTICALLY to the first hover —
+  // VS Code owns the box height, host follows the wrapper, scroller flex-fills.
+  // (cf. [[feedback_vscode_owns_hover_height]].) The OLD drill rules below capped
+  // the host at 48vh minus 2px (decoupled from the wrapper). In the v270 native model
+  // the wrapper is pinned by VS Code (~250px), so a host capped at 48vh GREW to
+  // the content (measured hostH=511) and OVERFLOWED the 250px wrapper → its
+  // scrollbar + bottom ran off-screen (the user's drill scroll-mismatch report).
+  // FIX: cap the drill host at the WRAPPER (max-height:100%, same as rule 370 for
+  // the first hover) and let the scroller flex-fill (max-height:none, same as the
+  // base scroller rule). Now drill == first hover: box stays VS Code's height,
+  // content scrolls inside. (--ir-drill-max-h is dead — its JS setter is disabled
+  // — so the old var() fallback was always plain 48vh anyway.)
+  '.monaco-resizable-hover:has(a[href*="previewBack"]),.monaco-resizable-hover:has(a[data-href*="previewBack"]){max-height:48vh !important}',
+  '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-hover,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-hover{max-height:100% !important}',
+  '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-scrollable-element,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-scrollable-element{max-height:none !important}',
   // L47: native virtual list for large hover bodies. content-visibility:
   // auto makes the brower skip layout+paint for off-screen .rendered-
   // markdown blocks (and their descendants) — turning a 57K-char drill
