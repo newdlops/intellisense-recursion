@@ -17,6 +17,7 @@ import {
   identifierWordRegex,
   HOVER_NEARBY_SYMBOL_COLUMN_RADIUS,
   HOVER_NOISY_IDENTIFIER_MAX_LENGTH,
+  IR_VTAIL_MODE,
   DEFINITION_PREVIEW_FALLBACK_LINES,
   DEFINITION_PREVIEW_SAFETY_MAX_LINES,
   DEFINITION_PREVIEW_VALUE_MAX_LINES,
@@ -1400,10 +1401,21 @@ function findSharedHoverService(): any | null {
 // markdown renderer and is found by renderer-patch, BEFORE step 2 head-splits to send
 // VS Code just the head. Single main-renderer (mainWsRef) path; multi-window later.
 // Ext-host change → needs a window reload to take effect.
+// L88 (2026-05-31): vtail mode switch — the overlay work is preserved, native is added.
+// 'overlay' = head-split + windowed virtual scroller (fast, but the custom overlay fights the
+// reused-hover lifecycle and drilled/force-preview hovers bypass it). 'native' = send the FULL
+// preview to VS Code's native hover (stable, highlighted, and our scan makes it drillable
+// everywhere — drill chains included), accepting the native render cost. IR_VTAIL_MODE is
+// imported from ./util (shared with preview-builder, which skips the L84 split in native mode).
+let irVtailModeLogged = false;
 const IR_VTAIL_THRESHOLD = 8000;
 let irVtailCounter = 0;
 async function irStashLargePreviewForChannelTest(previews: string): Promise<string> {
   try {
+    if (IR_VTAIL_MODE === 'native') {
+      if (!irVtailModeLogged) { irVtailModeLogged = true; log.info('[hover] vtail mode=native (overlay disabled; full native render + scan drill)'); }
+      return previews;   // native: VS Code renders the full preview; the scan wraps drill links
+    }
     if (!previews || previews.length < IR_VTAIL_THRESHOLD) { return previews; }
     if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) { return previews; }
     const id = 'v' + (++irVtailCounter);

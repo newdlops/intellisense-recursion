@@ -110,3 +110,9 @@ export const DEFINITION_PREVIEW_VALUE_MAX_LINES = 600;
 // during synchronous render). Full content + code-block layout preserved; only the
 // scrolled-out tail loses colour. Tunable.
 export const HOVER_HIGHLIGHT_MAX_LINES = 120;
+// L88 (2026-05-31): vtail render mode (shared by extension.ts + preview-builder.ts).
+// 'overlay' = head-split + windowed virtual scroller (fast but the custom overlay fights the
+// reused-hover lifecycle and drilled hovers bypass it; tail is plain). 'native' = full preview
+// to VS Code's native hover, FULLY syntax-highlighted (no L84 head/tail split), scan-drillable
+// everywhere, accepting VS Code's native render cost on big hovers. Flip to compare.
+export const IR_VTAIL_MODE: 'native' | 'overlay' = 'native';

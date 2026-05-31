@@ -17,7 +17,7 @@
 // Cross-module dependencies: none. The string is opaque to TS — embedded
 // JS comments / banners inside it are NOT TS structure.
 
-export const RENDERER_PATCH_VERSION = 246;
+export const RENDERER_PATCH_VERSION = 248;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -1317,7 +1317,15 @@ function irHoverContentSig(wrapperEl){
     return t.length+':'+t.slice(0,40)+':'+t.slice(-20);
   }catch(_){return '';}
 }
+// L89 (2026-05-31): native-hover restoration switch. When true, the renderer-patch
+// stops "adopting" VS Code's hover — no staging, no ir-keepalive/ir-sticky, no forced
+// sizing/scroll tier, no width-freeze. VS Code's own native hover shows/positions/
+// dismisses it; we only (a) let the patched $provideHover attach our markdown (extension
+// side, IR_VTAIL_MODE='native') and (b) wrap navigable type names for drill. Flip to
+// false to restore the full managed behaviour (L48-L88).
+var IR_HOVER_NATIVE_ONLY=true;
 function irStageHover(wrapperEl){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L89: native hover shows immediately (no staging)
   try{
     if(!wrapperEl||!wrapperEl.classList)return;
     var sig=irHoverContentSig(wrapperEl);
@@ -1495,6 +1503,7 @@ function irScheduleWidthFreezeReleaseCheck(wrapperEl){
   raf(check);
 }
 function irFreezeWidth(wrapperEl,floorW){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L89: no width-freeze on native hover
   if(!wrapperEl||wrapperEl.__irWidthFrozen)return;
   var w=Math.round(floorW);
   if(!(w>=60))return;
@@ -4356,6 +4365,7 @@ function irHoverHasManagedContent(hoverEl){
   return !!hoverEl.querySelector('.ir-applied,.ir-type-link');
 }
 function irArmHoverSticky(hoverEl, ms){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L89: native hover uses VS Code's own sticky behaviour
   if(!hoverEl||!hoverEl.classList)return;
   hoverEl.classList.add('ir-sticky');
   hoverEl.__irStickyUntil=Date.now()+ms;
@@ -4547,6 +4557,7 @@ function irReleaseNativeHoverManagement(hoverEl,reason){
   return true;
 }
 function irMarkHoverManaged(hoverEl, sticky){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L89: no keepalive/sticky in native-hover mode
   if(!hoverEl||!hoverEl.classList)return;
   hoverEl.classList.add('ir-keepalive');
   irEnsureHoverPointer(hoverEl);
@@ -8155,6 +8166,7 @@ track(window,'click',irBackControlClick,true);
 track(document,'click',irBackControlClick,true);
 
 function irMakeHoverScrollable(hoverEl, resetScroll, fallbackTextLength){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L89: keep VS Code's native hover sizing/scroll
   if(!hoverEl)return;
   try{
     // L31: throttle entire-body executions. A drill mutation burst calls
@@ -9598,7 +9610,7 @@ function irEnsureHoverScrollListener(hoverHost){
 // -- a later refinement re-scans the visible window for navigable type names).
 function irRenderVtailWindowed(block,tailText,id){
   try{
-    var lines=tailText.split('\n');
+    var lines=tailText.split('\\n');
     var total=lines.length;
     var scroller=(block.closest&&(block.closest('.monaco-scrollable-element')||block.closest('.monaco-hover')))||block.parentElement;
     if(!scroller)return;
@@ -9611,7 +9623,7 @@ function irRenderVtailWindowed(block,tailText,id){
     block.appendChild(wrap);
     // measure line height from a few probe lines (padding is 0 so height/N is the row height)
     var probeN=Math.min(5,total)||1;
-    winCode.textContent=lines.slice(0,probeN).join('\n')||' ';
+    winCode.textContent=lines.slice(0,probeN).join('\\n')||' ';
     var lh=18;try{var h=win.getBoundingClientRect().height;if(h>0)lh=h/probeN;}catch(_){}
     if(!(lh>=6&&lh<=60))lh=18;
     var BUFFER=12;var lastS=-1,lastE=-1;
@@ -9629,7 +9641,7 @@ function irRenderVtailWindowed(block,tailText,id){
         if(end<start)end=start;
         if(start===lastS&&end===lastE)return;
         lastS=start;lastE=end;
-        winCode.textContent=lines.slice(start,end).join('\n');
+        winCode.textContent=lines.slice(start,end).join('\\n');
         topSp.style.height=Math.round(start*lh)+'px';
         botSp.style.height=Math.round(Math.max(0,total-end)*lh)+'px';
       }catch(_){}
@@ -9714,7 +9726,7 @@ function irScanRenderedMarkdown(){
     var blockSig=(block.childElementCount||0)+':'+
       (block.firstElementChild?block.firstElementChild.nodeName:'_')+':'+
       (block.lastElementChild?block.lastElementChild.nodeName:'_');
-    if(block.__irLastScanSig===blockSig && block.querySelector('.ir-type-link')){
+    if(block.__irLastScanSig===blockSig && block.querySelector('.ir-type-link') && !block.__irViewportWrap){
       continue;
     }
     var text=block.textContent||'';
@@ -9742,7 +9754,7 @@ function irScanRenderedMarkdown(){
     if(text.length>=3){
       irMakeHoverScrollable(hoverHost, false, text.length);
     }
-    if(block.__irLastScanText===text&&(hasTypeLinks||text.length>IR_HOVER_EAGER_WRAP_MAX_TEXT)){
+    if(block.__irLastScanText===text&&!block.__irViewportWrap&&(hasTypeLinks||text.length>IR_HOVER_EAGER_WRAP_MAX_TEXT)){
       if(irInterestingHoverScanText(text)){
         irLogHoverScanDecision('skip-same-text',block,hoverHost,text,'',[], 'hasTypeLinks='+hasTypeLinks+' eagerTooLarge='+(text.length>IR_HOVER_EAGER_WRAP_MAX_TEXT));
       }
@@ -9791,13 +9803,23 @@ function irScanRenderedMarkdown(){
       irLogHoverScanDecision('skip-no-types',block,hoverHost,text,candidateText,types,'defer='+deferEagerWrap);
       continue;
     }
-    if(deferEagerWrap){
-      if(window.__irWrapLogCount<20){
-        window.__irWrapLogCount++;
-        irLog('renderer: defer wrap text='+text.length+' types='+types.length+' existing='+existingLinks+' sample='+types.slice(0,10).join(','));
-      }
-      irLogHoverScanDecision('skip-defer-wrap',block,hoverHost,text,candidateText,types,'existing='+existingLinks);
-      continue;
+    // L88 (2026-05-31): big hovers (native mode sends the FULL preview, not a 120-line
+    // head) exceed the eager-wrap budget. The old code skipped wrapping ENTIRELY here
+    // (continue) -> native hovers got zero .ir-type-link spans -> drilldown was dead in
+    // native mode. Instead fall through and wrap ONLY the text nodes currently in the
+    // hover viewport (+margin, pre-filtered below); the off-screen remainder is wrapped
+    // lazily on scroll (irEnsureHoverScrollListener re-fires the scan, and the
+    // __irViewportWrap flag set after the wrap bypasses the same-text/same-sig skips so
+    // newly-scrolled-in rows get wrapped too). Per-pass reflow stays bounded to ~one
+    // screenful, avoiding the hundreds-of-spans synchronous reflow L77 guarded against,
+    // while restoring the drill-link affordance everywhere in native mode.
+    var vpLimit=deferEagerWrap;
+    if(vpLimit&&window.__irWrapLogCount<20){
+      window.__irWrapLogCount++;
+      irLog('renderer: viewport-wrap text='+text.length+' types='+types.length+' existing='+existingLinks+' sample='+types.slice(0,10).join(','));
+    }
+    if(vpLimit){
+      irLogHoverScanDecision('viewport-wrap',block,hoverHost,text,candidateText,types,'existing='+existingLinks);
     }
     var linkRe=irBuildHoverLinkRegex(types);
     if(!linkRe){
@@ -9807,6 +9829,30 @@ function irScanRenderedMarkdown(){
     var walker=document.createTreeWalker(block,NodeFilter.SHOW_TEXT);
     var node,textNodes=[];
     while(node=walker.nextNode()){textNodes.push(node)}
+    // L88 viewport pre-filter: when vpLimit (big native hover) keep only text nodes whose
+    // parent box intersects [hostTop-300, hostBottom+300] in screen coords. All rect READS
+    // happen HERE, before any wrapping WRITE below, so there is no per-node read/write
+    // layout thrash. A node below the band ends the pass (text-node order is vertical
+    // within the code block); a 2000-node cap bounds the not-yet-laid-out fallback.
+    if(vpLimit){
+      var _vpTop=-1e9,_vpBot=1e9;
+      if(hoverHost&&hoverHost.getBoundingClientRect){
+        try{var _hbr=hoverHost.getBoundingClientRect();if(_hbr.height>=10){_vpTop=_hbr.top-300;_vpBot=_hbr.bottom+300;}}catch(_){}
+      }
+      var _vis=[];
+      for(var _vi=0;_vi<textNodes.length;_vi++){
+        var _vn=textNodes[_vi];if(!_vn||!_vn.parentNode)continue;
+        var _vpe=_vn.parentElement||_vn.parentNode;
+        var _vpr=(_vpe&&_vpe.getBoundingClientRect)?_vpe.getBoundingClientRect():null;
+        if(_vpr&&(_vpr.width||_vpr.height)){
+          if(_vpr.bottom<_vpTop)continue;
+          if(_vpr.top>_vpBot)break;
+        }
+        _vis.push(_vn);
+        if(_vis.length>=2000)break;
+      }
+      textNodes=_vis;
+    }
     var wrappedCount=0;
     var wc=/[a-zA-Z0-9_]/;
     for(var tn=0;tn<textNodes.length;tn++){
@@ -9870,6 +9916,10 @@ function irScanRenderedMarkdown(){
         }catch(e2){irLog('renderer: wrap error "'+rep.type+'": '+e2.message)}
       }
     }
+    // L88: mark big hovers as viewport-limited so the same-text/same-sig skips above are
+    // bypassed on the next (scroll-triggered) scan, letting newly-visible rows wrap. Small
+    // hovers (vpLimit=false) clear the flag and keep the normal full-wrap-once behaviour.
+    block.__irViewportWrap=vpLimit;
     if(wrappedCount>0){
       irRefreshTypeLinkGeometry(block,'wrap-result');
       irMarkHoverManaged(hoverHost,true);
@@ -9888,7 +9938,7 @@ function irScanRenderedMarkdown(){
       irLog('renderer: wrap text='+text.length+' types='+types.length+' wrapped='+wrappedCount+' sample='+types.slice(0,10).join(','));
     }
     if(wrappedCount===0||irInterestingHoverScanText(text)||irInterestingHoverScanText(candidateText)){
-      irLogHoverScanDecision('wrap-result',block,hoverHost,text,candidateText,types,'wrapped='+wrappedCount+' nodes='+textNodes.length);
+      irLogHoverScanDecision('wrap-result',block,hoverHost,text,candidateText,types,'wrapped='+wrappedCount+' nodes='+textNodes.length+(vpLimit?' vpwrap=1':''));
     }
     if(text.length>4000) irMakeHoverScrollable(hoverHost, false, text.length);
   }

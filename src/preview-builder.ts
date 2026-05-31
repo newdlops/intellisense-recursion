@@ -26,6 +26,7 @@ import {
   DEFINITION_PREVIEW_FALLBACK_LINES,
   DEFINITION_PREVIEW_SAFETY_MAX_LINES,
   HOVER_HIGHLIGHT_MAX_LINES,
+  IR_VTAIL_MODE,
 } from './util';
 import {
   SKIP_WORDS,
@@ -193,6 +194,9 @@ export function rememberPreviewLocations(
 // the highlight boundary. Deterministic (same code → same split), so block dedupe
 // keys stay stable.
 function renderPreviewCodeFences(lang: string, code: string): string {
+  if (IR_VTAIL_MODE === 'native') {
+    return `\`\`\`${lang}\n${code}\n\`\`\``;   // native: one fully-highlighted fence (no L84 head/tail split)
+  }
   const lines = code.split('\n');
   if (lines.length <= HOVER_HIGHLIGHT_MAX_LINES) {
     return `\`\`\`${lang}\n${code}\n\`\`\``;
