@@ -1768,7 +1768,16 @@ function patchSharedService(service: any) {
     const hoveredCandidate = hoverWordCandidateAt(hoverDocForCandidate, hoverApiPos);
     const anchorForCache = hoveredCandidate?.anchor ?? hoverApiPos;
     const posKey = `${uri?.path || uri}:${anchorForCache.line}:${anchorForCache.character}`;
-    const deliveryGroupKey = hoverRequestKey;
+    // L102 (2026-05-31): key preview-delivery dedup by the WORD-anchored posKey,
+    // not the exact-char hoverRequestKey. Intra-word mouse drift changes the char and
+    // VS Code re-calls $provideHover; an exact-char key made every drift a NEW delivery
+    // group -> re-deliver -> delivered content oscillated 57638<->59293 -> VS Code
+    // re-rendered the ~58997-char preview (1164ms tokenize + renderer scan storm). The
+    // word-anchored key folds all drift within one word into one delivery group, so
+    // delivery stays consistent. The renderer already fixed the same range-vs-column
+    // bug on its side (L71); this is the extension-side analog.
+    // cf. project_hover_rerender_exact_position_key memory.
+    const deliveryGroupKey = posKey;
     if (hoveredCandidate) {
       setLastHoverFetchPosition({
         uri: docUri,
@@ -1784,7 +1793,7 @@ function patchSharedService(service: any) {
     const postNativeT0 = Date.now();
     if (hoverResultText(result).includes(IR_DIRECT_HOVER_MARKER)) { return result; }
     const primaryHoverHandle = hoveredCandidate
-      ? hoverPreviewPrimaryHandleAllowed(hoverRequestKey, handle)
+      ? hoverPreviewPrimaryHandleAllowed(posKey, handle)   // L102: word-anchored key (same rationale as deliveryGroupKey) so intra-word drift keeps one stable primary handle instead of re-allocating per char
       : true;
     if (!result?.contents?.length && hoveredCandidate && !primaryHoverHandle) {
       return null;

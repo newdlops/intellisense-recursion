@@ -17,11 +17,20 @@
 // Cross-module dependencies: none. The string is opaque to TS — embedded
 // JS comments / banners inside it are NOT TS structure.
 
-export const RENDERER_PATCH_VERSION = 248;
+export const RENDERER_PATCH_VERSION = 270;
 
 export function getHoverPatchScript(): string {
   return `(function(){
 var IR_PATCH_VERSION = ${RENDERER_PATCH_VERSION};
+// L89/L91 (2026-05-31): native-hover restoration master switch. MUST be assigned HERE at the
+// top of the IIFE — before the CSS array (style.textContent=[...] below) reads it synchronously,
+// and before any hover runs. When true the patch stops "adopting" VS Code's hover: function
+// gates skip staging/keepalive/sticky/forced-size/width-freeze/reposition, so VS Code places the
+// hover natively. (v256: the CSS size/sash-takeover REMOVAL was reverted — it dropped the
+// max-height cap and ballooned big hovers; native resize/size is still TODO via a capped
+// approach.) We still attach our markdown (patched provideHover, IR_VTAIL_MODE='native')
+// and wrap navigable type names for drill. false = full managed behaviour (L48-L88).
+var IR_HOVER_NATIVE_ONLY=true;
 var IR_EXISTING_PATCH_VERSION = Number(window.__irPatchVersion)||0;
 if(IR_EXISTING_PATCH_VERSION >= IR_PATCH_VERSION && window.__irTestHooks) return 'already patched v'+IR_EXISTING_PATCH_VERSION;
 
@@ -298,6 +307,11 @@ style.textContent=[
   // the hover into .monaco-resizable-hover. Children (scroller, content,
   // rows, rendered-markdown) are also clamped to 0×0 so nothing inside can
   // escape and paint while the hover is in the unwrapped state.
+  // L91 NOTE (v256, 2026-05-31): REMOVING this "resizable-hover takeover" block in native mode
+  // (v255) dropped the max-height:48vh cap + scroller overflow, so big hovers ballooned to full
+  // content height (~32000px) = no scroll + slow layout. Reverted to unconditional. Native
+  // resize/size must be done by KEEPING the caps and only unpinning width/height + showing the
+  // sash, NOT by removing the block. TODO.
   '.monaco-hover,.monaco-editor-hover{box-sizing:border-box !important;width:0 !important;height:0 !important;min-width:0 !important;min-height:0 !important;max-width:0 !important;max-height:0 !important;overflow:hidden !important;visibility:hidden !important;pointer-events:auto !important;z-index:2147483647 !important}',
   '.monaco-hover .monaco-scrollable-element,.monaco-hover .monaco-hover-content,.monaco-hover .hover-row,.monaco-hover .hover-row-contents,.monaco-hover .markdown-hover,.monaco-hover .rendered-markdown,.monaco-editor-hover .monaco-scrollable-element,.monaco-editor-hover .monaco-hover-content,.monaco-editor-hover .hover-row,.monaco-editor-hover .hover-row-contents,.monaco-editor-hover .markdown-hover,.monaco-editor-hover .rendered-markdown{width:0 !important;height:0 !important;min-width:0 !important;min-height:0 !important;max-width:0 !important;max-height:0 !important;overflow:hidden !important}',
   // Inner sizing is restored as soon as the hover is inside .monaco-resizable-hover.
@@ -306,8 +320,28 @@ style.textContent=[
   // and hovers never appeared.) The viewport-cover-during-creation flash is now
   // mitigated by the base caps (max-width 680, max-height 48vh) which apply
   // immediately, and by the visibility check on the wrapper bbox in aligner.
-  '.monaco-resizable-hover .monaco-hover,.monaco-resizable-hover .monaco-editor-hover{width:min(max-content,680px) !important;height:auto !important;min-width:0 !important;min-height:0 !important;max-width:680px !important;max-height:48vh !important;visibility:visible !important}',
-  '.monaco-resizable-hover .monaco-hover .monaco-scrollable-element,.monaco-resizable-hover .monaco-editor-hover .monaco-scrollable-element{width:calc(100% - 2px) !important;height:calc(100% - 2px) !important;max-width:calc(100% - 2px) !important;max-height:calc(48vh - 2px) !important;min-width:0 !important;min-height:0 !important;overflow:auto !important;overscroll-behavior:contain !important;margin:1px !important}',
+  // L103-fix (2026-05-31): height:100% (not auto) makes the host fill the
+  // wrapper's DEFINITE inline px height (VS Code sizes the resizable wrapper to
+  // ~177/250px). MEASURED via hover-size-audit.
+  // L104-fix (2026-05-31): height:100% on the host was NOT enough. The audit
+  // (v269) proved the host DID resolve to the wrapper (hostH=246) but the
+  // scroller's height:calc(100% - 2px) STILL did not resolve — it fell through to
+  // its max-height:48vh and sized to content (scrollerH=511). So a 511px scroller
+  // sat inside a 246px host: the native scrollbar ran off the bottom of the
+  // visible hover and the bottom content was unreachable; short hovers (488px
+  // scroller in a 246px host, maxTop=0) were cut off with no scrollbar at all.
+  // FIX: make the host a flex column and the scroller flex:1 1 auto (height:auto,
+  // max-height:none). The flex algorithm fills the host's definite height EXACTLY
+  // — no fragile percentage-height resolution — so scrollerH == hostH and the
+  // scrollbar always lives inside the visible host (overflow:auto scrolls the
+  // content within it). min-height:0 is REQUIRED so a flex item can shrink below
+  // its content height; without it the flex item refuses to shrink and overflows
+  // again. NOTE: this fits the scroller to VS Code's chosen box height; the box
+  // itself stays at VS Code's (arbitrary 246/177) height so native resize keeps
+  // working. Growing the box to content is a separate opt-in (see wrapper rule
+  // below). cf. project_hover_rerender_exact_position_key.
+  '.monaco-resizable-hover .monaco-hover,.monaco-resizable-hover .monaco-editor-hover{display:flex !important;flex-direction:column !important;width:min(max-content,680px) !important;height:100% !important;min-width:0 !important;min-height:0 !important;max-width:680px !important;max-height:48vh !important;visibility:visible !important}',
+  '.monaco-resizable-hover .monaco-hover .monaco-scrollable-element,.monaco-resizable-hover .monaco-editor-hover .monaco-scrollable-element{flex:1 1 auto !important;width:calc(100% - 2px) !important;height:auto !important;max-width:calc(100% - 2px) !important;max-height:none !important;min-width:0 !important;min-height:0 !important;overflow:auto !important;overscroll-behavior:contain !important;margin:1px !important}',
   '.monaco-resizable-hover .monaco-hover .monaco-hover-content,.monaco-resizable-hover .monaco-hover .hover-row,.monaco-resizable-hover .monaco-hover .hover-row-contents,.monaco-resizable-hover .monaco-hover .markdown-hover,.monaco-resizable-hover .monaco-hover .rendered-markdown{width:auto !important;height:auto !important;max-width:100% !important;max-height:none !important;min-width:0 !important;min-height:0 !important;overflow:visible !important}',
   // The drilled hover's wrapper transiently grows to viewport size
   // (e.g., 1800×1069) during content swap before settling. Log
@@ -325,7 +359,17 @@ style.textContent=[
   // editorHoverWidget-border as a quieter fallback and a darker neutral
   // gray (0.85 alpha) as last resort. box-sizing is border-box so the
   // 2px stroke is absorbed by the 680px budget.
-  '.monaco-resizable-hover{box-sizing:border-box !important;width:min(max-content,680px) !important;height:max-content !important;max-width:680px !important;max-height:48vh !important;min-width:0 !important;min-height:0 !important;overflow:hidden !important;transform:none !important;padding:0 !important;margin:0 !important;pointer-events:auto !important;z-index:2147483647 !important;border:2px solid var(--vscode-focusBorder, var(--vscode-editorHoverWidget-border, rgba(128,128,128,0.85))) !important;border-radius:4px !important}',
+  // L92 (2026-05-31): native mode drops the !important on width/height so VS Code's inline resize
+  // (the native sash) wins, but KEEPS the max-width/max-height caps (no balloon, scroll preserved)
+  // — max-width:680 still clamps VS Code's transient 1800px mid-resize write. Managed = original pin.
+  // L104 NOTE (2026-05-31): height:max-content is INTENTIONALLY non-!important here so the wrapper
+  // keeps VS Code's inline height (resize works). The L104 scroll-fit fix lives on the host/scroller
+  // (flex, above), NOT here. To make the box GROW to content (capped at 48vh) instead of staying at
+  // VS Code's height, this would become height:max-content with !important added — but that overrides
+  // VS Code's inline height and DISABLES native resize. That trade-off is a separate, opt-in decision.
+  (IR_HOVER_NATIVE_ONLY
+    ? '.monaco-resizable-hover{box-sizing:border-box !important;width:min(max-content,680px);height:max-content;max-width:680px !important;max-height:48vh !important;min-width:0 !important;min-height:0 !important;overflow:hidden !important;transform:none !important;padding:0 !important;margin:0 !important;pointer-events:auto !important;z-index:2147483647 !important;border:2px solid var(--vscode-focusBorder, var(--vscode-editorHoverWidget-border, rgba(128,128,128,0.85))) !important;border-radius:4px !important}'
+    : '.monaco-resizable-hover{box-sizing:border-box !important;width:min(max-content,680px) !important;height:max-content !important;max-width:680px !important;max-height:48vh !important;min-width:0 !important;min-height:0 !important;overflow:hidden !important;transform:none !important;padding:0 !important;margin:0 !important;pointer-events:auto !important;z-index:2147483647 !important;border:2px solid var(--vscode-focusBorder, var(--vscode-editorHoverWidget-border, rgba(128,128,128,0.85))) !important;border-radius:4px !important}'),
   // Force inner .monaco-hover (and its primary inner panels) to stick
   // to the ancestor wrapper via position:static and clear any fixed/
   // absolute placement VS Code may have applied. Diagnostic showed inner
@@ -338,7 +382,8 @@ style.textContent=[
   // otherwise re-impose position:fixed.
   '.monaco-resizable-hover .monaco-hover.monaco-hover.monaco-hover,.monaco-resizable-hover .monaco-hover-content.monaco-hover-content,.monaco-resizable-hover .monaco-scrollable-element.monaco-scrollable-element{position:static !important;top:auto !important;left:auto !important;right:auto !important;bottom:auto !important;transform:none !important;inset:auto !important}',
   '.monaco-resizable-hover > .monaco-hover{width:100% !important;height:auto !important;max-width:100% !important;max-height:100% !important;margin:0 !important}',
-  '.monaco-resizable-hover .monaco-sash,.monaco-resizable-hover [class*="sash"]{display:none !important;visibility:hidden !important;pointer-events:none !important}',
+  // L92: native mode does NOT hide the resize sash — VS Code's native resize handle UI works.
+  (IR_HOVER_NATIVE_ONLY ? '' : '.monaco-resizable-hover .monaco-sash,.monaco-resizable-hover [class*="sash"]{display:none !important;visibility:hidden !important;pointer-events:none !important}'),
   // The .overflowingContentWidgets host is the workbench-level positioning
   // root that VS Code mounts overflow hovers under. Other panels (e.g., the
   // chat / Agent welcome view in the auxiliary bar) can occupy the same
@@ -634,7 +679,15 @@ var IR_HE_FORCE_LOG_KINDS={
   'vtail-channel-test':1,
   'vtail-stash-visible':1,
   'vtail-tail-rendered':1,
-  'vtail-windowed':1
+  'vtail-windowed':1,
+  // L98 (2026-05-31): native viewport clamp audit — fires only when a capped
+  // hover's bottom sat below the viewport and we nudged it up (#1 structural).
+  // Force-logged so we can confirm the clamp engages live; demote to
+  // forwarded-only once verified.
+  'hover-viewport-clamp':1,
+  // L103 (2026-05-31): hover size-audit — real wrapper/host/scroller heights vs
+  // content length, to pin the VS-Code-height-vs-our-content mismatch the user sees.
+  'hover-size-audit':1
 };
 function irHERecord(kind,detail){
   try{
@@ -1317,13 +1370,6 @@ function irHoverContentSig(wrapperEl){
     return t.length+':'+t.slice(0,40)+':'+t.slice(-20);
   }catch(_){return '';}
 }
-// L89 (2026-05-31): native-hover restoration switch. When true, the renderer-patch
-// stops "adopting" VS Code's hover — no staging, no ir-keepalive/ir-sticky, no forced
-// sizing/scroll tier, no width-freeze. VS Code's own native hover shows/positions/
-// dismisses it; we only (a) let the patched $provideHover attach our markdown (extension
-// side, IR_VTAIL_MODE='native') and (b) wrap navigable type names for drill. Flip to
-// false to restore the full managed behaviour (L48-L88).
-var IR_HOVER_NATIVE_ONLY=true;
 function irStageHover(wrapperEl){
   if(IR_HOVER_NATIVE_ONLY)return;   // L89: native hover shows immediately (no staging)
   try{
@@ -1757,6 +1803,10 @@ function irResetWrapperPositionState(wrapperEl,reason){
   }catch(_){}
 }
 function irAttachWrapperResizeReposition(widget){
+  // L95 (2026-05-31) DEPRECATED in native mode: the per-resize ResizeObserver re-enforcement fought
+  // VS Code's own resize (frame drops on handle drag). Native lets VS Code own resize. Logic kept
+  // (not deleted) for the legacy managed mode — restore by IR_HOVER_NATIVE_ONLY=false.
+  if(IR_HOVER_NATIVE_ONLY)return;
   if(!widget){irHERecord('attach-wrr-skip',{reason:'no-widget'});return;}
   // The hover widget's _resizableNode may be lazily constructed.
   // Retry a few times so we still attach when the widget is captured
@@ -2877,6 +2927,7 @@ function irPointerOverForeignHoverOverlay(wrapperEl){
 // symbol can be on different tokens — using the symbol position avoids
 // that whole class of mismatches.
 function irRepositionInitialHover(editor,wrapperEl){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L91: native hover keeps VS Code's own placement (we never set top/left)
   try{
     if(!wrapperEl||!wrapperEl.getBoundingClientRect){irHERecord('initial-reposition-skip',{reason:'no-wrapper'});return;}
     // Skip drill wrappers — drill goes through irRepositionDrilledHover*.
@@ -4299,6 +4350,10 @@ function irLogPointerActionTrace(e,stage,link,resolution){
 // logic can't fire before our click handler — some hover widgets
 // dismiss on mousedown outside the editor.
 function irTypeLinkPointerDown(e){
+  // L94 (2026-05-31): native mode — a pointerdown on VS Code's native resize sash must NOT be
+  // treated as an outside-click. The no-link branch below calls irDisposeActiveHoverForEditorTarget,
+  // so grabbing the resize handle instantly dismissed the hover. Bow out so native resize runs.
+  if(IR_HOVER_NATIVE_ONLY){try{var __sashT=e&&e.target;if(__sashT&&__sashT.closest&&__sashT.closest('.monaco-sash,[class*="sash"]'))return;}catch(_){}}
   var directLink=irClosestTypeLink(e.target);
   var wrappedLink=null;
   if(!directLink)wrappedLink=irWrapWordAtPoint(e);
@@ -4445,6 +4500,7 @@ function irResetNativeHoverMutations(hoverEl){
   }catch(_){}
 }
 function irMarkNativeHoverReleased(hoverEl,reason,hideVisual){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L96 (2026-05-31) DEPRECATED: VS Code owns dismiss/release (active-switch). Kept for legacy managed mode.
   try{
     if(!hoverEl)return;
     // L13 revised: VS Codes hover lifecycle can call this 3–6 times in the
@@ -4482,6 +4538,7 @@ function irMarkNativeHoverReleased(hoverEl,reason,hideVisual){
   }catch(_){}
 }
 function irReleaseNativeHoverManagement(hoverEl,reason){
+  if(IR_HOVER_NATIVE_ONLY)return false;   // L97 (2026-05-31) DEPRECATED: VS Code owns dismiss. Our release (outside-editor-new-token etc.) drove the release<->revive flicker churn. Kept for legacy managed mode.
   if(!hoverEl||!hoverEl.classList)return false;
   var beforeBrief=irHoverBrief(hoverEl);
   var releaseReason=String(reason||'release');
@@ -4806,6 +4863,9 @@ function irPrecacheHoverNaturalContext(e){
   }catch(_){}
 }
 function irDisposeActiveHoverForEditorTarget(e,reason){
+  // L95 (2026-05-31) DEPRECATED in native mode: VS Code owns hover dismiss. Our editor-target
+  // dispose was too aggressive (dismissed on sash/handle interaction). Kept for legacy managed mode.
+  if(IR_HOVER_NATIVE_ONLY)return;
   try{
     var active=window.__irActiveHoverEl&&document.body&&document.body.contains(window.__irActiveHoverEl)
       ? window.__irActiveHoverEl
@@ -5100,6 +5160,9 @@ function irHoverGuard(e){
   }
 }
 function irPreviewTransitionWheelGuard(e){
+  // L97 (2026-05-31): NOT deprecated — wheel guard scrolls the hover CONTENT and preventDefaults at
+  // the scroll boundary so an over-scroll does NOT propagate to the editor and dismiss the hover.
+  // This is content/scroll support, not native-fighting management. (v261 wrongly gated it -> #4.)
   try{
     var active=window.__irActiveHoverEl&&document.body&&document.body.contains(window.__irActiveHoverEl)
       ? window.__irActiveHoverEl
@@ -5151,6 +5214,9 @@ track(window,'mouseover',irHoverGuard,true);
 track(window,'mouseout',irHoverGuard,true);
 track(window,'mouseleave',irHoverGuard,true);
 function irHoverInternalWheelGuard(e){
+  // L97 (2026-05-31): NOT deprecated — scrolls the hover CONTENT and preventDefaults at the scroll
+  // boundary so over-scroll does NOT propagate to the editor and dismiss the hover (user: "스크롤
+  // 끝에서 더 스크롤해도 dismiss 말자"). Content/scroll support, not management. (v261 wrongly gated -> #4.)
   // Wheel events that originate INSIDE a managed hover. We want the
   // hover's internal scroller to scroll, BUT block the wheel from
   // bleeding through to the editor below — VS Code's editor scrolls
@@ -5223,6 +5289,43 @@ function irPrimaryHoverScroller(hoverEl){
     if(direct)return direct;
   }catch(_){}
   return hoverEl.querySelector('.monaco-scrollable-element')||hoverEl;
+}
+// L103 (2026-05-31): size-audit diagnostic. The user observes VS Code's chosen
+// hover height does not match our injected content length. Capture the real
+// element heights so we can fix the mismatch precisely (instead of guessing):
+// the resizable wrapper (VS Code sizes this), the .monaco-hover host, the
+// scroller (its scrollHeight/clientHeight drive the scrollbar thumb), and the
+// content length. maxTop=0 means nothing scrolls; scrollerH>wrapH means the
+// scrollbar extends past the visible hover bottom (the "thumb below" report).
+function irAuditHoverSize(hoverEl){
+  if(!IR_HOVER_NATIVE_ONLY)return;
+  try{
+    if(!hoverEl||!hoverEl.getBoundingClientRect)return;
+    var nowA=Date.now();
+    if(hoverEl.__irSizeAuditAt&&nowA-hoverEl.__irSizeAuditAt<1000)return;   // throttle: 1s per host
+    var hr=hoverEl.getBoundingClientRect();
+    if(hr.height<20)return;   // skip transient/collapsed
+    var contentLen=String(hoverEl.textContent||'').length;
+    if(contentLen<400)return;   // only audit substantial hovers (the mismatch case)
+    var wrap=hoverEl.closest?hoverEl.closest('.monaco-resizable-hover'):null;
+    var wr=wrap&&wrap.getBoundingClientRect?wrap.getBoundingClientRect():null;
+    var sc=irPrimaryHoverScroller(hoverEl);
+    var scr=sc&&sc.getBoundingClientRect?sc.getBoundingClientRect():null;
+    hoverEl.__irSizeAuditAt=nowA;
+    irHERecord('hover-size-audit',{
+      contentLen:contentLen,
+      wrapH:wr?Math.round(wr.height):null,
+      hostH:Math.round(hr.height),
+      scrollerH:scr?Math.round(scr.height):null,
+      scrollH:(sc&&typeof sc.scrollHeight==='number')?sc.scrollHeight:null,
+      clientH:(sc&&typeof sc.clientHeight==='number')?sc.clientHeight:null,
+      maxTop:(sc&&typeof sc.scrollHeight==='number')?Math.max(0,sc.scrollHeight-(sc.clientHeight||0)):null,
+      wrapInlineH:(wrap&&wrap.style)?String(wrap.style.height||''):null,
+      wrapInlineMaxH:(wrap&&wrap.style)?String(wrap.style.maxHeight||''):null,
+      scIsHost:sc===hoverEl,
+      vpH:(window.innerHeight||document.documentElement.clientHeight||0)
+    });
+  }catch(_){}
 }
 function irActiveHoverRoot(){
   var active=window.__irActiveHoverEl;
@@ -5428,6 +5531,7 @@ var IR_HOVER_EMPTY_VISUAL_SELECTOR=IR_HOVER_EMPTY_SHELL_SELECTOR+',[class*="hove
 var IR_HOVER_EXTERNAL_VISUAL_SELECTOR=IR_HOVER_EMPTY_VISUAL_SELECTOR+',.monaco-resizable-hover,[class*="resizable-hover"],[class*="ResizableHover"]';
 var IR_NATIVE_POPUP_EXCLUSION_SELECTOR='.suggest-widget,.quick-input-widget,.parameter-hints-widget,.monaco-menu,.action-widget,.peekview-widget,.rename-box,.zone-widget,.find-widget,.markers-panel,.notifications-toasts,.notifications-center';
 function irQuarantineHoverNativeHandle(handle,remove){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L93: native mode keeps VS Code's native scrollbar + resize sash (the CSS un-hide alone was undone by this JS quarantine)
   if(!handle)return;
   try{
     if(remove&&handle.parentNode){
@@ -5991,6 +6095,7 @@ function irClearManagedHoverVisibilityKeepalive(hoverEl){
   hoverEl.__irVisibilityKeepaliveTimers=[];
 }
 function irScheduleManagedHoverVisibilityKeepalive(hoverEl){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L100 (2026-05-31) DEPRECATED: don't schedule revive timers that fight VS Code's native visibility (the 22x visibility-keepalive churn in v264). VS Code owns dismiss. Kept for legacy managed mode.
   if(!hoverEl||!irIsNativeHoverRoot(hoverEl))return;
   irClearManagedHoverVisibilityKeepalive(hoverEl);
   var run=function(){
@@ -6363,6 +6468,7 @@ function irReviveRecentlyAppliedHover(root,reason){
   return false;
 }
 function irReviveRecentlyManagedHover(root,reason){
+  if(IR_HOVER_NATIVE_ONLY)return false;   // L100 (2026-05-31) DEPRECATED: reviving a hover VS Code made invisible = fighting native dismiss (the visibility-keepalive churn the user read as "overlay still alive"). VS Code owns the lifecycle; drill re-shows via page-transition -> $provideHover native re-hover. Kept for legacy managed mode.
   try{
     if(!root||!irHoverHasManagedContent(root))return false;
     if(irIsSyntheticHoverRoot(root))return false;
@@ -6394,6 +6500,10 @@ function irReviveRecentlyManagedHover(root,reason){
   return false;
 }
 function irReleaseNativeHiddenHover(root,reason,visibilityReason){
+  // L95 (2026-05-31) DEPRECATED in native mode: VS Code owns dismiss/release. Our release on 0x0
+  // transients (hidden-active-hoverguard / active-switch) dismissed the hover during native resize
+  // (focus-out felt too sensitive). Kept for legacy managed mode.
+  if(IR_HOVER_NATIVE_ONLY)return false;
   if(!root||!irIsNativeHoverRoot(root))return false;
   var refireGrace=false;
   try{refireGrace=!!(window.__irNativeHoverRefireUntil&&Date.now()<window.__irNativeHoverRefireUntil)}catch(_){}
@@ -6440,6 +6550,8 @@ function irReleaseNativeHiddenHover(root,reason,visibilityReason){
   return true;
 }
 function irDisposeHiddenActiveHover(reason){
+  // L95 (2026-05-31) DEPRECATED in native mode: VS Code owns dismiss. Kept for legacy managed mode.
+  if(IR_HOVER_NATIVE_ONLY)return false;
   try{
     var active=window.__irActiveHoverEl;
     if(!active||!document.body||!document.body.contains(active))return false;
@@ -6892,6 +7004,7 @@ function irShouldProcessHoverBlock(hoverHost,block){
 // second sighting) keep their classes — VS Code hover initial paint
 // passes through 16px width briefly and must not be killed.
 function irScanNarrowHoverWrappers(reason){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L96 DEPRECATED: VS Code owns size (no column/pillar sweep). Kept for legacy.
   try{
     var cwWraps=document.querySelectorAll('.monaco-resizable-hover');
     for(var cwI=0;cwI<cwWraps.length;cwI++){
@@ -7011,6 +7124,7 @@ function irScanNarrowHoverWrappers(reason){
 }
 
 function irRemoveInactiveHoverArtifacts(activeHover,reason){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L96 DEPRECATED: VS Code owns hover lifecycle (no inactive-hover sweep). Kept for legacy.
   // L38: 50ms throttle. Called on every hover switch + every prune
   // pass. A burst of activations or mutation-driven prune calls used
   // to fire this several times within a single frame — each pass does
@@ -7057,6 +7171,7 @@ function irRemoveInactiveHoverArtifacts(activeHover,reason){
   }
 }
 function irDisposeStaleHover(hoverEl,reason){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L96 DEPRECATED: VS Code owns dismiss/cleanup (no shell-clean/dispose). Kept for legacy.
   if(!hoverEl||!hoverEl.classList)return;
   if(irIsWorkbenchHoverRoot(hoverEl))return;
   var beforeBrief=irHoverBrief(hoverEl);
@@ -7982,9 +8097,59 @@ function irPickHoverSizeTier(hoverEl,fallbackTextLength){
 }
 // Position enforcement removed by user directive. VS Code's hover widget
 // positions itself; we no longer nudge margin-left/margin-top to keep the
-// hover in viewport. Stubs retained so legacy call-sites compile.
+// hover in viewport. irResetHoverViewportShift stays a stub (legacy call-sites
+// compile against it); irKeepHoverInViewport is re-activated below as the one
+// unavoidable native-mode viewport clamp.
 function irResetHoverViewportShift(_hoverEl){return}
-function irKeepHoverInViewport(_hoverEl){return}
+// L98 (2026-05-31): the ONE unavoidable size management in native mode. VS Code
+// owns native placement, but it does NOT re-measure the large content we inject
+// (v255 balloon proved this), so we MUST keep our 48vh max-height cap. A capped
+// hover that VS Code placed low has its bottom — and the scroll-end / scrollbar —
+// below the viewport: the structural #1 bug. We do NOT recompute placement (that
+// is irRepositionInitialHover, gated off in native); we only nudge the wrapper UP
+// by the bottom overflow so it comes back on-screen. Never moves it down, never
+// touches left (drill stays mouse-anchored — see feedback_mouse_anchored_drill),
+// and stays entirely out of overlay mode, where irRepositionInitialHover already
+// clamps and owns __irDesired (a second writer would fight its style observer).
+function irKeepHoverInViewport(hoverEl){
+  if(!IR_HOVER_NATIVE_ONLY)return;
+  try{
+    if(!hoverEl)return;
+    var wrapper=(hoverEl.classList&&hoverEl.classList.contains('monaco-resizable-hover'))?hoverEl:(hoverEl.closest?hoverEl.closest('.monaco-resizable-hover'):null);
+    if(!wrapper||!wrapper.getBoundingClientRect)return;
+    var rect=wrapper.getBoundingClientRect();
+    // Same collapse contract used everywhere (width<60 column || height<20 bar):
+    // never clamp a transient 16px sliver or a 0x0 mid-swap shell.
+    if(rect.width<60||rect.height<20)return;
+    var margin=8;
+    var viewportH=(window.innerHeight||document.documentElement.clientHeight||900);
+    var overflow=rect.bottom-(viewportH-margin);
+    if(overflow<2)return;   // bottom already on-screen (2px slack avoids sub-pixel churn)
+    // Don't push the top off the TOP edge: a hover taller than the usable height
+    // can't fully fit, so nudge only as far as the top margin and let the inner
+    // scroller cover the remainder.
+    var shift=Math.min(overflow,rect.top-margin);
+    if(shift<=0)return;
+    // style.top is a SCREEN coordinate for this wrapper (irRepositionInitialHover
+    // sets it from editorRect.top+visible.top), so screen-top - shift IS the new
+    // style.top. Use the live rect.top rather than the possibly-stale inline value.
+    var newTop=Math.round(rect.top-shift);
+    if(newTop<margin)newTop=margin;
+    var prevTop=parseInt(wrapper.style.top,10);
+    if(prevTop===newTop)return;   // idempotent — already clamped here this episode
+    wrapper.style.top=newTop+'px';
+    // Drill hovers re-apply __irDesired inside the wrapped _resizableNode.layout()
+    // (L24); update it too so the clamp sticks instead of being snapped back to
+    // the off-screen top on the next layout pass.
+    if(wrapper.__irDesired)wrapper.__irDesired.top=newTop;
+    irHERecord('hover-viewport-clamp',{
+      from:isNaN(prevTop)?null:prevTop,to:newTop,
+      shift:Math.round(shift),overflow:Math.round(overflow),
+      rect:{top:Math.round(rect.top),bottom:Math.round(rect.bottom),h:Math.round(rect.height)},
+      viewportH:viewportH,drill:!!wrapper.__irDesired
+    });
+  }catch(_){}
+}
 function irScheduleHoverViewportFit(hoverEl){
   if(!hoverEl)return;
   irScheduleHoverNativeHandleCleanup(hoverEl,true);
@@ -9288,7 +9453,17 @@ window.irShowHoverFallback=function(identifier,md,opts){
               rootOld.__irReleasedText='';
               if(rootOld.parentNode){
                 rootOld.parentNode.removeChild(rootOld);
-              }else{
+              }else if(!IR_HOVER_NATIVE_ONLY){
+                // L101 (2026-05-31) DEPRECATED in native: marking a detached/reused root
+                // hidden+released was the LAST ungated writer of release state. It drove the
+                // release<->revive churn (irTouchHoverRootContent un-hides on the next content
+                // change -> content length oscillated 57638<->59293 -> VS Code re-tokenized the
+                // 57K preview = 1603ms longtasks + re-scan storm) AND left VS Code's reused
+                // single hover wrapper stuck-hidden when it re-showed the SAME content (the
+                // "skip unchanged released native hover" path = a short class hover renders
+                // nothing). With both this and irMarkNativeHoverReleased gated, NO root carries
+                // ir-native-released-hover in native, so the whole revive/skip-unchanged
+                // subsystem goes inert. VS Code owns visibility/dismiss.
                 if(rootOld.classList)rootOld.classList.add('hidden','ir-native-released-hover');
                 if(rootOld.setAttribute)rootOld.setAttribute('data-ir-native-released-hover','1');
                 if(rootOld.style){
@@ -9580,7 +9755,16 @@ function irIsBlockVisibleInHover(block,hoverHost){
   try{
     var br=block.getBoundingClientRect();
     var hr=hoverHost.getBoundingClientRect();
-    if(hr.height<10)return true; // hover not laid out yet — don't skip
+    // L94 (2026-05-31): height<10 = hover either still FORMING (briefly 0 before layout) or already
+    // DISMISSED/collapsed (reused 0x0 singleton). Returning true for both kept re-scanning a
+    // dismissed big hover's off-screen blocks forever (scan -> wrap -> mutation -> re-scan loop),
+    // burning CPU after the hover was dismissed. Only treat as forming (don't skip) when content
+    // changed very recently; otherwise it's dismissed -> skip so the scan stops evaluating it.
+    if(hr.height<10){
+      var __ccAt=hoverHost.__irContentChangedAt||0;
+      if(__ccAt&&(Date.now()-__ccAt)<1000)return true;   // forming: allow the first scan after content arrives
+      return false;                                       // dismissed/collapsed: stop evaluating off-screen blocks
+    }
     var margin=400;
     if(br.bottom<hr.top-margin)return false;
     if(br.top>hr.bottom+margin)return false;
@@ -9596,6 +9780,11 @@ function irEnsureHoverScrollListener(hoverHost){
     scroller.addEventListener('scroll',function(){
       // Re-scan so newly visible blocks get wrapped. irScheduleScan is
       // already rAF-coalesced so multiple scroll ticks collapse.
+      // L90: re-arm viewport-wrap on the markdown blocks. The wrappedCount==0 convergence
+      // guard (irScanRenderedMarkdown) clears __irViewportWrap once formation settles to stop
+      // the self-mutation re-scan storm; a scroll reveals new off-screen rows that still need
+      // wrapping, so re-enable the skip-bypass for the next pass here.
+      try{var bs=hoverHost.querySelectorAll?hoverHost.querySelectorAll('.rendered-markdown'):null;if(bs)for(var bi=0;bi<bs.length;bi++){bs[bi].__irViewportWrap=true;}}catch(_){}
       try{irScheduleScan();}catch(_){}
     },{passive:true});
   }catch(_){}
@@ -9714,6 +9903,14 @@ function irScanRenderedMarkdown(){
     // Attach a scroll listener on the hover scroller exactly once per
     // hover so newly-scrolled-in blocks trigger a re-scan.
     if(hoverHost)irEnsureHoverScrollListener(hoverHost);
+    // L98: native viewport clamp — nudge a capped hover whose bottom VS Code
+    // placed below the viewport back on-screen (#1). No-op in overlay mode and
+    // when the bottom is already visible. Idempotent, so the per-block redundancy
+    // here (one host can own several .rendered-markdown blocks) costs only a
+    // wrapper rect read once the first call has settled it.
+    if(hoverHost){try{irKeepHoverInViewport(hoverHost);}catch(_){}}
+    if(hoverHost){try{irAuditHoverSize(hoverHost);}catch(_){}}   // L103: measure wrapper/host/scroller height mismatch
+
     // L35: cheap signature pre-check. textContent extraction on a 57K
     // char block is the dominant per-scan cost; in logs we see
     // "skip-same-text" 27+ times per drill where the block hasn't
@@ -9916,10 +10113,15 @@ function irScanRenderedMarkdown(){
         }catch(e2){irLog('renderer: wrap error "'+rep.type+'": '+e2.message)}
       }
     }
-    // L88: mark big hovers as viewport-limited so the same-text/same-sig skips above are
-    // bypassed on the next (scroll-triggered) scan, letting newly-visible rows wrap. Small
-    // hovers (vpLimit=false) clear the flag and keep the normal full-wrap-once behaviour.
-    block.__irViewportWrap=vpLimit;
+    // L88/L90: stay in viewport-wrap mode (bypassing the same-text/same-sig skips) ONLY while
+    // a pass still wraps NEW links — i.e. the hover is still growing to full size or rows just
+    // scrolled in. Once a pass wraps 0 new links the visible viewport is fully covered, so
+    // CLEAR the flag to re-engage the skips and stop re-scanning. L90 fix: our own
+    // .ir-type-link inserts re-fire the markdown MutationObserver -> irScheduleScan, so a
+    // settled 57K hover used to re-scan itself dozens of times/sec (scan storm; plateau of
+    // identical link counts in the log). Scroll re-arms the flag (irEnsureHoverScrollListener)
+    // so newly-visible rows still wrap. Small hovers (vpLimit=false): stays false as before.
+    block.__irViewportWrap=vpLimit&&wrappedCount>0;
     if(wrappedCount>0){
       irRefreshTypeLinkGeometry(block,'wrap-result');
       irMarkHoverManaged(hoverHost,true);
@@ -9977,6 +10179,40 @@ function irScheduleScan(){
   });
 }
 
+// L99 (2026-05-31): is this mutation purely our OWN .ir-type-link wrapping?
+// Wrapping a navigable name splits a text node (splitText byproducts are text
+// nodes) and inserts a <span class="ir-type-link"> around it, moving the matched
+// text into the span. VS Code's real hover-content changes instead swap whole
+// element subtrees (div.rendered-markdown, p, code, span.mtk*, ...). So a childList
+// mutation whose added nodes are ALL text-or-ir-type-link (and whose removed nodes
+// are all text) is one of our wraps, not a content change.
+function irIsOwnLinkWrapMutation(mut){
+  if(!mut||mut.type!=='childList')return false;
+  var added=mut.addedNodes||[];
+  var removed=mut.removedNodes||[];
+  if(!added.length&&!removed.length)return false;
+  // splitText leaves text nodes; insertBefore adds the <span class="ir-type-link">.
+  for(var i=0;i<added.length;i++){
+    var n=added[i];
+    if(!n)return false;
+    if(n.nodeType===3)continue;   // text node: splitText byproduct
+    if(n.nodeType===1&&n.classList&&n.classList.contains('ir-type-link'))continue;
+    return false;   // a real element added -> genuine content change
+  }
+  // span.appendChild(matchedText) MOVES the matched text out of its old parent, so
+  // the parent fires a removal record with NO added nodes. That was the v264 storm
+  // leak: the old guard bailed on !added.length and let this record set seenScan,
+  // re-firing the scan ~50ms apart. A removal of only text / ir-type-link nodes is
+  // still our own wrapping.
+  for(var j=0;j<removed.length;j++){
+    var rn=removed[j];
+    if(!rn)continue;
+    if(rn.nodeType===3)continue;   // text node moved into our span
+    if(rn.nodeType===1&&rn.classList&&rn.classList.contains('ir-type-link'))continue;
+    return false;   // a real element removed -> genuine content change
+  }
+  return true;
+}
 window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
   var __moT0=irNowMs();   // L83: time the markdown MO burst (a #2 block suspect on 57K-char content)
   irPruneDetachedHoverState();
@@ -10003,6 +10239,16 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
   }
   for(var mi=0;mi<muts.length;mi++){
     var mut=muts[mi];
+    // L99 (2026-05-31): a mutation that IS our own link-span insert must not
+    // re-fire the scan. Without this, wrapping the visible band of a 57K hover
+    // inserted spans -> this observer set seenScan -> irScheduleScan -> the scan
+    // wrapped a few more links -> more span inserts -> a 94-pass, ~7.6s storm
+    // (each pass re-reads 57K textContent + builds a 206-type regex = the scroll
+    // jank; the content reflowing under the wheel = the "frozen" scroll). The scan
+    // still runs on REAL content swaps (element subtrees) and on scroll
+    // (irEnsureHoverScrollListener re-arms __irViewportWrap + irScheduleScan), so
+    // newly-scrolled-in rows still get their drill links.
+    if(irIsOwnLinkWrapMutation(mut))continue;
     var nodes=mut.addedNodes||[];
     for(var ni=0;ni<nodes.length;ni++){
       irActivateAddedHoverRoots(nodes[ni],'mutation-added');

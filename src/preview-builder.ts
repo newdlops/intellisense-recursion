@@ -26,7 +26,6 @@ import {
   DEFINITION_PREVIEW_FALLBACK_LINES,
   DEFINITION_PREVIEW_SAFETY_MAX_LINES,
   HOVER_HIGHLIGHT_MAX_LINES,
-  IR_VTAIL_MODE,
 } from './util';
 import {
   SKIP_WORDS,
@@ -194,9 +193,10 @@ export function rememberPreviewLocations(
 // the highlight boundary. Deterministic (same code → same split), so block dedupe
 // keys stay stable.
 function renderPreviewCodeFences(lang: string, code: string): string {
-  if (IR_VTAIL_MODE === 'native') {
-    return `\`\`\`${lang}\n${code}\n\`\`\``;   // native: one fully-highlighted fence (no L84 head/tail split)
-  }
+  // L92 (2026-05-31): native mode now ALSO uses the L84 head/tail split. Full-highlight (the
+  // earlier native choice) made VS Code synchronously tokenize whole 1657-line classes -> ~1.5s
+  // main-thread blocks that even expired drill page-transitions. Highlight only the head; render
+  // the tail as a plain fence (no lang tag -> no tokenization). cf. project_hover_jank memory.
   const lines = code.split('\n');
   if (lines.length <= HOVER_HIGHLIGHT_MAX_LINES) {
     return `\`\`\`${lang}\n${code}\n\`\`\``;
