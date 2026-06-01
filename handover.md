@@ -1,3 +1,79 @@
+# ★★ 네이티브 호버 전환 — 2026-05-31 세션 (HEAD db39c8a=v248 / 작업트리=v262, L89~L97) [최신·최우선]
+
+## 목표 (사용자 지시)
+overlay hover → **VS Code 네이티브 hover**로 전환. VS Code가 **size/position/resize/scroll/dismiss를 소유**. 우리 역할 = **content(프리뷰 markdown) + drilldown + cmd+click 링크**만. 나머지 관리 로직은 **삭제 금지 — deprecated 주석 + `IR_HOVER_NATIVE_ONLY` 게이트로 OFF**(나중 복원 가능). 드릴도 가급적 native(page-transition→$provideHover→native render).
+
+## 마스터 스위치 2개
+- `IR_VTAIL_MODE: 'native'|'overlay' = 'native'` (src/util.ts:118) — content 경로. native면 extension의 `irStashLargePreviewForChannelTest`가 overlay CDP 채널을 우회(full preview 그대로), preview-builder `renderPreviewCodeFences`는 head/tail split.
+- `var IR_HOVER_NATIVE_ONLY=true;` (renderer-patch IIFE **최상단**, RENDERER_PATCH_VERSION 줄 아래 ~L32) — 렌더러 관리층 OFF. ⚠️ **CSS 배열(`style.textContent=[`)보다 위에서 "할당"** 필수 — CSS가 패치 로드 시 동기 실행하며 이 값을 읽음. var hoisting만으론 그 시점 undefined라 잘못된 분기를 탐. 함수 게이트들은 런타임 호출이라 선언 위치 무관.
+
+## git 상태 (중요 — 세션 시작 시 먼저 처리)
+- HEAD `db39c8a "native hover"` = **v248 커밋**(IR_VTAIL_MODE='native', extension native path, renderer-patch v248=L89 native-only).
+- **작업트리 = v262 (L90~L97), 미커밋** — `src/renderer-patch.ts`(+92/-19), `src/preview-builder.ts`(head/tail split). **→ 먼저 커밋 권장**(안 하면 v262 작업 유실 위험).
+- 백업: 브랜치 `backup/native-hover-drill-pre-reset-8a4ebda`, `stash@{0}`(reset 전 native v253).
+
+## 버전/마커 히스토리
+- v247: stash의 viewport-wrap을 8a4ebda 위로 포팅(24K 초과 big hover에서 드릴 링크 복구).
+- v248 **L89**: native-only 스위치 도입. staging/keepalive/sticky/scrollable/freeze OFF. ← **HEAD 커밋**.
+- v254 **L90**: scan storm 수렴 가드 — `block.__irViewportWrap=vpLimit&&wrappedCount>0`(새 wrap 0이면 해제) + 스크롤 시 `.rendered-markdown` 재무장. (wrap→MutationObserver→재스캔 무한루프 차단; plateau links 151×10이 증거였음)
+- v255 **L91**: size CSS takeover 통째 제거 시도 → **balloon 32000px 회귀 → v256에서 되돌림**. 교훈: 캡 제거하면 풍선.
+- v257 **L92**: head/tail split(native도 앞 120줄만 하이라이트 + 꼬리 plain fence) → **perf 6배↓ (longtask 총 29.7s→4.9s, max 1501→587ms)**. + CSS rule(.monaco-resizable-hover)에서 width/height의 `!important`만 제거(인라인 resize가 이기게)·sash 숨김 룰 native에서 해제(ternary).
+- v258 **L93**: `irQuarantineHoverNativeHandle` OFF — JS가 `.monaco-sash`를 능동 격리해 CSS로 살린 핸들을 다시 숨기던 것.
+- v259 **L94**: `irTypeLinkPointerDown`에서 sash pointerdown이면 early-return(dispose 방지) + `irIsBlockVisibleInHover`에서 0×0 stale(dismissed) hover skip(scan self-loop·CPU 누수 차단).
+- v260 **L95**: mgmt OFF — `irAttachWrapperResizeReposition`(per-resize ResizeObserver), `irReleaseNativeHiddenHover`, `irDisposeHiddenActiveHover`, `irDisposeActiveHoverForEditorTarget`.
+- v261 **L96**: 포괄 OFF — `irMarkNativeHoverReleased`, `irDisposeStaleHover`, `irRemoveInactiveHoverArtifacts`, `irScanNarrowHoverWrappers` (+ wheel guard 2개 — v262에서 되돌림).
+- v262 **L97**: wheel guard 2개(`irHoverInternalWheelGuard`/`irPreviewTransitionWheelGuard`) **un-gate**(#4 회귀 수정) + `irReleaseNativeHoverManagement` gate(release↔revive flicker churn 차단).
+- v263 **L98**: `irKeepHoverInViewport` no-op 스텁 → **네이티브 뷰포트 클램프** 재활성(통찰 #1 "불가피한 단 하나의 size 관리"). `.monaco-resizable-hover` 하단이 뷰포트 밖이면 **위로만** nudge(`style.top`=rect.top−overflow, top margin 8px 한계 내). placement 재계산·left·아래이동 안 함. **native 한정**(`if(!IR_HOVER_NATIVE_ONLY)return` — overlay는 irRepositionInitialHover가 clamp+`__irDesired` 소유). collapse(w<60‖h<20) skip, 멱등(`overflow<2` slack + `prevTop===newTop`, 한 스텝 수렴). 드릴은 layout-wrap이 `__irDesired.top` 재적용하므로 그것도 갱신. 스캔 루프 가시성 게이트 직후 와이어. force-log kind `hover-viewport-clamp`. **v263 라이브: clamp 0회 = 정상**(이 세션 호버는 host가 캡되어 화면 안; balloon은 콘텐츠 .rendered-markdown 3168px지 wrapper 아님). 실제 통증은 off-screen이 아니라 scan storm → L99.
+- v264 **L99**: **scan storm 근본 fix** (사용자: "스크롤 원활X + 긴 콘텐츠 스크롤 멈춤"). w=6 v=263 로그(18:09:56~18:10:03): 57623자 호버가 **7.6초간 94회 재스캔**(`viewport-wrap text=57623` ×94, links 0→367+ 단조증가). 원인 = **자기유발 루프**: 우리 `.ir-type-link` span 삽입 → `__irMarkdownObserver`(`document.body` childList/subtree)가 `.rendered-markdown` 안 변경 감지 → `seenScan=true` → `irScheduleScan` → 재스캔이 **57K 전체 재처리**(textContent + candidate 57379 + 206-type regex) + span 몇 개 더 → 무한. L90 수렴(`__irViewportWrap=vpLimit&&wrappedCount>0`)은 progressive wrap이라 94패스 동안 wrappedCount>0 유지돼 안 멈춤. 콘텐츠가 휠 밑에서 계속 reflow = "멈춘 것처럼". **fix: `irIsOwnLinkWrapMutation(mut)`**(childList + added 전부 text-or-`.ir-type-link` + removed 전부 text)면 observer 콜백이 그 mut을 `continue` skip → 자기유발 재스캔 0. 진짜 콘텐츠 swap(element subtree)·스크롤(`irEnsureHoverScrollListener`가 `__irViewportWrap` 재무장+`irScheduleScan`)에서는 스캔 유지 → newly-visible 행 wrap 보존. **검증지표(새 로그 불필요)**: 큰 호버 1개당 `viewport-wrap text=5XXXX` 횟수가 ~94 → 한 자릿수.
+- v264 **라이브 실패** (w=6 v=264, 18:44~46): 57314자 호버 viewport-wrap **95회**(~50ms 간격 burst, 거의 그대로). 원인 = `irIsOwnLinkWrapMutation`의 **버그**: wrap의 `span.appendChild(matchedText)`는 부모에서 텍스트가 **빠지는** mutation(added=[], removed=[text])을 만드는데, `if(!added.length)return false`가 이걸 "우리 것 아님"으로 처리 → 매 스캔 seenScan 세팅(added-record skip이 무의미). → v265에서 수정.
+- v265 **L99-fix + L100**: (a) **storm fix 수정** — `irIsOwnLinkWrapMutation`가 제거 레코드도 처리(added 비어도 removed가 전부 text|ir-type-link면 우리 wrap). 스캔이 매 패스 부르는 geometry/pointer/back-button은 노드 add/remove 안 함(attr/멱등) 확인 → 유일 연속 childList=우리 wrap. (b) **L100 관리층 deprecate**(사용자 "overlay 철저히 deprecate"): v264 churn = `irScheduleManagedHoverVisibilityKeepalive`(22× visibility-keepalive 타이머) → `irReviveRecentlyManagedHover`(VS Code가 invisible化한 호버 되살림=dismiss와 싸움). **둘 다 `if(IR_HOVER_NATIVE_ONLY)return` 게이트**. force-preview(drill-apply)·9391 released-marking↔6657 revive(wrapper 재사용 보호 [[project_single_hover_wrapper]])는 drill 인프라라 **보존**. **v265 배포·설치 완료, 재시작 후 검증 대기**(storm 횟수↓ + 스크롤 smooth + **드릴 여전히 작동?**(revive 게이트라 native re-hover 의존 — 깨지면 visibility-keepalive가 drill에 load-bearing이었던 것)).
+- v265 **라이브 결과**: visibility-keepalive 0✓·revive 0✓(L100 작동) BUT storm 여전(57623→78×, 57314→51×) + **released-revive 23× 잔존**. w=6 v=265 19:06~09 시퀀스 분석: 콘텐츠 len이 **57638↔59293 진동**(가끔 114952=중복) → VS Code가 거대 프리뷰 반복 토크나이즈(**longtask 최대 1603ms**) + 진동이 storm 재스캔 구동. `released native hover revived`(6657)가 진동과 1:1 상관 → **내가 보존한 9391↔6657 release-revive가 churn·진동·(재사용 wrapper stuck-hidden=짧은 호버 안보임)의 공통 원인**으로 판명. host 173px도 진동 중 측정 artifact 의심. clamp 0회=정상(host bottom 화면 안, off-screen 아님).
+- v266 **L101**: **마지막 ungated release writer 게이트**. 9391 else-branch(detached/재사용 root를 hidden+`ir-native-released-hover` 마킹)를 `else if(!IR_HOVER_NATIVE_ONLY)`로 native에서 차단. released-attr 세터는 4504(irMarkNativeHoverReleased, 게이트됨)+9391 둘뿐 → **native에서 release 상태 0** → revive/skip-unchanged 서브시스템 전체 inert. 기대효과: (a) release-revive churn 0, (b) 콘텐츠 진동·storm·longtask↓(진동이 revive 구동이었다면), (c) **짧은 호버 stuck-hidden 해소**(재사용 wrapper가 released로 안 남음). drill 정리의 removeChild(if-branch)는 보존. **v266 라이브**: 일부 개선(57314 storm 51→2, unrenderable-active 0, longtask 29→16/1603→1164ms, revive 23→13) BUT 57623 storm 65× 여전(tight 40ms 루프) + 콘텐츠 진동(57638↔59293) 잔존 + release-revive 13×.
+- v267 **L102 (extension-side, 사용자 승인)**: **VS Code 재렌더 churn 근본 fix**. 조사 결과(extension `[hover] attach native=326 ours=58997` 반복이 증명) = VS Code가 intra-word 마우스 드리프트마다 `$provideHover` 재호출 → extension 재attach → 58997자 재렌더(1164ms 토크나이즈 + renderer storm). 근본원인 = `hoverRequestKey=uri:line:**char**`(extension.ts ~1587)로 **모든 hover dedup이 정확한 글자 위치 keyed** → drift가 새 키 → dedup 우회. renderer L71([[feedback_anchor_moved_compares_range]]: range-not-column)과 동일 버그의 extension판. **fix**: `deliveryGroupKey`(1780)와 `hoverPreviewPrimaryHandleAllowed` 키(1796)를 exact `hoverRequestKey` → **word-anchored `posKey`**(=`hoveredCandidate.anchor`=단어 시작, drift에 안정)로 변경. drill 매칭(1604, 컴포넌트 직접)·fallback(1704)·suppress(1732/1738)는 보존. RENDERER_PATCH_VERSION 267로 마커 bump(extension-only 변경이라 renderer 로그 구분용). 빌드/주입/번들/배포 OK(두 변경 out/extension.js 확정). **재시작 후 검증 대기**: 57623 viewport-wrap 횟수↓·진동 소멸·longtask↓. 메모리 [[project_hover_rerender_exact_position_key]].
+- v267 **라이브 실패**(20:20~24): storm 더 심함(57623→82×), 진동 지속(58984↔59948↔58269), longtask 637ms. L102가 안 통한 이유 = primary 핸들이 deliverablePreviews 비어도 1551에서 `previews`(full) 재attach → word-keying이 primary의 full 재attach를 못 막음. **사용자 핵심 관찰**: extension `attach native=0/158/326 ours=58997/59221` — VS Code의 native LSP hover는 0~326자(거의 빈 것)인데 우리는 58997자 주입. **VS Code가 hover 높이를 host=666x173 또는 666x246(VS Code 내부 max ~252px, L298)으로 잡음 = 우리 콘텐츠(3168px)와 매칭 안 됨.** native가 변하니(0/158/326) 우리 dedup도 변동(58997 1블록/59221 2블록)→진동. 추측 fix(L98~102) 다수 실패 → 측정 우선으로 전환.
+- v268 **L103 (진단)**: `irAuditHoverSize` 추가 — 활성 큰 호버(contentLen≥400)의 **wrapper rect h / host h / scroller h / scrollHeight / clientHeight / maxTop / wrapInlineH** 를 force-log(`hover-size-audit`, 1s/host throttle). 목적: scroller h > wrapper h(=스크롤 썸이 밑으로 빠짐) 인지, maxTop=0(스크롤 불가)인지, VS Code wrapper 높이 vs 우리 콘텐츠 정확 측정 → 추측 없이 사이징 fix. **재시작+Company 호버 후 `grep hover-size-audit log.txt` 읽고 정밀 fix 결정.**
+- v268 **측정 결과 (근본 원인 확정)**: `hover-size-audit` — 큰 호버 `wrapH:250 hostH:246 scrollerH:511 scrollH:30172 maxTop:29661 wrapInlineH:"250px"`; 짧은 호버 `wrapH:177 scrollerH:382 scrollH:382 maxTop:0`. **스모킹건: scrollerH(511) > wrapH(250)** — VS Code는 resizable wrapper를 DEFINITE 인라인(~177/250px, 자기 기본 크기)로 잡는데, 우리 `.monaco-hover{height:auto}`(line 323)는 INDEFINITE라 자식 `.monaco-scrollable-element`의 `height:calc(100%-2px)` 퍼센트가 안 풀려 → `max-height:48vh`(511)로 떨어짐 = wrapper와 무관하게 511px scroller → 스크롤바가 wrapper(250) 바닥 아래로 빠짐("썸 안 보임"). 짧은 호버는 scroller=content=382 > wrapper=177 + maxTop=0 → 바닥 205px가 wrapper 밖인데 스크롤도 안 됨("짧은 내용 안 보임"). 사용자 직감(우리 주입이 scroll 높이 교란) 정확 — 단 범인은 drill 컨트롤이 아니라 height:auto CSS.
+- v269 **L103-fix**: `.monaco-hover{height:auto→100%}`. wrapper 인라인 px(definite)에 대해 풀려 scroller=wrapper-2 → 큰 호버 썸 일치 + 짧은 호버 maxTop>0(스크롤 가능). max-height:48vh는 formation-time(인라인 미설정 시) fallback 캡으로 유지. size-audit 진단 유지(효과 확인용). **재시작 후 검증**: `hover-size-audit`에서 scrollerH≈wrapH, 짧은 호버 maxTop>0; 육안 썸 일치+짧은 호버 끝까지 보임/스크롤됨.
+
+## 현재 OFF — 16 게이트 (`if(IR_HOVER_NATIVE_ONLY)return...` + "DEPRECATED" 주석)
+irStageHover · irFreezeWidth · irAttachWrapperResizeReposition · irRepositionInitialHover · irArmHoverSticky · irMarkNativeHoverReleased · irReleaseNativeHoverManagement · irMarkHoverManaged · irDisposeActiveHoverForEditorTarget · irQuarantineHoverNativeHandle · irReleaseNativeHiddenHover · irDisposeHiddenActiveHover · irScanNarrowHoverWrappers · irRemoveInactiveHoverArtifacts · irDisposeStaleHover · irMakeHoverScrollable. + CSS ternary: resizable-hover width/height 핀 제거 · sash 노출.
+
+## KEPT (우리 역할)
+- **content**: extension `$provideHover` 패치가 `res.contents`에 우리 markdown 첨부 → VS Code 네이티브 MarkdownRenderer 렌더. preview-builder `renderPreviewCodeFences` = head 120줄 하이라이트 + 꼬리 plain fence(언어태그 없음=토크나이즈 0).
+- **drill/cmd+click**: `irScanRenderedMarkdown`의 링크 wrap(.ir-type-link), `irTypeLinkPointerDown`(링크 경로), `irGoToType`→pendingPreviewHover→page-transition→$provideHover→native re-hover.
+- **wheel guard**(`irHoverInternalWheelGuard`/`irPreviewTransitionWheelGuard`): hover 콘텐츠 스크롤 + 경계에서 preventDefault(over-scroll이 에디터로 전파→dismiss되는 것 방지). **관리 아님 — 게이트 금지(L97 교훈).**
+- **size cap CSS**(.monaco-resizable-hover max-height:48vh + scroller overflow:auto): balloon 방지 — 유지 필요.
+- **force-preview**(`irForcePreviewHoverVisible`): 드릴 가시성. flicker 의심 후보(아래 미해결 2).
+
+## ★ 핵심 통찰 / 함정 (시간 많이 쓴 것)
+1. **VS Code는 우리가 주입한 거대 콘텐츠를 네이티브로 캡하지 않음**(v255 balloon 입증). → size cap을 우리가 **반드시** 유지 → 고정 캡이 VS Code 네이티브 배치와 충돌 → **#1(스크롤 끝 스크롤바 화면밖/하단 짤림)은 구조적**. "100% native size" 불가. 유일 해법 = **뷰포트 클램프**(현재 no-op인 `irKeepHoverInViewport` ~L7976 최소 재활성: hover 하단이 뷰포트 밖이면 위로 nudge). 이게 불가피한 단 하나의 size 관리.
+2. **`!important` 스타일시트는 인라인을 이김** → native resize 살리려면 override 말고 **제거**해야(L92).
+3. **flag hoisting**: IR_HOVER_NATIVE_ONLY는 CSS 배열보다 위에서 할당(동기 실행).
+4. **renderer-patch는 통째 template literal**: backtick·dollar-brace 보간·단일 backslash 이스케이프(개행/탭 등은 이중으로) 금지. tsc는 통과해도 주입이 깨짐. **수정 후 필수 검증**: 주입 — `node -e "new Function(require('./out/renderer-patch.js').getHoverPatchScript())"`; + 단일-backslash 이스케이프 재스캔(이전 세션 노드 스크립트 재사용, [[feedback_no_backticks_in_renderer_patch]]). (세션 시작 때 HEAD에 깨진 개행 이스케이프 3곳이 있어 overlay조차 주입 실패하던 것 발견·수정.)
+5. **head/tail split = perf 레버**(full-highlight는 1657줄 동기 토크나이즈 = 1.5초 블록 + 드릴 page-transition 만료 유발).
+6. **wheel guard는 scroll 지원이지 관리 아님** — 게이트하면 over-scroll이 에디터로 전파→dismiss(#4 회귀, v261→v262).
+7. **로그는 창 혼재**: w=6=현재 테스트 창(v262), w=3/w=4=다른 옛 창. 분석은 `grep "w=6 v=NNN"` + 시간 슬라이스 필수([[feedback_log_mixes_windows]]).
+8. **flicker** = release(`irReleaseNativeHoverManagement`, "outside-editor-new-token" 등)↔revive(`irTouchHoverRootContent`)↔force-preview keepalive churn. v262에서 release 게이트로 차단 시도(미검증).
+
+## 미해결 (다음 세션 우선순위)
+1. **v265 라이브 검증 (storm fix 수정 + L100 관리 게이트)** — 재시작 후: (a) 큰 호버 `viewport-wrap text=5XXXX` 횟수 ~95→**한자릿수**(storm 죽음?), (b) 스크롤 smooth·안 멈춤, (c) **드릴 여전히 작동?** — revive/visibility-keepalive 게이트라 drill이 native re-hover만으로 살아있어야 함. **드릴이 깨지면**(클릭 후 호버 사라짐/안 뜸) visibility-keepalive가 drill에 load-bearing이었던 것 → 게이트를 drill-only 예외로 좁히거나 native re-hover 보강.
+2. **긴 호버 스크롤이 여전히 안 되면**(휠 `max=0`) 별건 = scroller 캡 미적용. 큰 호버 `.monaco-scrollable-element`가 `max-height:48vh`+`overflow:auto` 실제로 먹는지 직접 확인(native에서 `irMakeHoverScrollable` 게이트 OFF→CSS-only 의존). 필요시 native scroll-only 최소 헬퍼.
+3. **#1 클램프(L98/v263) 검증** — 구현·배포됨, 발동 case 미발생(0회=정상). hover 하단이 실제 화면 밖인 case(뷰포트 하단 근처 큰 심볼)에서 `hover-viewport-clamp` 발동+하단 보이는지.
+4. **남은 관리 churn 후속**(필요시): force-preview-zero-rect-transient(L78 keepalive)·force preview hover(drill-apply)가 아직 native에서 발동. drill 인프라라 보존했으나, 사용자가 여전히 "overlay 느낌"이면 force-preview도 게이트 검토(drill은 native re-hover). 9391↔6657 released-revive는 wrapper 재사용 보호라 마지막에.
+
+## 빌드/검증/배포/측정
+```
+npm run compile && node -e "var m=require('./out/renderer-patch.js');new Function(m.getHoverPatchScript());console.log('INJECT OK v='+m.RENDERER_PATCH_VERSION)" && npm run bundle
+npm run deploy:local     # 패키징+설치 → VS Code 재시작
+# 로그 분석(단일 창, 시간 슬라이스):
+awk 'substr($0,12,8)>="HH:MM:00"' log.txt | grep "w=6 v=262" > /tmp/s.txt
+```
+
+## 관련 메모리
+[[project_native_hover_only_switch]] (이번 세션 전체 — 가장 상세, L89~L97), [[project_native_drill_eager_wrap]] (viewport-wrap/balloon), [[project_hover_jank_is_content_tokenization]] (head/tail), [[feedback_no_backticks_in_renderer_patch]] (주입 검증), [[feedback_log_mixes_windows]] (창 혼재).
+
+---
+
 # Handover: hover stability (pillar/position/collapse/staging) — L48~L81 + 모듈 refactor (Phase 2~16)
 
 작성 시점: 2026-05-28 KST (저녁)

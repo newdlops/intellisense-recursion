@@ -63,7 +63,7 @@ export const hoverFallbackPrimaryHandles = new Map<string, { handle: number; cle
 // content delivery. Separate from the preview and fallback maps for the
 // same reason those are separate from each other: the three paths fire on
 // different request keys/timing and must not steal each other's primary slot.
-// L108 (2026-06-01): in native mode VS Code renders each provider handle's
+// L111 (2026-06-01): in native mode VS Code renders each provider handle's
 // result as its own hover-row. The drill path used to return the full preview
 // for EVERY handle in the showHover fanout, so a 1657-line class stacked 5×
 // (59K→295K) and VS Code re-tokenized/re-laid-out the widget O(N²) — 11.5s of

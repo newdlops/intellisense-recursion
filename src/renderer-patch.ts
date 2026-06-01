@@ -17,11 +17,34 @@
 // Cross-module dependencies: none. The string is opaque to TS — embedded
 // JS comments / banners inside it are NOT TS structure.
 
-// v277 (L108, 2026-06-01): no renderer-patch change — bumped as a build marker so
-// the log's v= confirms the ext-side drill fix (primary-handle gate on the
-// page-transition content return; stops native mode from stacking the drill
-// preview N× per showHover fanout) is the loaded build after a window reload.
-export const RENDERER_PATCH_VERSION = 277;
+// v279 (L111+L112+L113, 2026-06-01): the log's v= confirms which build is loaded.
+// (L108/L109/L110 were already taken by prior work; this session's fixes are L111+.)
+//   L111 — primary-handle gate on the page-transition (drill) content return, so
+//          native mode stops stacking the drill preview N× per showHover fanout
+//          (was 11.5s on a 1657-line class). [ext-host]
+//   L112 — retry the renderer-injection CDP discovery with backoff instead of giving
+//          up to the 5-minute safety timer; a transient inspector race on reload left
+//          the patch uninjected and drill dead (2026-06-01 10:46). [ext-host]
+//   L113 — native mode skips the dead "outside-editor-new-token" management branch in
+//          irHoverGuard (logged managed={disposed} 80×/session of pure overlay churn).
+//   L114 — native mode early-returns from irHoverGuard doing ONLY drill-link wrapping;
+//          skips ALL remaining management (active-near-non-editor-pass +
+//          stopImmediatePropagation storm, sticky/release/refire, .ir-keepalive). The
+//          per-branch gating (L113) was whack-a-mole; this abandons overlay wholesale.
+//   L115 — scroll listener re-arms __irViewportWrap + re-scans ONLY for huge (>24K)
+//          band-wrapped blocks; small hovers no longer re-tokenize every scroll tick
+//          (mtk≈108ms storm = "char col 변경시 hover 깨짐").
+//   L116 — (REVERTED by L117) tried to grow large hovers past VS Code's minimal ~177px box.
+//   L117 — reverted L116 (intrinsic wrapper broke host height:100% → scroll died, maxTop:0).
+//   L118 — (ROLLED BACK by L119) all-content-driven sizing to grow the box to content.
+//   L119 — rolled back L118: the taller box covered the symbol. Settled: VS Code owns box height
+//          AND placement; accept its (smaller) height — box scrolls. (v283 A state.)
+//   L120 — KEEP the resize sash in native (was hidden by the unconditional .ir-scrollable
+//          scrollbar-hide rules) so the user can manually drag a small drill hover taller
+//          (up to our 48vh/680px caps). The manual escape hatch for "drill 높이 낮아서 안보여"
+//          since auto-grow is impossible (L116/L118). JS quarantine/grab-dismiss already gated.
+// If the running window still logs v<286, the new build is NOT loaded yet.
+export const RENDERER_PATCH_VERSION = 286;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -344,6 +367,11 @@ style.textContent=[
   // itself stays at VS Code's (arbitrary 246/177) height so native resize keeps
   // working. Growing the box to content is a separate opt-in (see wrapper rule
   // below). cf. project_hover_rerender_exact_position_key.
+  // L119 (2026-06-01): ROLLED BACK L118. The all-content-driven box (grow to content/48vh)
+  // made the box taller, and VS Code positions a taller hover OVER the symbol it describes
+  // (user: "호버 위치가 심볼을 가리네"). Back to A (v283): host height:100% fills VS Code's
+  // definite box, scroller flex-fills it, box stays VS Code's (smaller) height + placement.
+  // Growing the box conflicts with native placement; not pursued further without a position fix.
   '.monaco-resizable-hover .monaco-hover,.monaco-resizable-hover .monaco-editor-hover{display:flex !important;flex-direction:column !important;width:min(max-content,680px) !important;height:100% !important;min-width:0 !important;min-height:0 !important;max-width:680px !important;max-height:48vh !important;visibility:visible !important}',
   '.monaco-resizable-hover .monaco-hover .monaco-scrollable-element,.monaco-resizable-hover .monaco-editor-hover .monaco-scrollable-element{flex:1 1 auto !important;width:calc(100% - 2px) !important;height:auto !important;max-width:calc(100% - 2px) !important;max-height:none !important;min-width:0 !important;min-height:0 !important;overflow:auto !important;overscroll-behavior:contain !important;margin:1px !important}',
   '.monaco-resizable-hover .monaco-hover .monaco-hover-content,.monaco-resizable-hover .monaco-hover .hover-row,.monaco-resizable-hover .monaco-hover .hover-row-contents,.monaco-resizable-hover .monaco-hover .markdown-hover,.monaco-resizable-hover .monaco-hover .rendered-markdown{width:auto !important;height:auto !important;max-width:100% !important;max-height:none !important;min-width:0 !important;min-height:0 !important;overflow:visible !important}',
@@ -368,9 +396,12 @@ style.textContent=[
   // — max-width:680 still clamps VS Code's transient 1800px mid-resize write. Managed = original pin.
   // L104 NOTE (2026-05-31): height:max-content is INTENTIONALLY non-!important here so the wrapper
   // keeps VS Code's inline height (resize works). The L104 scroll-fit fix lives on the host/scroller
-  // (flex, above), NOT here. To make the box GROW to content (capped at 48vh) instead of staying at
-  // VS Code's height, this would become height:max-content with !important added — but that overrides
-  // VS Code's inline height and DISABLES native resize. That trade-off is a separate, opt-in decision.
+  // (flex, above), NOT here.
+  // L104 NOTE: height:max-content is non-!important so the wrapper keeps VS Code's inline height
+  // (resize + native placement work). L116/L118 both tried to grow it to content and both
+  // regressed (L116: scroll died maxTop:0; L118: taller box covered the symbol). Conclusion:
+  // VS Code owns the box height AND placement — growing the box past VS Code's height fights its
+  // positioning. Accept VS Code's (smaller) height; the box scrolls. cf. feedback_vscode_owns_hover_height.
   (IR_HOVER_NATIVE_ONLY
     ? '.monaco-resizable-hover{box-sizing:border-box !important;width:min(max-content,680px);height:max-content;max-width:680px !important;max-height:48vh !important;min-width:0 !important;min-height:0 !important;overflow:hidden !important;transform:none !important;padding:0 !important;margin:0 !important;pointer-events:auto !important;z-index:2147483647 !important;border:2px solid var(--vscode-focusBorder, var(--vscode-editorHoverWidget-border, rgba(128,128,128,0.85))) !important;border-radius:4px !important}'
     : '.monaco-resizable-hover{box-sizing:border-box !important;width:min(max-content,680px) !important;height:max-content !important;max-width:680px !important;max-height:48vh !important;min-width:0 !important;min-height:0 !important;overflow:hidden !important;transform:none !important;padding:0 !important;margin:0 !important;pointer-events:auto !important;z-index:2147483647 !important;border:2px solid var(--vscode-focusBorder, var(--vscode-editorHoverWidget-border, rgba(128,128,128,0.85))) !important;border-radius:4px !important}'),
@@ -408,8 +439,20 @@ style.textContent=[
   // in both width and height; the bbox-corner assertion checks against that.
   '.monaco-hover.ir-scrollable > .monaco-scrollable-element,.monaco-editor-hover.ir-scrollable > .monaco-scrollable-element{overflow:auto !important;overscroll-behavior:contain !important;width:calc(100% - 2px) !important;height:calc(100% - 2px) !important;max-width:calc(100% - 2px) !important;max-height:calc(48vh - 2px) !important;margin:1px !important;border:0 !important;outline:0 !important;box-shadow:none !important}',
   '.monaco-hover.ir-scrollable > .monaco-scrollable-element > .scrollbar,.monaco-hover.ir-scrollable > .monaco-scrollable-element > .shadow,.monaco-editor-hover.ir-scrollable > .monaco-scrollable-element > .scrollbar,.monaco-editor-hover.ir-scrollable > .monaco-scrollable-element > .shadow{display:none !important}',
-  '.monaco-hover.ir-scrollable .scrollbar,.monaco-hover.ir-scrollable .slider,.monaco-hover.ir-scrollable .shadow,.monaco-hover.ir-scrollable .sash,.monaco-hover.ir-scrollable .monaco-sash,.monaco-hover.ir-scrollable .scroll-decoration,.monaco-hover.ir-scrollable .decorationsOverviewRuler,.monaco-editor-hover.ir-scrollable .scrollbar,.monaco-editor-hover.ir-scrollable .slider,.monaco-editor-hover.ir-scrollable .shadow,.monaco-editor-hover.ir-scrollable .sash,.monaco-editor-hover.ir-scrollable .monaco-sash,.monaco-editor-hover.ir-scrollable .scroll-decoration,.monaco-editor-hover.ir-scrollable .decorationsOverviewRuler{display:none !important;visibility:hidden !important;pointer-events:none !important;border:0 !important;outline:0 !important;box-shadow:none !important;background:transparent !important}',
-  '.monaco-hover.ir-scrollable [class*="sash"],.monaco-hover.ir-scrollable [class*="scrollbar"],.monaco-editor-hover.ir-scrollable [class*="sash"],.monaco-editor-hover.ir-scrollable [class*="scrollbar"]{display:none !important;visibility:hidden !important;pointer-events:none !important;opacity:0 !important;border:0 !important;outline:0 !important;box-shadow:none !important;background:transparent !important}',
+  // L120 (2026-06-01): native mode KEEPS the resize sash so the user can drag a small
+  // drill hover taller (box can't auto-grow — that covered the symbol, L116/L118; the sash
+  // is the manual escape hatch the user asked for: "핸들이라도 잘 쓰게 하자"). These rules
+  // hide the scrollbar/slider/shadow/decorations for a clean look but USED to also hide
+  // .sash/.monaco-sash/[class*=sash] — unconditionally, so the resize handle was dead in
+  // native too (line 419's sash-hide was gated; these weren't). Drop the sash selectors in
+  // native; managed mode still hides everything. Resize is bounded by our caps (max-width:680,
+  // max-height:48vh). The JS sash quarantine + grab-dismiss are already gated (L93/L94).
+  (IR_HOVER_NATIVE_ONLY
+    ? '.monaco-hover.ir-scrollable .scrollbar,.monaco-hover.ir-scrollable .slider,.monaco-hover.ir-scrollable .shadow,.monaco-hover.ir-scrollable .scroll-decoration,.monaco-hover.ir-scrollable .decorationsOverviewRuler,.monaco-editor-hover.ir-scrollable .scrollbar,.monaco-editor-hover.ir-scrollable .slider,.monaco-editor-hover.ir-scrollable .shadow,.monaco-editor-hover.ir-scrollable .scroll-decoration,.monaco-editor-hover.ir-scrollable .decorationsOverviewRuler{display:none !important;visibility:hidden !important;pointer-events:none !important;border:0 !important;outline:0 !important;box-shadow:none !important;background:transparent !important}'
+    : '.monaco-hover.ir-scrollable .scrollbar,.monaco-hover.ir-scrollable .slider,.monaco-hover.ir-scrollable .shadow,.monaco-hover.ir-scrollable .sash,.monaco-hover.ir-scrollable .monaco-sash,.monaco-hover.ir-scrollable .scroll-decoration,.monaco-hover.ir-scrollable .decorationsOverviewRuler,.monaco-editor-hover.ir-scrollable .scrollbar,.monaco-editor-hover.ir-scrollable .slider,.monaco-editor-hover.ir-scrollable .shadow,.monaco-editor-hover.ir-scrollable .sash,.monaco-editor-hover.ir-scrollable .monaco-sash,.monaco-editor-hover.ir-scrollable .scroll-decoration,.monaco-editor-hover.ir-scrollable .decorationsOverviewRuler{display:none !important;visibility:hidden !important;pointer-events:none !important;border:0 !important;outline:0 !important;box-shadow:none !important;background:transparent !important}'),
+  (IR_HOVER_NATIVE_ONLY
+    ? '.monaco-hover.ir-scrollable [class*="scrollbar"],.monaco-editor-hover.ir-scrollable [class*="scrollbar"]{display:none !important;visibility:hidden !important;pointer-events:none !important;opacity:0 !important;border:0 !important;outline:0 !important;box-shadow:none !important;background:transparent !important}'
+    : '.monaco-hover.ir-scrollable [class*="sash"],.monaco-hover.ir-scrollable [class*="scrollbar"],.monaco-editor-hover.ir-scrollable [class*="sash"],.monaco-editor-hover.ir-scrollable [class*="scrollbar"]{display:none !important;visibility:hidden !important;pointer-events:none !important;opacity:0 !important;border:0 !important;outline:0 !important;box-shadow:none !important;background:transparent !important}'),
   '.ir-native-hover-handle-hidden{display:none !important;visibility:hidden !important;pointer-events:none !important;opacity:0 !important;width:0 !important;height:0 !important;min-width:0 !important;min-height:0 !important;max-width:0 !important;max-height:0 !important;border:0 !important;outline:0 !important;box-shadow:none !important;background:transparent !important}',
   '.monaco-hover.ir-native-released-hover,.monaco-editor-hover.ir-native-released-hover{visibility:hidden !important;pointer-events:none !important}',
   '.ir-hover-artifact-hidden{display:none !important;visibility:hidden !important;pointer-events:none !important;opacity:0 !important}',
@@ -451,6 +494,7 @@ style.textContent=[
   // content scrolls inside. (--ir-drill-max-h is dead — its JS setter is disabled
   // — so the old var() fallback was always plain 48vh anyway.)
   '.monaco-resizable-hover:has(a[href*="previewBack"]),.monaco-resizable-hover:has(a[data-href*="previewBack"]){max-height:48vh !important}',
+  // L119: rolled back to A — drill host fills the wrapper, scroller uncapped (flex-fills).
   '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-hover,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-hover{max-height:100% !important}',
   '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-scrollable-element,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-scrollable-element{max-height:none !important}',
   // L47: native virtual list for large hover bodies. content-visibility:
@@ -4964,6 +5008,27 @@ function irHoverGuardShouldLogDedup(el,e){
   }catch(_){return true}
 }
 function irHoverGuard(e){
+  if(IR_HOVER_NATIVE_ONLY){
+    // L114 (2026-06-01): native mode — VS Code owns the ENTIRE hover lifecycle
+    // (show/dismiss/sticky/position/scroll). Every managed-mode branch below
+    // FIGHTS it: active-near-non-editor-pass + the inside-hover path both call
+    // e.stopImmediatePropagation() (swallowing the mouse events VS Code needs),
+    // plus sticky arming / release / refire / .ir-keepalive tracking. Gating only
+    // the individual action fns (L89/L97/L110) and branch 3 (L113) left branch 2
+    // storming every pointermove near the hover and breaking native handling
+    // (user: "native를 안쓰고 overlay를 다시 주입해서 깨지고 있음 — 우린 overlay를 버렸음").
+    // Keep ONLY the drill affordance: wrap the type name under the pointer into a
+    // clickable .ir-type-link (the click itself is handled separately by
+    // irTypeLinkPointerDown, which also wraps on its own). No propagation
+    // interference, no lifecycle management. cf. project_native_hover_only_switch.
+    try{
+      if(e&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='pointerover'||e.type==='mouseover')
+        &&irClosestHover(e.target)){
+        try{irWrapWordAtPoint(e)}catch(_){}
+      }
+    }catch(_){}
+    return;
+  }
   try{irDisposeHiddenActiveHover('hoverguard')}catch(_){}
   if(irClosestNativePopup(e&&e.target)){
     try{
@@ -5000,10 +5065,17 @@ function irHoverGuard(e){
       }
       return;
     }
-    if(activeEditorHover&&irHoverHasManagedContent(activeEditorHover)
+    if(!IR_HOVER_NATIVE_ONLY&&activeEditorHover&&irHoverHasManagedContent(activeEditorHover)
       && irIsHoverRelocationEvent(e)
       && irEventTargetsEditorSurface(e)
       && !irClosestHover(e.target)){
+      // L113 (2026-06-01): native mode skips this whole "outside-editor-new-token"
+      // branch. Its actions are already no-ops in native (irReleaseNativeHoverManagement
+      // L97, irRequestNativeShowHover L110, irArmHoverSticky L89), yet the branch still
+      // evaluated, logged "managed={disposed}", and returned on EVERY mousemove over an
+      // editor token while a drill hover was up (80 events in one 11:03 session) — dead
+      // overlay-management churn the user read as "still injecting overlay". VS Code
+      // shows the new-token hover natively. cf. project_native_hover_only_switch.
       var editorMoveToken=irEventTargetTokenText(e);
       if(editorMoveToken&&!irHoverContainsTokenText(activeEditorHover,editorMoveToken)){
         irReleaseHoverSticky(activeEditorHover);
@@ -9893,7 +9965,23 @@ function irEnsureHoverScrollListener(hoverHost){
       // (irScanRenderedMarkdown) clears __irViewportWrap once a band is fully
       // wrapped; a scroll reveals new off-screen rows, so re-enable the skip-
       // bypass here. This flag flip is cheap (no layout, no textContent read).
-      try{var bs=hoverHost.querySelectorAll?hoverHost.querySelectorAll('.rendered-markdown'):null;if(bs)for(var bi=0;bi<bs.length;bi++){bs[bi].__irViewportWrap=true;}}catch(_){}
+      // L115 (2026-06-01): re-arm ONLY blocks large enough to use band wrapping
+      // (deferEagerWrap, > IR_HOVER_EAGER_WRAP_MAX_TEXT). Small blocks are wrapped
+      // whole on the first scan, so __irViewportWrap=true there just forces both
+      // scan guards (irScanRenderedMarkdown ~10091/10119) to fail → a full
+      // re-tokenize (mtk≈108ms, wrapped=0) on EVERY scroll/momentum tick of a
+      // small hover (743-char "Service" hover re-scanned ~5×/sec = the jank the
+      // user saw as "char col 변경시 hover가 깨져"). Gate on the cached scan text
+      // length (O(1), no re-materialization); if nothing needs band wrapping,
+      // skip the re-arm AND the debounced re-scan entirely.
+      var needsBandWrap=false;
+      try{
+        var bs=hoverHost.querySelectorAll?hoverHost.querySelectorAll('.rendered-markdown'):null;
+        if(bs)for(var bi=0;bi<bs.length;bi++){
+          if((bs[bi].__irLastScanText||'').length>IR_HOVER_EAGER_WRAP_MAX_TEXT){bs[bi].__irViewportWrap=true;needsBandWrap=true;}
+        }
+      }catch(_){}
+      if(!needsBandWrap)return;
       // L107 (2026-06-01): DEBOUNCE the heavy wrap re-scan during scrolling.
       // A wheel scroll of a 57K-char / 1657-line class hover ("company") used to
       // fire a FULL block re-scan PER wheel tick: re-read 57K textContent, rebuild

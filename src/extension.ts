@@ -1632,7 +1632,7 @@ function patchSharedService(service: any) {
       if (preview.matchCount === 1) {
         log.info(`[hover] page-transition handle=${handle} → "${preview.identifier}"`);
       }
-      // L108 (2026-06-01): deliver the drill content for ONE handle only.
+      // L111 (2026-06-01): deliver the drill content for ONE handle only.
       // VS Code fans the showHover out to every registered provider handle and,
       // in native mode (no renderer management layer to collapse duplicates),
       // renders each returned result as its own hover-row. Returning
@@ -2180,6 +2180,13 @@ async function injectRendererViaTestRemoteDebugging() {
   }
 }
 
+// L112 (2026-06-01): how many extra discovery rounds to run before giving up to the
+// 5-minute reinject safety timer. The renderer's V8 inspector occasionally takes longer
+// than the initial 500ms to start listening after SIGUSR1 (window-reload race);
+// without these retries a single miss leaves the renderer patch uninjected for
+// up to 5 minutes (drill/scan dead). cf. 2026-06-01 10:46 injection failure.
+const IR_INJECT_DISCOVERY_RETRIES = 4;
+
 async function injectRenderer() {
   if (isTestRendererDebugMode()) {
     await injectRendererViaTestRemoteDebugging();
@@ -2202,11 +2209,32 @@ async function injectRenderer() {
     log.info('[inject] SIGUSR1 sent, waiting for inspector...');
     await new Promise(r => setTimeout(r, 500));
 
-    const wsUrl = await findInspectorWebSocketUrlForPid(mainPid);
+    // The renderer's V8 inspector can take longer than 500ms to start listening
+    // after SIGUSR1 — especially right after a window reload, when the renderer
+    // process is still coming up. A single miss here used to fall straight
+    // through to the 5-minute reinject safety timer (setInterval in activate),
+    // leaving the renderer patch UNINJECTED: hovers still render (ext-host
+    // $provideHover is patched) but nothing wraps type-links or handles drill
+    // clicks, so drill silently dies for minutes. Observed 2026-06-01 10:46 —
+    // "no inspector WebSocket matched main PID" once on reload and drill was dead
+    // for the rest of the session. Retry discovery a few times with backoff,
+    // re-arming the inspector each round in case the first SIGUSR1 raced ahead of
+    // Electron's handler. SIGUSR1 is idempotent (re-sending when the inspector is
+    // already open is a no-op).
+    let wsUrl = await findInspectorWebSocketUrlForPid(mainPid);
+    for (let attempt = 1; !wsUrl && attempt <= IR_INJECT_DISCOVERY_RETRIES; attempt++) {
+      if (extensionDeactivated) { return; }
+      const backoffMs = 500 * attempt;
+      log.warn(`[inject] inspector not found yet (attempt ${attempt}/${IR_INJECT_DISCOVERY_RETRIES}) — re-arming + waiting ${backoffMs}ms`);
+      try { process.kill(mainPid, 'SIGUSR1'); } catch {}
+      await new Promise(r => setTimeout(r, backoffMs));
+      wsUrl = await findInspectorWebSocketUrlForPid(mainPid);
+    }
     if (!wsUrl) {
       log.warn('[inject] No matching CDP WebSocket URL found');
       return;
     }
+    log.info('[inject] inspector found, injecting renderer patch');
     log.info(`[inject] Connecting WebSocket...`);
     const ws = new WebSocket(wsUrl);
     const workspacePathForRenderer = workspaceRootFsPath() ?? '';
