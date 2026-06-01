@@ -39,12 +39,15 @@
 //   L118 — (ROLLED BACK by L119) all-content-driven sizing to grow the box to content.
 //   L119 — rolled back L118: the taller box covered the symbol. Settled: VS Code owns box height
 //          AND placement; accept its (smaller) height — box scrolls. (v283 A state.)
-//   L120 — KEEP the resize sash in native (was hidden by the unconditional .ir-scrollable
-//          scrollbar-hide rules) so the user can manually drag a small drill hover taller
-//          (up to our 48vh/680px caps). The manual escape hatch for "drill 높이 낮아서 안보여"
-//          since auto-grow is impossible (L116/L118). JS quarantine/grab-dismiss already gated.
-// If the running window still logs v<286, the new build is NOT loaded yet.
-export const RENDERER_PATCH_VERSION = 286;
+//   L120 — KEEP the resize sash in native so the user can drag a small drill hover taller.
+//   L121 — cache the candidate-name list + alternation regex per block (viewport-wrap re-scan reuse).
+//   L122 — native cleanup of OUR bookkeeping when VS Code dismisses the active hover. The gated
+//          dispose (L95) left __irActiveHoverEl pointing at the dead hover AND its MutationObserver
+//          running → the scan + observer kept firing on the dismissed widget = CPU that "persists
+//          after the hover is gone" (the real residual-CPU leak). Now drop ref + stop observer +
+//          clear timers (safe bookkeeping, no visibility writes). cf. project_drill_cpu_wheel_rescan.
+// If the running window still logs v<288, the new build is NOT loaded yet.
+export const RENDERER_PATCH_VERSION = 288;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -6653,6 +6656,28 @@ function irReviveRecentlyManagedHover(root,reason){
   }catch(_){}
   return false;
 }
+function irNativeReleaseDismissedHoverBookkeeping(root){
+  // L122 (2026-06-01): native-mode cleanup of OUR bookkeeping when VS Code has dismissed
+  // the active hover (it went non-renderable / got the hidden class). The full release
+  // (irReleaseNativeHiddenHover / irDisposeHiddenActiveHover) is gated off in native (L95-L97)
+  // because it fought VS Code's dismiss (hide/revive/reposition). But gating it ALSO stopped us
+  // dropping __irActiveHoverEl + stopping the per-hover MutationObserver (__irActiveHoverHandle
+  // Observer, childList+attributes on the subtree) + clearing timers — so the scan kept treating
+  // the dead hover as active and that observer kept firing on VS Code's mutations to the reused/
+  // hidden widget. That is the CPU that "persists after the hover is gone" (user: cleanup missing).
+  // This does ONLY safe bookkeeping: stop the observer, drop the ref, clear timers. NO visibility/
+  // class/position writes — so if VS Code revives the widget the scan simply re-detects it as
+  // active (scan-fallback); no release<->revive flicker (cf. feedback_zero_rect_with_content_is_transient).
+  try{
+    if(window.__irActiveHoverEl===root){
+      try{irStopActiveHoverHandleObserver();}catch(_){}
+      window.__irActiveHoverEl=null;
+    }
+  }catch(_){}
+  try{if(root&&root.__irStickyTimer){irClearTimer(root.__irStickyTimer);root.__irStickyTimer=null;}}catch(_){}
+  try{if(root&&root.__irScrollScanTimer){clearTimeout(root.__irScrollScanTimer);root.__irScrollScanTimer=null;}}catch(_){}
+  try{if(root&&root.__irFitFrame){cancelAnimationFrame(root.__irFitFrame);root.__irFitFrame=null;}}catch(_){}
+}
 function irReleaseNativeHiddenHover(root,reason,visibilityReason){
   // L95 (2026-05-31) DEPRECATED in native mode: VS Code owns dismiss/release. Our release on 0x0
   // transients (hidden-active-hoverguard / active-switch) dismissed the hover during native resize
@@ -7106,7 +7131,12 @@ function irShouldProcessHoverBlock(hoverHost,block){
     irClearEmptyHoverRoot(hoverHost);
     var active=window.__irActiveHoverEl;
     if(active&&document.body&&document.body.contains(active)&&!irIsRenderableHoverRoot(active)){
-      irDisposeHiddenActiveHover('scan');
+      // L122: native keeps VS Code's dismiss but still clears OUR bookkeeping (the gated
+      // irDisposeHiddenActiveHover is a no-op in native — that left the dead hover "active"
+      // and its observer running = CPU persisting after the hover). Managed mode keeps the
+      // full dispose.
+      if(IR_HOVER_NATIVE_ONLY)irNativeReleaseDismissedHoverBookkeeping(active);
+      else irDisposeHiddenActiveHover('scan');
       active=window.__irActiveHoverEl;
     }
     if(hoverHost&&!irIsRenderableHoverRoot(hoverHost)){
@@ -10184,9 +10214,25 @@ function irScanRenderedMarkdown(){
       continue;
     }
     var skip=IR_HOVER_LINK_SKIP;
-    var candidateText=irHoverLinkCandidateText(block,text);
     var deferEagerWrap=text.length>IR_HOVER_EAGER_WRAP_MAX_TEXT;
-    var types=irCollectHoverLinkNames(candidateText,skip,deferEagerWrap);
+    // L121 (2026-06-01): cache the candidate-name list + regex per block, keyed on the
+    // scanned text. A huge (viewport-wrapped) hover re-runs this scan on every scroll
+    // settle to wrap the newly-visible band, but the content is UNCHANGED. Rebuilding the
+    // ~206-name candidate list (a full scan of 57K chars) and recompiling the alternation
+    // regex on each re-scan was the residual CPU on big drill hovers (the only big "ours"
+    // cost — VS Code's tokenization longtasks are separate/attribution:unknown). Reuse on
+    // text match; the tree-walk + band-wrap below still run. linkRe is reset per text node
+    // (lastIndex=0) so the shared regex object is safe to reuse.
+    var candidateText,types,cachedLinkRe=null;
+    if(block.__irScanCacheText===text&&block.__irScanCacheTypes){
+      candidateText=block.__irScanCacheCandidateText||text;
+      types=block.__irScanCacheTypes;
+      cachedLinkRe=block.__irScanCacheRegex||null;
+    }else{
+      candidateText=irHoverLinkCandidateText(block,text);
+      types=irCollectHoverLinkNames(candidateText,skip,deferEagerWrap);
+      try{block.__irScanCacheText=text;block.__irScanCacheCandidateText=candidateText;block.__irScanCacheTypes=types;block.__irScanCacheRegex=null;}catch(_){}
+    }
     irSetHoverLinkCandidates(block,types);
     block.__irLastScanText=text;
     // L77 (2026-05-29): defer the heavy navigable-name wrapping while this hover
@@ -10232,11 +10278,12 @@ function irScanRenderedMarkdown(){
     if(vpLimit){
       irLogHoverScanDecision('viewport-wrap',block,hoverHost,text,candidateText,types,'existing='+existingLinks);
     }
-    var linkRe=irBuildHoverLinkRegex(types);
+    var linkRe=cachedLinkRe||irBuildHoverLinkRegex(types);   // L121: reuse compiled regex across same-text re-scans
     if(!linkRe){
       irLogHoverScanDecision('skip-no-regex',block,hoverHost,text,candidateText,types,'');
       continue;
     }
+    if(!cachedLinkRe){try{block.__irScanCacheRegex=linkRe;}catch(_){}}
     var walker=document.createTreeWalker(block,NodeFilter.SHOW_TEXT);
     var node,textNodes=[];
     while(node=walker.nextNode()){textNodes.push(node)}
