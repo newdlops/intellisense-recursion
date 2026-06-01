@@ -51,13 +51,14 @@
 //   L127 — coalesce the on-demand wrap in native irHoverGuard (pointer dedup ±4px/40ms; ~halves it).
 //   L128 — REVERTED L125's line cap (truncation not wanted). Full content; cost held by L123+L126.
 //   L129 — (superseded by L130) head highlight 60->200.
-//   L130 — user chose B: FULL highlight, NO head/tail split (whole preview = one ```lang fence).
-//          Color throughout while scrolling. TRADEOFF accepted: VS Code tokenizes the whole block
-//          synchronously on show → ~1ms/line freeze (1657-line class ≈ ~1.7s). Only the tokenization
-//          freeze returns; other perf fixes (band-wrap L126, no-scroll-storm L124, dismiss cleanup
-//          L122, per-move dedup L127) stay. [ext-host/preview-builder]
-// If the running window still logs v<296, the new build is NOT loaded yet.
-export const RENDERER_PATCH_VERSION = 296;
+//   L130 — user chose B: FULL highlight, NO head/tail split. Freeze acceptable even on a 52k class.
+//   L131 — free retained per-block scan caches on dismiss (memory leak fix). Confirmed our code is
+//          clean post-dismiss: 19:10+ log had 0 ir-sync-longtask (all 20 longtasks attribution:
+//          unknown = VS Code) and no extension hover-resolves after the last hover — the residual
+//          CPU/retained 52k DOM is VS Code's (full-highlight B + VS Code keeps hidden hover content).
+//   L132 — hover border 2px -> 1px (user: thinner).
+// If the running window still logs v<298, the new build is NOT loaded yet.
+export const RENDERER_PATCH_VERSION = 298;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -396,14 +397,11 @@ style.textContent=[
   // inline width="1800px" wins; we use width:min() to combine our
   // soft sizing with a hard ceiling, plus overflow:hidden on the
   // wrapper so a stretchier inner can't escape.
-  // L60 (2026-05-28): bump to 2px + lead with --vscode-focusBorder so
-  // the stroke wins in both light and dark themes. L58's 1px +
-  // editorHoverWidget-border read as nearly invisible on light themes
-  // because the platform token there is a very faint gray. focusBorder
-  // is theme-specified to stand out (typically a blue/accent), with
-  // editorHoverWidget-border as a quieter fallback and a darker neutral
-  // gray (0.85 alpha) as last resort. box-sizing is border-box so the
-  // 2px stroke is absorbed by the 680px budget.
+  // L60 (2026-05-28): lead with --vscode-focusBorder so the stroke wins in both light and
+  // dark themes (L58's editorHoverWidget-border alone read as nearly invisible on light themes —
+  // a very faint platform gray). focusBorder is theme-specified to stand out (blue/accent), with
+  // editorHoverWidget-border as a quieter fallback and a darker neutral gray (0.85 alpha) last.
+  // L132 (2026-06-01): width 2px -> 1px (user: thinner border). box-sizing border-box absorbs it.
   // L92 (2026-05-31): native mode drops the !important on width/height so VS Code's inline resize
   // (the native sash) wins, but KEEPS the max-width/max-height caps (no balloon, scroll preserved)
   // — max-width:680 still clamps VS Code's transient 1800px mid-resize write. Managed = original pin.
@@ -416,8 +414,8 @@ style.textContent=[
   // VS Code owns the box height AND placement — growing the box past VS Code's height fights its
   // positioning. Accept VS Code's (smaller) height; the box scrolls. cf. feedback_vscode_owns_hover_height.
   (IR_HOVER_NATIVE_ONLY
-    ? '.monaco-resizable-hover{box-sizing:border-box !important;width:min(max-content,680px);height:max-content;max-width:680px !important;max-height:48vh !important;min-width:0 !important;min-height:0 !important;overflow:hidden !important;transform:none !important;padding:0 !important;margin:0 !important;pointer-events:auto !important;z-index:2147483647 !important;border:2px solid var(--vscode-focusBorder, var(--vscode-editorHoverWidget-border, rgba(128,128,128,0.85))) !important;border-radius:4px !important}'
-    : '.monaco-resizable-hover{box-sizing:border-box !important;width:min(max-content,680px) !important;height:max-content !important;max-width:680px !important;max-height:48vh !important;min-width:0 !important;min-height:0 !important;overflow:hidden !important;transform:none !important;padding:0 !important;margin:0 !important;pointer-events:auto !important;z-index:2147483647 !important;border:2px solid var(--vscode-focusBorder, var(--vscode-editorHoverWidget-border, rgba(128,128,128,0.85))) !important;border-radius:4px !important}'),
+    ? '.monaco-resizable-hover{box-sizing:border-box !important;width:min(max-content,680px);height:max-content;max-width:680px !important;max-height:48vh !important;min-width:0 !important;min-height:0 !important;overflow:hidden !important;transform:none !important;padding:0 !important;margin:0 !important;pointer-events:auto !important;z-index:2147483647 !important;border:1px solid var(--vscode-focusBorder, var(--vscode-editorHoverWidget-border, rgba(128,128,128,0.85))) !important;border-radius:4px !important}'
+    : '.monaco-resizable-hover{box-sizing:border-box !important;width:min(max-content,680px) !important;height:max-content !important;max-width:680px !important;max-height:48vh !important;min-width:0 !important;min-height:0 !important;overflow:hidden !important;transform:none !important;padding:0 !important;margin:0 !important;pointer-events:auto !important;z-index:2147483647 !important;border:1px solid var(--vscode-focusBorder, var(--vscode-editorHoverWidget-border, rgba(128,128,128,0.85))) !important;border-radius:4px !important}'),
   // Force inner .monaco-hover (and its primary inner panels) to stick
   // to the ancestor wrapper via position:static and clear any fixed/
   // absolute placement VS Code may have applied. Diagnostic showed inner
@@ -6698,6 +6696,19 @@ function irNativeReleaseDismissedHoverBookkeeping(root){
   try{if(root&&root.__irStickyTimer){irClearTimer(root.__irStickyTimer);root.__irStickyTimer=null;}}catch(_){}
   try{if(root&&root.__irScrollScanTimer){clearTimeout(root.__irScrollScanTimer);root.__irScrollScanTimer=null;}}catch(_){}
   try{if(root&&root.__irFitFrame){cancelAnimationFrame(root.__irFitFrame);root.__irFitFrame=null;}}catch(_){}
+  // L131 (2026-06-01): free the retained per-block scan caches on dismiss. A full-highlight (B/L130)
+  // 52k class otherwise keeps __irScanCacheText(52k) + candidateText(52k) + the ~240-name types array
+  // + compiled regex + candidate set ALIVE after the hover is gone (the "메모리에서 해제 못함"). The
+  // dismissed/hidden hover is skipped by the renderable check (scan ~7114) before the text guards, so
+  // dropping these markers is safe (a revive re-scans). Frees the biggest retained renderer memory.
+  try{
+    var __blks=root&&root.querySelectorAll?root.querySelectorAll('.rendered-markdown'):null;
+    if(__blks)for(var __bi=0;__bi<__blks.length;__bi++){
+      var __b=__blks[__bi];
+      try{__b.__irScanCacheText=null;__b.__irScanCacheCandidateText=null;__b.__irScanCacheTypes=null;__b.__irScanCacheRegex=null;}catch(_){}
+      try{__b.__irLastScanText=null;__b.__irLastScanSig=null;__b.__irViewportWrap=false;__b.__irHoverLinkCandidates=null;}catch(_){}
+    }
+  }catch(_){}
 }
 function irReleaseNativeHiddenHover(root,reason,visibilityReason){
   // L95 (2026-05-31) DEPRECATED in native mode: VS Code owns dismiss/release. Our release on 0x0
