@@ -1425,17 +1425,20 @@ async function irStashLargePreviewForChannelTest(previews: string): Promise<stri
     // the head (tiny → instant sync render); stash the plain TAIL TEXT and let the renderer append
     // it as a plain <pre> OFF the sync path (idle). No boundary (small or multi-block preview) =>
     // no split: stash the whole thing, render unchanged (mode=full).
-    const VTAIL_BOUNDARY = '```\n```\n';
+    // L123 (2026-06-01): tail fence is now ```plaintext (was empty ```) — see renderPreviewCodeFences.
+    // This managed-mode vtail stash path is dead in native (returns early above), but keep its
+    // boundary detection in sync so re-enabling overlay mode still head-splits correctly.
+    const VTAIL_BOUNDARY = '```\n```plaintext\n';
     const boundaryIdx = previews.indexOf(VTAIL_BOUNDARY);
     let headToSend = previews;
     let stashContent = previews;
     let mode = 'full';
     if (boundaryIdx >= 0) {
       headToSend = previews.slice(0, boundaryIdx + 3); // through the head fence's closing ```
-      const afterHead = previews.slice(boundaryIdx + 3); // "\n```\n<TAIL>\n```" (+ maybe trailing blocks)
-      const tOpen = afterHead.indexOf('```\n');
+      const afterHead = previews.slice(boundaryIdx + 3); // "\n```plaintext\n<TAIL>\n```" (+ maybe trailing blocks)
+      const tOpen = afterHead.indexOf('```plaintext\n');
       if (tOpen >= 0) {
-        const tStart = tOpen + 4;
+        const tStart = tOpen + '```plaintext\n'.length;
         const tEnd = afterHead.lastIndexOf('\n```');
         const tail = (tEnd > tStart) ? afterHead.slice(tStart, tEnd) : afterHead.slice(tStart);
         if (tail.length > 0) { stashContent = tail; mode = 'split'; }

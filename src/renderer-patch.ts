@@ -41,13 +41,23 @@
 //          AND placement; accept its (smaller) height — box scrolls. (v283 A state.)
 //   L120 — KEEP the resize sash in native so the user can drag a small drill hover taller.
 //   L121 — cache the candidate-name list + alternation regex per block (viewport-wrap re-scan reuse).
-//   L122 — native cleanup of OUR bookkeeping when VS Code dismisses the active hover. The gated
-//          dispose (L95) left __irActiveHoverEl pointing at the dead hover AND its MutationObserver
-//          running → the scan + observer kept firing on the dismissed widget = CPU that "persists
-//          after the hover is gone" (the real residual-CPU leak). Now drop ref + stop observer +
-//          clear timers (safe bookkeeping, no visibility writes). cf. project_drill_cpu_wheel_rescan.
-// If the running window still logs v<288, the new build is NOT loaded yet.
-export const RENDERER_PATCH_VERSION = 288;
+//   L122 — native cleanup of OUR bookkeeping when VS Code dismisses the active hover (drop ref +
+//          stop observer + clear timers) — fixes CPU that persisted after the hover.
+//   L123 — huge-hover tail fence now ```plaintext (was empty ```): cut TextMate tokenization
+//          (mtk 6693->2045 spans, longtask 1687->573ms). Full content kept. [ext-host]
+//   L124 — native mode stops the scroll-driven band-wrap re-scan (storm). Drill wraps on-demand.
+//   L125 — shrink huge-hover DOM at source: head highlight 120->60 + 300-line cap (mtk 2045->494).
+//   L126 — eager-wrap threshold 24000->4000 (capped hover: full-wrap 394 spans -> band-wrap 12).
+//   L127 — coalesce the on-demand wrap in native irHoverGuard (pointer dedup ±4px/40ms; ~halves it).
+//   L128 — REVERTED L125's line cap (truncation not wanted). Full content; cost held by L123+L126.
+//   L129 — (superseded by L130) head highlight 60->200.
+//   L130 — user chose B: FULL highlight, NO head/tail split (whole preview = one ```lang fence).
+//          Color throughout while scrolling. TRADEOFF accepted: VS Code tokenizes the whole block
+//          synchronously on show → ~1ms/line freeze (1657-line class ≈ ~1.7s). Only the tokenization
+//          freeze returns; other perf fixes (band-wrap L126, no-scroll-storm L124, dismiss cleanup
+//          L122, per-move dedup L127) stay. [ext-host/preview-builder]
+// If the running window still logs v<296, the new build is NOT loaded yet.
+export const RENDERER_PATCH_VERSION = 296;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -5027,7 +5037,18 @@ function irHoverGuard(e){
     try{
       if(e&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='pointerover'||e.type==='mouseover')
         &&irClosestHover(e.target)){
-        try{irWrapWordAtPoint(e)}catch(_){}
+        // L127 (2026-06-01): coalesce the on-demand wrap. pointermove+mousemove fire for the SAME
+        // physical move (2x at identical coords) and reading-jitter fires many at ~one spot;
+        // irWrapWordAtPoint does DOM range/word/validate work on each call (point-wrap fired 120x +
+        // near-link 80x in one session) and any new-word wrap forces a VS Code reflow. Skip when the
+        // pointer has not moved >4px since the last wrap within 40ms — never skips a real move to a
+        // new word (tokens are ~50px wide) and the click handler (irTypeLinkPointerDown) wraps on its
+        // own regardless, so drill is unaffected. Halves the per-move cost.
+        var __pwx=(e.clientX|0),__pwy=(e.clientY|0),__pwt=Date.now(),__pwl=window.__irPointWrapLast;
+        if(!(__pwl&&Math.abs(__pwl.x-__pwx)<=4&&Math.abs(__pwl.y-__pwy)<=4&&(__pwt-__pwl.t)<40)){
+          window.__irPointWrapLast={x:__pwx,y:__pwy,t:__pwt};
+          try{irWrapWordAtPoint(e)}catch(_){}
+        }
       }
     }catch(_){}
     return;
@@ -7624,7 +7645,14 @@ var IR_HOVER_LINK_MAX_TYPES=240;
 var IR_HOVER_LINK_MAX_LOWER_DECLS=100;
 var IR_HOVER_LINK_MAX_CONSTANTS=80;
 var IR_HOVER_LINK_MAX_BROAD_IDENTIFIERS=160;
-var IR_HOVER_EAGER_WRAP_MAX_TEXT=24000;
+// L126 (2026-06-01): 24000 -> 4000. Above this, the scan wraps ONLY the viewport band
+// (+ on-demand via irWrapWordAtPoint, L124); below it, it wraps the WHOLE block in one pass.
+// L125's 300-line cap dropped the huge Company hover from ~57K to ~11K — under the old 24000
+// it fell into the FULL-wrap path and inserted 394 .ir-type-link spans synchronously (wrapped=394
+// nodes=458) = a big reflow on every show + 394 spans injected into VS Code's hover DOM = the
+// "overlay 흔적 / vscode 경합 / 딜레이" the user reported. 4000 keeps capped/long hovers on the
+// band+on-demand path (~30 spans) so we inject far fewer traces and stop fighting VS Code's render.
+var IR_HOVER_EAGER_WRAP_MAX_TEXT=4000;
 var IR_HOVER_DEFERRED_CANDIDATE_MAX_TEXT=50000;
 var IR_HOVER_DEFERRED_CANDIDATE_MAX_LINES=900;
 function irTypeShapedName(w){return /^[A-Z][A-Za-z0-9_]*$/.test(w)||/^_[A-Z][A-Z0-9_]*$/.test(w)}
@@ -9985,6 +10013,18 @@ function irIsBlockVisibleInHover(block,hoverHost){
 var IR_HOVER_SCROLL_SCAN_DEBOUNCE_MS=140;
 function irEnsureHoverScrollListener(hoverHost){
   if(!hoverHost||hoverHost.__irScrollListenerAttached)return;
+  // L124 (2026-06-01): native mode no longer re-scans on scroll. The scroll-driven
+  // band-wrap (re-arm __irViewportWrap + re-scan to wrap newly-visible rows) was an
+  // 18x/session re-scan STORM on huge hovers: each settle TreeWalked the block, rect-read
+  // every text node to find the viewport band, and inserted .ir-type-link spans -> VS Code
+  // reflow -> 100-573ms longtask. It is REDUNDANT: drill works on-demand. irHoverGuard
+  // (pointer-move, L114) and irTypeLinkPointerDown (click, L94) both call irWrapWordAtPoint,
+  // which validates against the candidate set the INITIAL scan already built for the WHOLE
+  // block (not just the visible band) - so a row scrolled into view gets its drill link the
+  // moment the pointer touches it. The initial visible-band wrap still runs on open (so the
+  // hover shows links for what is on screen). Net: scroll storm + scroll-wrap reflows gone,
+  // drill unchanged. cf. project_drill_cpu_wheel_rescan (this supersedes L107/L115's scroll scan).
+  if(IR_HOVER_NATIVE_ONLY){hoverHost.__irScrollListenerAttached=true;return;}
   try{
     var scroller=irPrimaryHoverScroller(hoverHost)||hoverHost;
     if(!scroller||!scroller.addEventListener)return;

@@ -109,7 +109,20 @@ export const DEFINITION_PREVIEW_VALUE_MAX_LINES = 600;
 // the #2 hover-jank cause (a genuine 1,657-line class blocked the renderer ~2.4s
 // during synchronous render). Full content + code-block layout preserved; only the
 // scrolled-out tail loses colour. Tunable.
-export const HOVER_HIGHLIGHT_MAX_LINES = 120;
+// L129 (2026-06-01): 60 -> 200. User wants syntax color while scrolling, but VS Code's hover
+// tokenizes the WHOLE code block at once (no native viewport-lazy tokenization for hovers — only
+// the editor does that), so "native + dynamic + no-freeze" is impossible; only full(freeze) /
+// fast-partial / non-native-dynamic(overlay/re-deliver churn) exist. 200 is the pragmatic native
+// pick: covers most scrolling with color, freeze bounded (~1ms/line on show — a 200-line class
+// ≈ ~400ms; smaller classes less), no churn. Lines past 200 stay plain (plaintext tail, L123).
+// TUNABLE: higher = more color + more show-freeze; lower = faster + less color.
+export const HOVER_HIGHLIGHT_MAX_LINES = 200;
+// L125: hard cap on TOTAL preview lines rendered into the hover. A genuine 1,657-line class
+// otherwise builds ~1,657 DOM line elements (even the plain tail) + a 206-name candidate scan —
+// the residual resource cost after head/tail split (L84) + plaintext tail (L123). Cap renders
+// head(60 highlighted) + tail up to here (plain) + a "N more lines truncated" note; the full
+// definition is one ⌘-click away. Generous enough that most classes render whole.
+export const HOVER_PREVIEW_MAX_LINES = 300;
 // L88 (2026-05-31): vtail render mode (shared by extension.ts + preview-builder.ts).
 // 'overlay' = head-split + windowed virtual scroller (fast but the custom overlay fights the
 // reused-hover lifecycle and drilled hovers bypass it; tail is plain). 'native' = full preview
