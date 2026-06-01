@@ -57,8 +57,16 @@
 //          unknown = VS Code) and no extension hover-resolves after the last hover — the residual
 //          CPU/retained 52k DOM is VS Code's (full-highlight B + VS Code keeps hidden hover content).
 //   L132 — hover border 2px -> 1px (user: thinner).
-// If the running window still logs v<298, the new build is NOT loaded yet.
-export const RENDERER_PATCH_VERSION = 298;
+//   L133 — horizontal wheel inside a hover no longer bleeds to the editor (which dismissed
+//          the hover). Consume horizontal-dominant wheels at every in-hover return path
+//          (small/non-scrollable hover + no-range/boundary). Vertical unchanged. [renderer]
+//   L134 — release drill history (__irHistory md strings + __irHistoryFor/__irOriginalHover
+//          Snapshot/__irLastPreviewTarget refs) when VS Code dismisses the owning hover.
+//          The reused wrapper is hidden (not detached) on dismiss, so the old detach-only
+//          prune leaked it; now released via irHoverRootStablyDismissed in prune + native
+//          dismiss bookkeeping, guarded against mid-drill content-swap transients. [renderer]
+// If the running window still logs v<299, the new build is NOT loaded yet.
+export const RENDERER_PATCH_VERSION = 299;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -213,10 +221,13 @@ function irPruneDetachedHoverState(){
     if(pruneNow-lastPruneAt<250)return;
     window.__irLastPruneAt=pruneNow;
     var body=document.body;
-    if(window.__irHistoryFor&&!body.contains(window.__irHistoryFor)){
-      window.__irHistoryFor=null;
-      window.__irHistory=[];
-      window.__irHistoryCurrent=null;
+    // L134 (2026-06-01): release drill history once the hover that owns it is dismissed.
+    // Detach is the old signal, but VS Code REUSES one hidden wrapper on dismiss (never
+    // detaches it), so the detach-only test missed every native dismiss and the history
+    // (md strings + element refs) leaked. irHoverRootStablyDismissed also covers the
+    // hidden/zero-rect-settled case while excluding mid-drill content-swap transients.
+    if(window.__irHistoryFor&&irHoverRootStablyDismissed(window.__irHistoryFor)){
+      irReleaseDrillHistoryForRoot(window.__irHistoryFor,body.contains(window.__irHistoryFor)?'prune-dismissed':'prune-detached');
     }
     if(window.__irOriginalHoverSnapshot&&(!window.__irOriginalHoverSnapshot.hoverEl||!body.contains(window.__irOriginalHoverSnapshot.hoverEl))){
       window.__irOriginalHoverSnapshot=null;
@@ -6675,6 +6686,54 @@ function irReviveRecentlyManagedHover(root,reason){
   }catch(_){}
   return false;
 }
+function irHoverRootStablyDismissed(root){
+  // L134 (2026-06-01): is this hover genuinely gone (VS Code dismissed it), as opposed to
+  // a transient mid-drill content-swap collapse? Detached = gone. Otherwise it must be
+  // non-renderable AND SETTLED — a drill swap touches content (and can flash zero-rect)
+  // within ~1.2s, so a fresh __irContentChangedAt means it is still forming, not dismissed.
+  // cf. feedback_zero_rect_with_content_is_transient + the L94 "forming<1s" guard.
+  try{
+    if(!root)return false;
+    if(!document.body||!document.body.contains(root))return true;
+    if(irIsRenderableHoverRoot(root))return false;
+    var changed=Number(root.__irContentChangedAt)||0;
+    if(changed&&Date.now()-changed<1200)return false;
+    return true;
+  }catch(_){return false}
+}
+function irReleaseDrillHistoryForRoot(root,reason){
+  // L134 (2026-06-01): release the drill history + snapshot tied to a hover VS Code has
+  // dismissed. In native mode irReleaseNativeHiddenHover (which used to do this) is gated
+  // off, and VS Code REUSES one .monaco-resizable-hover wrapper — so on dismiss the wrapper
+  // is HIDDEN, not detached. irPruneDetachedHoverState's detach-only test therefore never
+  // fired, and __irHistory (up to 20 full-preview md strings) + __irHistoryFor / __irOriginal
+  // HoverSnapshot (refs that pin the dead hover element) leaked, continuing to consume renderer
+  // memory after the hover was gone (user: "release가 제대로 안되면 렌더링 자원을 계속 소모").
+  // Mirrors the proven release block in irReleaseNativeHiddenHover; keyed by root identity so
+  // it never wipes history belonging to a different, live hover.
+  try{
+    var cleared=false;
+    if(window.__irHistoryFor===root){
+      window.__irHistoryFor=null;
+      window.__irHistory=[];
+      window.__irHistoryCurrent=null;
+      cleared=true;
+    }
+    if(window.__irOriginalHoverSnapshot&&window.__irOriginalHoverSnapshot.hoverEl===root){
+      window.__irOriginalHoverSnapshot=null;
+      cleared=true;
+    }
+    if(window.__irLastPreviewTarget&&irRootContains(root,window.__irLastPreviewTarget)){
+      window.__irLastPreviewTarget=null;
+      cleared=true;
+    }
+    if(cleared&&(window.__irHoverLifecycleLogCount||0)<120){
+      window.__irHoverLifecycleLogCount=(window.__irHoverLifecycleLogCount||0)+1;
+      irLog('renderer: drill history released ('+(reason||'')+') root={'+irHoverBrief(root)+'}');
+    }
+    return cleared;
+  }catch(_){return false}
+}
 function irNativeReleaseDismissedHoverBookkeeping(root){
   // L122 (2026-06-01): native-mode cleanup of OUR bookkeeping when VS Code has dismissed
   // the active hover (it went non-renderable / got the hidden class). The full release
@@ -6709,6 +6768,10 @@ function irNativeReleaseDismissedHoverBookkeeping(root){
       try{__b.__irLastScanText=null;__b.__irLastScanSig=null;__b.__irViewportWrap=false;__b.__irHoverLinkCandidates=null;}catch(_){}
     }
   }catch(_){}
+  // L134 (2026-06-01): VS Code dismissed this hover — also release the drill history/snapshot
+  // it owned (the retained md-string array + element refs). Only when SETTLED so a mid-drill
+  // content-swap transient doesn't wipe live history. cf. irReleaseDrillHistoryForRoot.
+  try{if(irHoverRootStablyDismissed(root))irReleaseDrillHistoryForRoot(root,'native-dismiss');}catch(_){}
 }
 function irReleaseNativeHiddenHover(root,reason,visibilityReason){
   // L95 (2026-05-31) DEPRECATED in native mode: VS Code owns dismiss/release. Our release on 0x0
@@ -7612,6 +7675,23 @@ track(document,'wheel',function(e){
         irMakeHoverScrollable(insideHv,false,textLen);
       }else{
         irSetActiveHoverLayer(insideHv);
+        // L133 (2026-06-01): a horizontal wheel over a small / non-scrollable hover must
+        // NOT bleed to the editor — a horizontal editor scroll fires onDidChangeTextEditor
+        // VisibleRanges and VS Code dismisses the hover (user: "좌우 스크롤시 hover dismiss
+        // 말자"). Consume horizontal-dominant wheels here (scrolling the hover's own content
+        // if it happens to overflow); vertical still falls through unchanged.
+        var dSmall=irWheelDelta(e,0);
+        if(Math.abs(dSmall.x)>0&&Math.abs(dSmall.x)>=Math.abs(dSmall.y)){
+          if(pre){
+            var maxLeftSm=Math.max(0,(pre.scrollWidth||0)-(pre.clientWidth||0));
+            if(maxLeftSm>0)pre.scrollLeft=irClamp((pre.scrollLeft||0)+dSmall.x,0,maxLeftSm);
+          }
+          insideHv.__irLastInsideAt=Date.now();
+          irArmHoverSticky(insideHv,IR_HOVER_EXIT_GRACE_MS);
+          e.__irWheelHandled=true;
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
         return;
       }
     }
@@ -7644,6 +7724,17 @@ track(document,'wheel',function(e){
       // or is already at the boundary. Otherwise the hover becomes a wheel
       // event sink and neither native hover scrolling nor editor scrolling
       // can proceed.
+      // L133 (2026-06-01): EXCEPTION — a horizontal-dominant wheel must still be
+      // consumed even with no horizontal range / at the boundary, else it bleeds to
+      // the editor, scrolls it horizontally, and VS Code dismisses the hover (user:
+      // "좌우 스크롤시 hover dismiss 말자"). Vertical over-scroll keeps falling through
+      // unchanged (vertical is already consumed upstream by irHoverInternalWheelGuard).
+      if(Math.abs(dx)>0&&Math.abs(dx)>=Math.abs(dy)){
+        insideHv.__irLastInsideAt=Date.now();
+        irArmHoverSticky(insideHv,IR_HOVER_EXIT_GRACE_MS);
+        e.preventDefault();
+        e.stopImmediatePropagation();
+      }
       return;
     }
     e.preventDefault();
