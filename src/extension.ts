@@ -126,6 +126,7 @@ import {
   hoverPreviewPrimaryHandles,
   hoverFallbackPrimaryHandles,
   hoverFallbackPrimaryHandleAllowed,
+  hoverPendingPrimaryHandleAllowed,
   clearHoverPreviewPrimaryHandles,
   hoverPreviewPrimaryHandleAllowed,
   hoverPreviewDeliveryKey,
@@ -1630,6 +1631,22 @@ function patchSharedService(service: any) {
       // drill. matchCount was just incremented above.
       if (preview.matchCount === 1) {
         log.info(`[hover] page-transition handle=${handle} → "${preview.identifier}"`);
+      }
+      // L108 (2026-06-01): deliver the drill content for ONE handle only.
+      // VS Code fans the showHover out to every registered provider handle and,
+      // in native mode (no renderer management layer to collapse duplicates),
+      // renders each returned result as its own hover-row. Returning
+      // preview.contents for every handle stacked a 1657-line class 5× (59K→295K)
+      // and re-tokenized/re-laid-out the widget O(N²) — 11.5s of main-thread
+      // longtasks (412→4134ms), and the page-transition expired mid-render. Gate
+      // by primary handle exactly like the normal-hover (hoverPreviewPrimaryHandle
+      // Allowed) and currentPreviewState-fallback (hoverFallbackPrimaryHandleAllowed)
+      // paths. The pending stays alive (not consumed), so whichever handle wins the
+      // primary slot is the single one that paints; the rest return null and VS Code
+      // merges them in without adding duplicate rows. cf. project_hover_rerender_*,
+      // project_native_hover_only_switch memories.
+      if (!hoverPendingPrimaryHandleAllowed(hoverRequestKey, handle)) {
+        return null;
       }
       const ln = position?.lineNumber !== undefined ? position.lineNumber : (position?.line !== undefined ? position.line + 1 : 1);
       const col = position?.column !== undefined ? position.column : (position?.character !== undefined ? position.character + 1 : 1);

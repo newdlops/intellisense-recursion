@@ -17,7 +17,11 @@
 // Cross-module dependencies: none. The string is opaque to TS — embedded
 // JS comments / banners inside it are NOT TS structure.
 
-export const RENDERER_PATCH_VERSION = 271;
+// v277 (L108, 2026-06-01): no renderer-patch change — bumped as a build marker so
+// the log's v= confirms the ext-side drill fix (primary-handle gate on the
+// page-transition content return; stops native mode from stacking the drill
+// preview N× per showHover fanout) is the loaded build after a window reload.
+export const RENDERER_PATCH_VERSION = 277;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -2006,6 +2010,7 @@ function irAttachEditorScrollWatch(editor){
   }catch(_){}
 }
 function irRepositionDrilledHover(editor,widget){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L110 (2026-06-01): VS Code owns drill hover position (user directive). We no longer move drill hovers; they stay where VS Code/the original hover places them.
   // Compute desired screen coordinates for the drilled hover wrapper
   // from the original symbol's document position (line+column) +
   // current editor scroll + viewport bounds. Sets wrapper top/left so
@@ -2771,6 +2776,7 @@ function irArmDrillSettleObserver(wrapperEl){
   }catch(_){}
 }
 function irRepositionDrilledHoverByElement(editor,wrapperEl){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L110 (2026-06-01): VS Code owns drill hover position (user directive).
   try{
     if(!editor||typeof editor.getScrolledVisiblePosition!=='function')return;
     if(!wrapperEl||!wrapperEl.getBoundingClientRect)return;
@@ -4460,6 +4466,16 @@ function irRequestNativeHideHover(reason){
   }catch(_){}
 }
 function irRequestNativeShowHover(reason){
+  // L110 (2026-06-01): VS Code owns the hover lifecycle/position (user directive:
+  // "hover의 위치가 vscode가 지정해 주기 때문에 더이상 우리가 관여할 필요가 없어"). Our
+  // mouse-relocation re-show requests (outside-editor-new-token / token-relocation,
+  // ~4995/5112/5168) re-drove VS Code to re-deliver the SAME drill preview, and the
+  // extension APPENDED another copy each time → duplicate accumulation (v=275 log:
+  // 58975→117950→176925 within ~1.5s as the mouse moved over the Company hover) →
+  // VS Code tokenizes 3-7× the content = the multi-second freeze. Stop requesting
+  // shows; VS Code shows hovers natively on its own. (Pairs with the already-gated
+  // release side, irReleaseNativeHoverManagement L97.)
+  if(IR_HOVER_NATIVE_ONLY)return;
   try{
     var now=Date.now();
     try{
@@ -4720,7 +4736,32 @@ function irEventTargetTokenText(e){
 }
 function irHoverContainsTokenText(hoverEl,token){
   try{
-    return !!(hoverEl&&token&&token.length>1&&String(hoverEl.textContent||'').indexOf(token)>=0);
+    if(!hoverEl||!token||token.length<=1)return false;
+    // L108 (2026-06-01): memoize the textContent scan. irHoverGuard binds this to
+    // 8 mouse events incl. BOTH pointermove AND mousemove (renderer-patch ~5215),
+    // so a single physical mouse move over the editor runs this 2x, and buffered-
+    // move bursts hit it dozens of times/sec. A fresh String(hoverEl.textContent)
+    // materialization + indexOf on a 57K-char class drill hover, per event, pinned
+    // the main thread while moving the mouse over code (user-reported frame drops).
+    // The content only changes on a real swap; our own .ir-type-link wrapping mutates
+    // inner descendants but NOT the hover root's direct children, so a structural
+    // signature (childElementCount + first/last child tag) stays stable across
+    // wrapping and flips only when VS Code swaps content. Cache the string once per
+    // signature and the per-token hit/miss in a null-proto map.
+    var sig=(hoverEl.childElementCount||0)+':'+
+      (hoverEl.firstElementChild?hoverEl.firstElementChild.nodeName:'_')+':'+
+      (hoverEl.lastElementChild?hoverEl.lastElementChild.nodeName:'_');
+    if(hoverEl.__irContainsSig!==sig){
+      hoverEl.__irContainsSig=sig;
+      hoverEl.__irContainsText=String(hoverEl.textContent||'');
+      hoverEl.__irContainsTokenCache=Object.create(null);
+    }
+    var cache=hoverEl.__irContainsTokenCache||(hoverEl.__irContainsTokenCache=Object.create(null));
+    var cached=cache[token];
+    if(cached!==undefined)return cached;
+    var hit=hoverEl.__irContainsText.indexOf(token)>=0;
+    cache[token]=hit;
+    return hit;
   }catch(_){return false}
 }
 function irHoverRecentlyPreviewApplied(hoverEl){
@@ -5332,6 +5373,40 @@ function irAuditHoverSize(hoverEl){
       scIsHost:sc===hoverEl,
       vpH:(window.innerHeight||document.documentElement.clientHeight||0)
     });
+    // L106 (2026-06-01): when content is abnormally large (drill duplicate-copy
+    // accumulation — a single class preview is ~58975 chars, so >80000 means the
+    // content already holds extra copies), capture the DOM structure so the dedup
+    // can target the RIGHT element level. v272 hover-dedupe-removed=0 proved the
+    // copies are NOT being caught by .rendered-markdown dedup — find out what they
+    // actually are (one giant block? duplicate rows? non-rendered-markdown?).
+    if(contentLen>80000){
+      var dupExtra=function(list){
+        var seen=Object.create(null),extra=0;
+        for(var i=0;i<list.length&&i<60;i++){
+          var k=String(list[i].textContent||'').replace(/\s+/g,' ').trim().slice(0,160);
+          if(!k)continue;
+          if(seen[k])extra++;else seen[k]=1;
+        }
+        return extra;
+      };
+      var rms=hoverEl.querySelectorAll('.rendered-markdown');
+      var rmLens=[];
+      for(var ri=0;ri<rms.length&&ri<12;ri++)rmLens.push(String(rms[ri].textContent||'').length);
+      var childTags=[];
+      var kids=hoverEl.children||[];
+      for(var ci=0;ci<kids.length&&ci<8;ci++)childTags.push(String(kids[ci].className||kids[ci].nodeName).slice(0,40));
+      irHERecord('hover-structure',{
+        contentLen:contentLen,
+        renderedMarkdown:rms.length,
+        rmDupExtra:dupExtra(rms),
+        rmLens:rmLens,
+        hoverRows:hoverEl.querySelectorAll('.hover-row').length,
+        rowDupExtra:dupExtra(hoverEl.querySelectorAll('.hover-row')),
+        hoverContents:hoverEl.querySelectorAll('.monaco-hover-content').length,
+        scrollables:hoverEl.querySelectorAll('.monaco-scrollable-element').length,
+        childTags:childTags
+      });
+    }
   }catch(_){}
 }
 function irActiveHoverRoot(){
@@ -8124,6 +8199,15 @@ function irKeepHoverInViewport(hoverEl){
     if(!hoverEl)return;
     var wrapper=(hoverEl.classList&&hoverEl.classList.contains('monaco-resizable-hover'))?hoverEl:(hoverEl.closest?hoverEl.closest('.monaco-resizable-hover'):null);
     if(!wrapper||!wrapper.getBoundingClientRect)return;
+    // L109 (2026-06-01): NEVER move a drill hover. Per user directive ("드릴의 호버
+    // 위치를 이동할 필요가 없어") + [[feedback_mouse_anchored_drill]], drill hovers are
+    // mouse-anchored and must stay where placed. Beyond honoring that: the clamp's
+    // wrapper.getBoundingClientRect() below forces a SYNCHRONOUS layout of the drill
+    // content, and a drilled class preview can be ~295K chars (v=274 log: prev=294875)
+    // — that reflow is multi-second and compounds VS Code's own tokenization freeze
+    // (the 4064/2720/1609ms longtasks). Bail on the cheap class/flag check BEFORE any
+    // rect read so drill hovers cost zero layout here.
+    if((wrapper.classList&&wrapper.classList.contains('ir-drill-hover'))||wrapper.__irDesired)return;
     var rect=wrapper.getBoundingClientRect();
     // Same collapse contract used everywhere (width<60 column || height<20 bar):
     // never clamp a transient 16px sliver or a 0x0 mid-swap shell.
@@ -9560,17 +9644,22 @@ window.irShowHoverFallback=function(identifier,md,opts){
 };
 
 var irLastContainerCount=0;
-// L75 (2026-05-29): TEMPORARILY DISABLED to test the user's hypothesis that
-// the DOM dedupe is the root cause of the size-collapse / content-truncation /
-// "내용 안보임". irDedupeHoverContent runs inside the scan AFTER sizing: it
-// (a) runs 5 regexes over each block's FULL textContent (up to ~57k chars) on
-// every scan pass — a freeze on large hovers re-scanned in the MutationObserver
-// loop, (b) REMOVES duplicate .rendered-markdown blocks (can eat content), and
-// (c) shrinks the wrapper + rewrites __irDesired afterward (irKeepMouseInside-
-// WrapperAfterDedupe), fighting the size we just determined. Flip back to true
-// to re-enable. If the test confirms dedupe is the cause, the real fix is to
-// dedupe BEFORE paint / once per content (not every scan) rather than off.
-var IR_HOVER_DOM_DEDUPE_ENABLED=false;
+// L75 (2026-05-29): DISABLED as a test (suspected cause of size-collapse / "내용 안보임").
+// L105 (2026-06-01): RE-ENABLED with the two fixes the L75 note itself prescribed
+// ("dedupe BEFORE paint / once per content, not every scan"). MEASURED need: drilling
+// into a large class accumulated DUPLICATE preview copies (one per mouseover over the
+// drilled hover, up to 7 copies = 412825 chars) → a 10.3s main-thread tokenize freeze
+// ("폭주"). Nothing removed them because this dedup was off. The original concerns are
+// addressed so the re-enable is safe:
+//   (a) per-scan regex cost — irDedupeHoverContent now early-outs unless the block set
+//       changed since the last pass (cheap count+length signature, no regex), so it runs
+//       once per content change instead of every storm scan.
+//   (c) size-fighting side-effect — irKeepMouseInsideWrapperAfterDedupe is gated OFF in
+//       native mode (VS Code owns size/position; cf. [[feedback_vscode_owns_hover_height]]).
+//   (b) "eats content" — it only removes blocks whose NORMALIZED text is byte-identical
+//       to an earlier block (true duplicates, e.g. the repeated class copies). Real
+//       distinct content is never equal-keyed.
+var IR_HOVER_DOM_DEDUPE_ENABLED=true;
 
 function irNormalizeHoverDedupeText(text){
   return String(text||'')
@@ -9587,6 +9676,14 @@ function irDedupeHoverContent(hoverHost){
     var seen=Object.create(null), removed=0;
     var blocks=hoverHost.querySelectorAll('.rendered-markdown');
     if(blocks.length<2)return;
+    // L105 (2026-06-01): only do the regex-heavy normalize when the block set
+    // actually changed since the last pass — the scan re-fires many times/sec on
+    // a drilled hover. Cheap signature (block count + last block text length); no
+    // regex, no full-host textContent read.
+    var lastBlk=blocks[blocks.length-1];
+    var dedupeSig=blocks.length+':'+((lastBlk&&lastBlk.textContent)?lastBlk.textContent.length:0);
+    if(hoverHost.__irLastDedupeSig===dedupeSig)return;
+    hoverHost.__irLastDedupeSig=dedupeSig;
     for(var bi=0;bi<blocks.length;bi++){
       var block=blocks[bi];
       if(!block||!document.body.contains(block))continue;
@@ -9617,9 +9714,9 @@ function irDedupeHoverContent(hoverHost){
       }
       seen[key]=block;
     }
-    if(removed&&window.__irWrapLogCount<20){
-      window.__irWrapLogCount++;
-      irLog('renderer: dedupe hover blocks removed='+removed);
+    if(removed){
+      // L105: reliable (un-throttled) record so the drill-accumulation fix is verifiable.
+      try{irHERecord('hover-dedupe-removed',{removed:removed,blocks:blocks.length});}catch(_){}
     }
     // L26: after dedup the wrapper may have shrunk and the user's mouse
     // may now be outside its bounds — next mousemove would mouseleave the
@@ -9628,7 +9725,7 @@ function irDedupeHoverContent(hoverHost){
     // need __irDesired updated so the layout/style observers (L23, L24)
     // restore to this safer pose rather than dragging back to the pre-
     // shrink desired position.
-    if(removed)irKeepMouseInsideWrapperAfterDedupe(hoverHost);
+    if(removed&&!IR_HOVER_NATIVE_ONLY)irKeepMouseInsideWrapperAfterDedupe(hoverHost);   // L105: native owns size/position — don't nudge the wrapper
   }catch(_){}
 }
 function irKeepMouseInsideWrapperAfterDedupe(hoverHost){
@@ -9778,6 +9875,12 @@ function irIsBlockVisibleInHover(block,hoverHost){
     return true;
   }catch(_){return true}
 }
+// L107 (2026-06-01): debounce window for the scroll-driven wrap re-scan. A
+// continuous wheel scroll of a huge drill hover fires one 'scroll' per tick
+// (~25-30/sec); without this the scan re-ran the full block each tick. 140ms >
+// a wheel tick (~16-33ms) so a settling gesture coalesces to ONE pass, yet is
+// short enough that drill links appear effectively instantly once the user stops.
+var IR_HOVER_SCROLL_SCAN_DEBOUNCE_MS=140;
 function irEnsureHoverScrollListener(hoverHost){
   if(!hoverHost||hoverHost.__irScrollListenerAttached)return;
   try{
@@ -9785,14 +9888,30 @@ function irEnsureHoverScrollListener(hoverHost){
     if(!scroller||!scroller.addEventListener)return;
     hoverHost.__irScrollListenerAttached=true;
     scroller.addEventListener('scroll',function(){
-      // Re-scan so newly visible blocks get wrapped. irScheduleScan is
-      // already rAF-coalesced so multiple scroll ticks collapse.
-      // L90: re-arm viewport-wrap on the markdown blocks. The wrappedCount==0 convergence
-      // guard (irScanRenderedMarkdown) clears __irViewportWrap once formation settles to stop
-      // the self-mutation re-scan storm; a scroll reveals new off-screen rows that still need
-      // wrapping, so re-enable the skip-bypass for the next pass here.
+      // L90: re-arm viewport-wrap on the markdown blocks so the NEXT scan wraps
+      // rows that just scrolled into view. The wrappedCount==0 convergence guard
+      // (irScanRenderedMarkdown) clears __irViewportWrap once a band is fully
+      // wrapped; a scroll reveals new off-screen rows, so re-enable the skip-
+      // bypass here. This flag flip is cheap (no layout, no textContent read).
       try{var bs=hoverHost.querySelectorAll?hoverHost.querySelectorAll('.rendered-markdown'):null;if(bs)for(var bi=0;bi<bs.length;bi++){bs[bi].__irViewportWrap=true;}}catch(_){}
-      try{irScheduleScan();}catch(_){}
+      // L107 (2026-06-01): DEBOUNCE the heavy wrap re-scan during scrolling.
+      // A wheel scroll of a 57K-char / 1657-line class hover ("company") used to
+      // fire a FULL block re-scan PER wheel tick: re-read 57K textContent, rebuild
+      // the ~200-name candidate list, compile a ~200-alternation regex, TreeWalk
+      // the whole block (thousands of mtk token spans), and getBoundingClientRect
+      // every text node above the scroll position — a 100-561ms longtask EACH, and
+      // worse the deeper the scroll (more above-band nodes to rect-read). 45 scans
+      // for 48 wheel ticks pinned a CPU core (user: "cpu사용률이 폭발"). irScheduleScan's
+      // idle coalescing (L33) was meant to defer this but idle gaps open BETWEEN
+      // wheel ticks so it fired anyway. A reset-on-scroll debounce runs the wrap
+      // pass ONCE, ~140ms after scrolling settles (links appear when the user stops
+      // to read/click, not mid-gesture). __irViewportWrap re-armed above makes that
+      // settle-scan wrap the now-visible band.
+      try{if(hoverHost.__irScrollScanTimer)clearTimeout(hoverHost.__irScrollScanTimer);}catch(_){}
+      hoverHost.__irScrollScanTimer=setTimeout(function(){
+        hoverHost.__irScrollScanTimer=null;
+        try{irScheduleScan();}catch(_){}
+      },IR_HOVER_SCROLL_SCAN_DEBOUNCE_MS);
     },{passive:true});
   }catch(_){}
 }

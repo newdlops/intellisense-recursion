@@ -59,6 +59,35 @@ export const hoverPreviewPrimaryHandles = new Map<string, { handle: number; clea
 // stealing each other's primary slot would suppress legitimate hover
 // content.
 export const hoverFallbackPrimaryHandles = new Map<string, { handle: number; cleanup: ReturnType<typeof setTimeout> | null }>();
+// Third primary-handle map, dedicated to the pendingPreviewHover (drill)
+// content delivery. Separate from the preview and fallback maps for the
+// same reason those are separate from each other: the three paths fire on
+// different request keys/timing and must not steal each other's primary slot.
+// L108 (2026-06-01): in native mode VS Code renders each provider handle's
+// result as its own hover-row. The drill path used to return the full preview
+// for EVERY handle in the showHover fanout, so a 1657-line class stacked 5×
+// (59K→295K) and VS Code re-tokenized/re-laid-out the widget O(N²) — 11.5s of
+// main-thread longtasks (412→4134ms). Under the old managed layer the renderer
+// collapsed the duplicates; native has nothing to collapse them. Gate the drill
+// content to one handle, like the normal-hover and currentPreviewState paths.
+export const hoverPendingPrimaryHandles = new Map<string, { handle: number; cleanup: ReturnType<typeof setTimeout> | null }>();
+export function hoverPendingPrimaryHandleAllowed(requestKey: string, handle: number): boolean {
+  let entry = hoverPendingPrimaryHandles.get(requestKey);
+  if (!entry) {
+    entry = { handle, cleanup: null };
+    hoverPendingPrimaryHandles.set(requestKey, entry);
+  } else if (entry.cleanup) {
+    clearTimeout(entry.cleanup);
+  }
+  const primary = entry.handle;
+  entry.cleanup = setTimeout(() => {
+    const current = hoverPendingPrimaryHandles.get(requestKey);
+    if (current?.handle === primary) {
+      hoverPendingPrimaryHandles.delete(requestKey);
+    }
+  }, 2000);
+  return primary === handle;
+}
 export function hoverFallbackPrimaryHandleAllowed(requestKey: string, handle: number): boolean {
   let entry = hoverFallbackPrimaryHandles.get(requestKey);
   if (!entry) {
@@ -86,6 +115,10 @@ export function clearHoverPreviewPrimaryHandles() {
     if (entry.cleanup) { clearTimeout(entry.cleanup); }
   }
   hoverFallbackPrimaryHandles.clear();
+  for (const entry of hoverPendingPrimaryHandles.values()) {
+    if (entry.cleanup) { clearTimeout(entry.cleanup); }
+  }
+  hoverPendingPrimaryHandles.clear();
 }
 
 export function hoverPreviewPrimaryHandleAllowed(requestKey: string, handle: number): boolean {
