@@ -65,8 +65,26 @@
 //          The reused wrapper is hidden (not detached) on dismiss, so the old detach-only
 //          prune leaked it; now released via irHoverRootStablyDismissed in prune + native
 //          dismiss bookkeeping, guarded against mid-drill content-swap transients. [renderer]
-// If the running window still logs v<299, the new build is NOT loaded yet.
-export const RENDERER_PATCH_VERSION = 299;
+// v300 (L135, 2026-06-02): another extension's hover (HoverProvider API → shares the single
+//          .monaco-hover widget) rendered EMPTY and then every subsequent hover broke
+//          (user: "근처 심볼을 해석할수 없으면 빈 호버를 표시하고 그뒤부터는 호버가 파괴됨").
+//          Two DOM-destroying management paths were never gated when L93-L134 abandoned the
+//          overlay — they still fire on hovers IR doesn't own:
+//   L135a — irMarkEmptyHoverRoot stamped .ir-empty-hover-root (opacity:0!important + pointer-
+//           events:none), or removeChild'd the root outright when a prior populated hover was
+//           active, the instant the scan saw a momentarily-empty .monaco-hover (a foreign hover
+//           mid-render, or one whose nearby symbol IR couldn't resolve so it carried no IR
+//           content yet). Because VS Code REUSES the one .monaco-resizable-hover wrapper, that
+//           opacity:0/removal corrupted the shared widget → the empty paint + the "destroyed
+//           after" cascade. Gated to no-op in native (VS Code owns visibility/dismiss; cf. L95-L97).
+//   L135b — irWatchHoverNativeHandles + irScheduleHoverNativeHandleCleanup (installed per
+//           active hover by irSetActiveHoverLayer) ran a MutationObserver that called
+//           irCleanupAddedHoverHandleNode, whose orphan-shell + external-visual-artifact
+//           branches do a DIRECT parentNode.removeChild — NOT routed through the L93-gated
+//           irQuarantineHoverNativeHandle — so a foreign extension's custom hover widget could
+//           be removed from the DOM. Gated both entry points to no-op in native.
+// If the running window still logs v<300, the new build is NOT loaded yet.
+export const RENDERER_PATCH_VERSION = 300;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -6304,6 +6322,7 @@ function irScheduleManagedHoverVisibilityKeepalive(hoverEl){
   ];
 }
 function irScheduleHoverNativeHandleCleanup(hoverEl,remove){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L135b (2026-06-02): native owns VS Code's scrollbar/sash + foreign hover DOM. The scheduled irHideHoverNativeHandles is already a no-op via the L93-gated irQuarantineHoverNativeHandle; skip entirely so we burn no timers/RAF.
   if(!hoverEl)return;
   irClearHoverHandleCleanup(hoverEl);
   var run=function(){
@@ -6340,6 +6359,7 @@ function irStopActiveHoverHandleObserver(){
 }
 function irWatchHoverNativeHandles(hoverEl){
   irStopActiveHoverHandleObserver();
+  if(IR_HOVER_NATIVE_ONLY)return;   // L135b (2026-06-02): this observer called irCleanupAddedHoverHandleNode, whose orphan-shell + external-visual-artifact branches removeChild foreign hover widgets DIRECTLY (bypassing the L93-gated quarantine). VS Code owns foreign hover DOM in native; never install it. (irStopActiveHoverHandleObserver above still tears down any prior observer.)
   if(!hoverEl||typeof MutationObserver==='undefined')return;
   try{
     var obs=irTrackObserver(new MutationObserver(function(muts){
@@ -6893,6 +6913,7 @@ function irHoverRootRectSummary(root){
   }catch(_){return ''}
 }
 function irMarkEmptyHoverRoot(root){
+  if(IR_HOVER_NATIVE_ONLY)return;   // L135a (2026-06-02): VS Code owns hover visibility/dismiss in native. Stamping .ir-empty-hover-root (opacity:0) or removeChild on a momentarily-empty .monaco-hover hid/destroyed OTHER extensions' hovers (shared single widget) mid-render → "빈 호버 → 그뒤 파괴". irRefreshEmptyHoverRootState still returns hasContent; it just no longer hides. cf. L95-L97.
   if(!root||!root.classList)return;
   try{
     var active=window.__irActiveHoverEl;
