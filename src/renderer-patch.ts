@@ -84,7 +84,7 @@
 //           irQuarantineHoverNativeHandle — so a foreign extension's custom hover widget could
 //           be removed from the DOM. Gated both entry points to no-op in native.
 // If the running window still logs v<300, the new build is NOT loaded yet.
-export const RENDERER_PATCH_VERSION = 300;
+export const RENDERER_PATCH_VERSION = 306;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -588,6 +588,7 @@ function irHEDescribe(el){
 function irHEHoverRoot(target){
   var el=target&&(target.nodeType===1?target:target.parentElement);
   if(!el||!el.closest)return null;
+  if(el.closest('.ij-find-overlay'))return null; // not ir's surface — intellij-styled-search preview (native hover)
   var resizable=el.closest('.monaco-resizable-hover');
   if(resizable)return resizable;
   var hov=el.closest('.monaco-hover, .monaco-editor-hover');
@@ -832,6 +833,14 @@ for(var __irHE_i=0;__irHE_i<IR_HE_EVENT_TYPES.length;__irHE_i++){(function(type)
   document.addEventListener(type,function(e){
     try{
       var tgt=e.target;
+      // Skip intellij-styled-search's surface (.ij-find-overlay). This hover-engine
+      // diagnostic runs irHEHoverRoot + a document-wide querySelector on EVERY one of
+      // 22 event types (incl. mousemove/pointermove/wheel); over that extension's
+      // preview editor it dominated mouse-move CPU (profiled). Its preview uses native
+      // hover, so ir has nothing to record there.
+      if(window.__ijFindPointerInside===true)return; // O(1) signal from intellij-styled-search; closest() below is fallback
+      var __irCe=tgt&&(tgt.nodeType===1?tgt:tgt.parentElement);
+      if(__irCe&&__irCe.closest&&__irCe.closest('.ij-find-overlay'))return;
       var root=irHEHoverRoot(tgt);
       var anyHover=document.querySelector('.monaco-resizable-hover, .monaco-hover, .monaco-editor-hover');
       // Always record events while a hover is alive (so we can correlate
@@ -3153,6 +3162,7 @@ function irRepositionInitialHover(editor,wrapperEl){
             if(stEl.closest('.monaco-resizable-hover'))continue;
             if(stEl.closest('.monaco-hover'))continue;
             if(stEl.closest('.monaco-list'))continue;
+            if(stEl.closest('.ij-find-overlay'))continue; // intellij-styled-search preview — not ir's
             var maybeEd=stEl.closest('.monaco-editor');
             if(maybeEd){domEd=maybeEd;break;}
           }
@@ -3355,6 +3365,12 @@ function irFindWidgetOnElement(el){
   // level deeper under .editor or ._editor. This mirrors the
   // intellij-styled-search "findMonacoWidgetOn" sniffing pattern.
   if(!el)return null;
+  // Skip intellij-styled-search's injected Monaco preview editor (mounted under
+  // .ij-find-overlay). ir's full per-element property enumeration below was run
+  // ~11x per editor on every scan trigger, and over that large preview editor it
+  // ate ~18% of renderer CPU during the search panel's resize/scroll (profiled).
+  // That extension self-excludes .ij-find-overlay in its own scanner; mirror it.
+  if(el.closest&&el.closest('.ij-find-overlay'))return null;
   var seen={};
   var keys=[];
   try{var own=Object.getOwnPropertyNames(el);for(var oi=0;oi<own.length;oi++){keys.push(own[oi]);seen[own[oi]]=1;}}catch(_){}
@@ -3389,6 +3405,7 @@ function irFindCodeEditorViaDom(){
     var nodes=document.querySelectorAll('.monaco-editor');
     for(var n=0;n<nodes.length;n++){
       var startEl=nodes[n];
+      if(startEl.closest&&startEl.closest('.ij-find-overlay'))continue; // skip intellij-styled-search search-panel editors
       var candidates=[startEl];
       var el=startEl.parentElement;
       for(var p=0;p<6&&el;p++,el=el.parentElement){
@@ -3420,6 +3437,7 @@ function irListAllCodeEditors(){
     var nodes=document.querySelectorAll('.monaco-editor');
     for(var n=0;n<nodes.length;n++){
       var startEl=nodes[n];
+      if(startEl.closest&&startEl.closest('.ij-find-overlay'))continue; // skip intellij-styled-search search-panel editors
       var candidates=[startEl];
       var el=startEl.parentElement;
       for(var p=0;p<6&&el;p++,el=el.parentElement){
@@ -4910,6 +4928,13 @@ function irShouldHoldPreviewTransition(root,e){
 function irRememberPointerEvent(e){
   try{
     if(!e||typeof e.clientX!=='number'||typeof e.clientY!=='number')return;
+    // intellij-styled-search's preview uses native hover — ir does no hover/drill
+    // there. This window-capture handler fires on every pointermove/mousemove/over;
+    // over that extension's preview it was the #1 main-thread entry during resize
+    // (profiled). Skip pointer events whose target is under .ij-find-overlay.
+    if(window.__ijFindPointerInside===true)return; // O(1) signal from intellij-styled-search (pointer over its overlay); closest() below is the fallback when that ext is absent/old
+    var __irRpeEl=e.target&&(e.target.nodeType===1?e.target:e.target.parentElement);
+    if(__irRpeEl&&__irRpeEl.closest&&__irRpeEl.closest('.ij-find-overlay'))return;
     // L43: skip near-stationary mouse events. When the user pauses on
     // a hover, the OS still emits pointermove/mousemove at 100Hz+ and
     // each call did getBoundingClientRect (irPointInPreviewTransitionRect)
@@ -4965,20 +4990,38 @@ function irPrecacheHoverNaturalContext(e){
     if(tgt.closest('.monaco-resizable-hover'))return;
     if(tgt.closest('.monaco-hover'))return;
     if(tgt.closest('.monaco-list'))return;
+    if(tgt.closest('.ij-find-overlay'))return; // intellij-styled-search preview uses native hover — not ir's to precache
     var edEl=tgt.closest('.monaco-editor');
     if(!edEl)return;
     var ed=null;
+    // Resolving the editor widget for edEl runs irListAllCodeEditors (full
+    // per-element property enumeration, ~45ms) on EVERY mouseover/pointerover.
+    // During a window/panel resize the cursor sits over one editor while the
+    // layout shift fires a burst of token-cross events — re-scanning each time
+    // was a visible hitch (profiled: #1 main-thread entry). The widget for a
+    // given .monaco-editor element is stable, so reuse a cached one while edEl
+    // is unchanged; validate the cached widget's DOM still covers edEl.
     try{
-      if(typeof irListAllCodeEditors==='function'){
-        var allEds=irListAllCodeEditors();
-        for(var ai=0;ai<allEds.length;ai++){
-          var cand=allEds[ai];
-          var cn=cand&&cand.getDomNode&&cand.getDomNode();
-          if(cn&&(cn===edEl||(cn.contains&&cn.contains(edEl)))){ed=cand;break;}
-        }
+      var ced=(edEl===window.__irPrecacheEdEl)?window.__irPrecacheEd:null;
+      if(ced&&typeof ced.getTargetAtClientPoint==='function'){
+        var cdom=ced.getDomNode&&ced.getDomNode();
+        if(cdom&&(cdom===edEl||(cdom.contains&&cdom.contains(edEl))))ed=ced;
       }
     }catch(_){}
-    if(!ed){try{ed=irFindWidgetOnElement(edEl);}catch(_){}}
+    if(!ed){
+      try{
+        if(typeof irListAllCodeEditors==='function'){
+          var allEds=irListAllCodeEditors();
+          for(var ai=0;ai<allEds.length;ai++){
+            var cand=allEds[ai];
+            var cn=cand&&cand.getDomNode&&cand.getDomNode();
+            if(cn&&(cn===edEl||(cn.contains&&cn.contains(edEl)))){ed=cand;break;}
+          }
+        }
+      }catch(_){}
+      if(!ed){try{ed=irFindWidgetOnElement(edEl);}catch(_){}}
+      if(ed){try{window.__irPrecacheEdEl=edEl;window.__irPrecacheEd=ed;}catch(_){}}
+    }
     if(!ed||typeof ed.getTargetAtClientPoint!=='function')return;
     var x=e.clientX, y=e.clientY;
     if(typeof x!=='number'||typeof y!=='number')return;
