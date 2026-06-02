@@ -83,8 +83,17 @@
 //           branches do a DIRECT parentNode.removeChild — NOT routed through the L93-gated
 //           irQuarantineHoverNativeHandle — so a foreign extension's custom hover widget could
 //           be removed from the DOM. Gated both entry points to no-op in native.
+// v307 (L136, 2026-06-03): scroll-jank fix — irRememberPointerEvent's hover
+//   precache (irListAllCodeEditors widget scan, ~45ms via per-element prototype
+//   enumeration) ran on every token-cross mouseover/pointerover, INCLUDING the
+//   burst emitted when content scrolls under a stationary cursor. Profiled in
+//   intellij-styled-search: 59% of the main thread during a wheel scroll → the
+//   document visibly stuttered (preview/search-panel stayed smooth via the
+//   existing .ij-find-overlay / __ijFindPointerInside guards). Now gated on
+//   recent wheel activity (window.__irLastWheelAt, 160ms window); precache
+//   resumes the instant scrolling stops. Trace-validated: skips 68/80 scans.
 // If the running window still logs v<300, the new build is NOT loaded yet.
-export const RENDERER_PATCH_VERSION = 306;
+export const RENDERER_PATCH_VERSION = 307;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -4982,6 +4991,19 @@ function irPrecacheHoverNaturalContext(e){
   try{
     var ty=String(e&&e.type||'');
     if(ty!=='mouseover'&&ty!=='pointerover')return;
+    // L136 (2026-06-03): scroll-jank fix. mouseover/pointerover fire not only on
+    // genuine pointer movement but also when content scrolls under a STATIONARY
+    // cursor — a wheel scroll of an editor emits a burst of token-cross events.
+    // Precaching a hover target during a scroll is pointless (the user is
+    // scrolling, not hovering) and the irListAllCodeEditors() widget scan below
+    // costs ~45ms, which starves frame production and visibly stutters the
+    // document scroll (profiled in intellij-styled-search: irRememberPointerEvent
+    // ate 59% of the main thread during a wheel scroll, ~44ms per token-cross).
+    // Skip the scan while a wheel fired recently; precache resumes the instant
+    // scrolling stops. Light pointer-state bookkeeping in irRememberPointerEvent
+    // still runs, so nothing downstream goes stale.
+    var __irLW=window.__irLastWheelAt;
+    if(__irLW&&(Date.now()-__irLW)<160)return;
     var tgt=e&&e.target;
     if(!tgt||!tgt.closest)return;
     // Skip events fired inside hover overlays — drill mouse drift would
@@ -5490,6 +5512,11 @@ function irHoverInternalWheelGuard(e){
 // changing observable behaviour.
 track(window,'wheel',irHoverInternalWheelGuard,true);
 track(window,'wheel',irPreviewTransitionWheelGuard,true);
+// L136 (2026-06-03): cheap wheel-time stamp read by irPrecacheHoverNaturalContext
+// to detect scroll-induced mouseover/pointerover bursts and skip the ~45ms
+// editor-widget scan during a scroll. Bound at capture so it stamps for every
+// wheel regardless of the guards above; the handler itself is effectively free.
+track(window,'wheel',function(){try{window.__irLastWheelAt=Date.now();}catch(_){}},true);
 function irPrimaryHoverScroller(hoverEl){
   if(!hoverEl)return null;
   try{
