@@ -4123,12 +4123,14 @@ suite('Hover Drill-Down E2E', () => {
         `Re-acquired hover should be on-screen. initialTop=${initialTop} reTop=${reTop}`);
     }
 
-    // 3) Restore scroll, drill down, then scroll again — verify drilled
-    // hover auto-restores via the scheduleScrollRestoreHover path
-    // (no manual re-acquire). VS Code dismisses the wrapper on scroll,
-    // but onDidChangeTextEditorVisibleRanges re-fires
-    // applyPreviewStateAsHover within ~220ms while currentPreviewState
-    // is alive, so a 500ms wait should see the drilled hover back.
+    // 3) Restore scroll, drill down, then scroll again — verify scroll is
+    // now 100% native: the drilled hover must NOT auto-restore and, above
+    // all, the editor must NOT jump back to the symbol. Scroll-restore
+    // (scheduleScrollRestoreHover → refireHoverAtAnchor → revealRange
+    // InCenterIfOutsideViewport) was disabled in the native-only pivot
+    // (VS Code owns scroll/dismiss; we keep only content + drill). Regression
+    // guard for "focus-out 후 스크롤 시 심볼로 점프" — after a drill the editor
+    // used to snap back to the anchor on every subsequent scroll.
     await vscode.commands.executeCommand('editorScroll', { to: 'up', by: 'line', value: SCROLL_LINES, revealCursor: false });
     await sleep(220);
     await getHoverText(doc.uri, anchor!);
@@ -4144,23 +4146,27 @@ suite('Hover Drill-Down E2E', () => {
     if (drilledBeforeScroll && drilledBeforeScroll.outer) {
       const drilledTop0 = Math.round(drilledBeforeScroll.outer.top);
       console.log(`  scroll-test drilled-before-scroll outer top=${drilledTop0} size=${Math.round(drilledBeforeScroll.outer.width)}x${Math.round(drilledBeforeScroll.outer.height)}`);
-      await vscode.commands.executeCommand('editorScroll', { to: 'down', by: 'line', value: SCROLL_LINES, revealCursor: false });
-      // Wait long enough for the auto-restore debounce (~220ms) + the
-      // refireHoverAtAnchor round-trip (~3 showHover attempts of
-      // 360ms each).
+      // Scroll hard (pages) so the anchor leaves the viewport — that is the
+      // only situation where the old revealRange(InCenterIfOutsideViewport)
+      // would have snapped the editor back. On this short fixture the anchor
+      // may still stay visible (then no reveal would fire either way); the
+      // assertion below is safe in both cases — it only fails if the viewport
+      // moves on its own after the user's scroll.
+      await vscode.commands.executeCommand('editorScroll', { to: 'down', by: 'page', value: 3, revealCursor: false });
+      await sleep(150);
+      const firstVisibleAfterScroll = editor.visibleRanges[0]?.start.line ?? 0;
+      // Wait well past the old auto-restore debounce (~220ms) + the
+      // refireHoverAtAnchor round-trip. With scroll-restore disabled the
+      // viewport must stay exactly where the user left it — no programmatic
+      // reveal/recenter back to the anchor.
       await sleep(2000);
+      const firstVisibleAfterWait = editor.visibleRanges[0]?.start.line ?? 0;
       const drilledAfterScroll = await captureGeometry('scroll-test.drilled-after-scroll');
-      assert.ok(drilledAfterScroll && drilledAfterScroll.outer,
-        `Drilled hover should auto-restore after scroll via onDidChangeTextEditorVisibleRanges. ` +
-        `Got: ${JSON.stringify(drilledAfterScroll)}`);
-      const drilledTop1 = Math.round(drilledAfterScroll.outer.top);
-      const dy = drilledTop1 - drilledTop0;
-      console.log(`  scroll-test drilled-after-scroll outer top=${drilledTop1} dy=${dy}`);
-      // Auto-restore is the success: the drilled hover came back at
-      // SOME on-screen position. Exact y depends on VS Code's
-      // above/below flip behavior.
-      assert.ok(drilledTop1 >= 0 && drilledTop1 < 900 && drilledAfterScroll.outer.width > 20,
-        `Auto-restored drilled hover should be on-screen. drilledTop0=${drilledTop0} drilledTop1=${drilledTop1}`);
+      console.log(`  scroll-test drilled-after-scroll firstVisible ${firstVisibleAfterScroll}→${firstVisibleAfterWait} ` +
+        `hoverRestored=${!!(drilledAfterScroll && drilledAfterScroll.outer)}`);
+      assert.ok(Math.abs(firstVisibleAfterWait - firstVisibleAfterScroll) <= 1,
+        `Editor must not jump back to the symbol after scroll (scroll-restore is disabled — native owns scroll). ` +
+        `firstVisibleAfterScroll=${firstVisibleAfterScroll} firstVisibleAfterWait=${firstVisibleAfterWait}`);
     } else {
       console.log(`  scroll-test drilled-before-scroll: drilled hover not visible — skipping drill scroll check`);
     }

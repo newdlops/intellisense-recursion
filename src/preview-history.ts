@@ -61,7 +61,23 @@ export function markDrillFlowEnd(): void {
     }, 480);
   }
 }
+// DEPRECATED / DISABLED (native-only pivot): scroll is now 100% VS Code's.
+// scheduleScrollRestoreHover re-fired applyPreviewStateAsHover →
+// refireHoverAtAnchor on every scroll while currentPreviewState was alive,
+// and refireHoverAtAnchor reveals the anchor (revealRange
+// InCenterIfOutsideViewport). Because the drill session was never cleared on
+// native dismiss (focus-out), scrolling AFTER focus-out kept yanking the
+// editor back to the symbol — the "scroll jumps to symbol" annoyance. Per the
+// native-only direction (VS Code owns scroll/dismiss; we keep ONLY content +
+// drill), let a scroll dismiss the drilled hover natively: no re-show, no
+// editor reveal/jump. Flip to re-enable the old re-fire behavior.
+// `: boolean` (not the inferred `false` literal) keeps the body reachable to
+// the type checker so its existing control-flow narrowing still holds.
+const SCROLL_RESTORE_ENABLED: boolean = false;
 export function scheduleScrollRestoreHover(): void {
+  // Single chokepoint: gating here covers the visibleRanges listener, the
+  // markDrillFlowEnd flush, and the post-guard retry timer.
+  if (!SCROLL_RESTORE_ENABLED) { return; }
   // Guards:
   //   - scrollRestoreInFlight: refireHoverAtAnchor moves the cursor
   //     which fires onDidChangeTextEditorVisibleRanges again. Without
