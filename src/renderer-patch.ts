@@ -93,7 +93,7 @@
 //   recent wheel activity (window.__irLastWheelAt, 160ms window); precache
 //   resumes the instant scrolling stops. Trace-validated: skips 68/80 scans.
 // If the running window still logs v<300, the new build is NOT loaded yet.
-export const RENDERER_PATCH_VERSION = 307;
+export const RENDERER_PATCH_VERSION = 308;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -3367,41 +3367,77 @@ if(!window.__irMapPrototypePatched){
     irHERecord('global-prototype-patched',{});
   }catch(_){}
 }
-function irFindWidgetOnElement(el){
-  // Search direct properties (own + inherited enumerable) on the element
-  // for an object that looks like a CodeEditorWidget. Some Monaco builds
-  // attach the widget as a private own property; others stash it one
-  // level deeper under .editor or ._editor. This mirrors the
-  // intellij-styled-search "findMonacoWidgetOn" sniffing pattern.
-  if(!el)return null;
-  // Skip intellij-styled-search's injected Monaco preview editor (mounted under
-  // .ij-find-overlay). ir's full per-element property enumeration below was run
-  // ~11x per editor on every scan trigger, and over that large preview editor it
-  // ate ~18% of renderer CPU during the search panel's resize/scroll (profiled).
-  // That extension self-excludes .ij-find-overlay in its own scanner; mirror it.
-  if(el.closest&&el.closest('.ij-find-overlay'))return null;
+// Element->widget cache + learned key. irScanWidgetOnElement reads every
+// own/inherited/symbol property of a DOM node (some getters force layout) and is
+// run ~11x per editor on every scan trigger; a single COLD scan over a large
+// editor was profiled at ~138ms (intellij-styled-search Trace-20260603T235406).
+// The WeakMap makes every REPEAT scan O(1); __irLastWidgetKey — the key the
+// widget was last found under, stable for a given Monaco build — resolves the
+// widget-holding element in one property read on later scans instead of a full
+// enumeration. Only the first cold scan of a session pays full price.
+// Negative (null) caching is safe: ir scans live editors under the cursor, and
+// Monaco creates the .monaco-editor DOM node together with its widget, so a
+// holder element can never be scanned before its widget is attached.
+var __irElWidgetCache=(typeof WeakMap==='function')?new WeakMap():null;
+var __irLastWidgetKey=null;
+function irExtractCodeEditorWidget(v){
+  if(!v||typeof v!=='object')return null;
+  if(irLooksLikeCodeEditorWidget(v))return v;
+  try{
+    if(v.editor&&irLooksLikeCodeEditorWidget(v.editor))return v.editor;
+    if(v._editor&&irLooksLikeCodeEditorWidget(v._editor))return v._editor;
+  }catch(_){}
+  return null;
+}
+function irScanWidgetOnElement(el){
+  // Fast path: try the key/symbol that matched on a previous scan first.
+  if(__irLastWidgetKey!==null){
+    try{
+      var fw=irExtractCodeEditorWidget(el[__irLastWidgetKey]);
+      if(fw)return fw;
+    }catch(_){}
+  }
   var seen={};
   var keys=[];
   try{var own=Object.getOwnPropertyNames(el);for(var oi=0;oi<own.length;oi++){keys.push(own[oi]);seen[own[oi]]=1;}}catch(_){}
   for(var k in el){if(!seen[k]){keys.push(k);seen[k]=1;}}
   for(var i=0;i<keys.length;i++){
     var v;try{v=el[keys[i]];}catch(_){continue;}
-    if(!v||typeof v!=='object')continue;
-    if(irLooksLikeCodeEditorWidget(v))return v;
-    try{
-      if(v.editor&&irLooksLikeCodeEditorWidget(v.editor))return v.editor;
-      if(v._editor&&irLooksLikeCodeEditorWidget(v._editor))return v._editor;
-    }catch(_){}
+    var w=irExtractCodeEditorWidget(v);
+    if(w){__irLastWidgetKey=keys[i];return w;}
   }
   try{
     var syms=Object.getOwnPropertySymbols(el);
     for(var s=0;s<syms.length;s++){
       var sv;try{sv=el[syms[s]];}catch(_){continue;}
       if(!sv||typeof sv!=='object')continue;
-      if(irLooksLikeCodeEditorWidget(sv))return sv;
+      if(irLooksLikeCodeEditorWidget(sv)){__irLastWidgetKey=syms[s];return sv;}
     }
   }catch(_){}
   return null;
+}
+function irFindWidgetOnElement(el){
+  // Search direct properties (own + inherited enumerable) + symbols on the
+  // element for an object that looks like a CodeEditorWidget. Some Monaco builds
+  // attach the widget as a private own property; others stash it one level deeper
+  // under .editor or ._editor. Mirrors intellij-styled-search "findMonacoWidgetOn".
+  if(!el)return null;
+  // Skip intellij-styled-search's injected Monaco preview editor (mounted under
+  // .ij-find-overlay) — that extension self-excludes it in its own scanner.
+  if(el.closest&&el.closest('.ij-find-overlay'))return null;
+  if(__irElWidgetCache){
+    try{
+      var cached=__irElWidgetCache.get(el);
+      if(cached!==undefined){
+        if(cached===null)return null;
+        if(irLooksLikeCodeEditorWidget(cached))return cached;
+        // cached widget went stale (editor disposed/reattached) — rescan below.
+      }
+    }catch(_){}
+  }
+  var found=irScanWidgetOnElement(el);
+  if(__irElWidgetCache){try{__irElWidgetCache.set(el,found);}catch(_){}}
+  return found;
 }
 function irFindCodeEditorViaDom(){
   // Walks .monaco-editor, each of its ancestors up to .editor-group-
