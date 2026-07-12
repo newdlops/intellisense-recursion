@@ -195,6 +195,10 @@ import {
   setLastHoverFetchPosition,
 } from './native-refire';
 import {
+  resolveOverlayHoverAnchor,
+  refireOverlayHover,
+} from './overlay-hover-handshake';
+import {
   withTimeout,
   ensureOpenDocIndex,
   findOpenDoc,
@@ -1171,6 +1175,10 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.commands.registerCommand(
         'intellisenseRecursion.requestNativeShowHoverForTests',
         (reason?: string) => requestNativeShowHoverFromRendererPointer(String(reason || 'test-command')),
+      ),
+      vscode.commands.registerCommand(
+        'intellisenseRecursion.refireHoverAtAnchorForTests',
+        refireHoverAtAnchor,
       ),
       vscode.commands.registerCommand(
         'intellisenseRecursion.dispatchRendererKeyForTests',
@@ -9382,11 +9390,15 @@ async function previewTypeHandler(
   // (e.g. drilling into a definition far down the file), so without this
   // snapshot showHover can end up firing outside the viewport and the
   // user perceives it as "hover disappeared".
-  const anchorPos = lastHoverFetchPosition;
-  if (!anchorPos) {
+  const rawAnchorPos = lastHoverFetchPosition;
+  if (!rawAnchorPos) {
     log.warn(`preview: "${identifier}" no anchorPos — skipping (no prior hover position)`);
     return;
   }
+  // Keep docUriStr (the backing analysis document) for definition lookup,
+  // but let an overlay owner replace the anchor used by state, pending-hover
+  // matching, click dedupe, and the eventual refire.
+  const anchorPos = await resolveOverlayHoverAnchor(rawAnchorPos);
   const anchorUriKey = hoverRequestUriKey(anchorPos.uri);
   const originScrollState = currentPreviewState?.originScrollState
     ?? (previewHistory.length === 0 ? await capturePreviewScrollStateInRenderer() : undefined);
@@ -9600,6 +9612,18 @@ async function previewTypeHandler(
 }
 
 async function refireHoverAtAnchor(anchor: { uri: vscode.Uri; line: number; character: number }): Promise<void> {
+  // Overlay editors are renderer-owned and cannot be targeted through the
+  // active file editor. Give the owner the first chance to refire in-place;
+  // absent/declined/failed commands retain the native editor fallback below.
+  if (await refireOverlayHover(anchor)) {
+    recordPreviewHoverDebug({
+      kind: "overlay-refire-handled",
+      uri: anchor.uri.toString(),
+      line: anchor.line,
+      character: anchor.character,
+    });
+    return;
+  }
   const newPos = new vscode.Position(anchor.line, anchor.character);
   const current = vscode.window.activeTextEditor;
   const visible = vscode.window.visibleTextEditors.find(editor =>
