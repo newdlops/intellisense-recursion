@@ -5003,6 +5003,112 @@ suite('Hover Renderer E2E', () => {
     assert.ok(simultaneousTexts.some((text: string) => text.includes('DragFirstModel'))
       && simultaneousTexts.some((text: string) => text.includes('DragSecondModel')),
     `Both independently painted hover contents should remain visible. ${JSON.stringify(drag)}`);
+
+    const selection = drag.selectionProbe;
+    assert.ok(selection,
+      `Detached content selection probe should run. ${JSON.stringify(drag)}`);
+    assert.strictEqual(selection.dragCandidateFromContent, false,
+      `Pointer movement in detached body text must not arm window dragging. ${JSON.stringify(selection)}`);
+    assert.strictEqual(selection.dragActiveFromContent, false,
+      `Detached body text selection must not move the window. ${JSON.stringify(selection)}`);
+    assert.notStrictEqual(selection.userSelect, 'none',
+      `Detached hover body should remain text-selectable. ${JSON.stringify(selection)}`);
+    assert.ok(String(selection.selectedText || '').includes('detail row'),
+      `A DOM range inside detached content should expose copyable text. ${JSON.stringify(selection)}`);
+    assert.strictEqual(selection.selectionInsideDetached, true,
+      `The selected range should remain owned by the detached window. ${JSON.stringify(selection)}`);
+    assert.ok(selection.beforeRect && selection.afterRect
+      && Math.abs(selection.afterRect.left - selection.beforeRect.left) <= 1
+      && Math.abs(selection.afterRect.top - selection.beforeRect.top) <= 1,
+    `Selecting detached content must not move its window. ${JSON.stringify(selection)}`);
+
+    const link = drag.linkProbe;
+    assert.ok(link,
+      `Detached link probe should run. ${JSON.stringify(drag)}`);
+    assert.notStrictEqual(link.pointerEvents, 'none',
+      `Detached type links should accept pointer input. ${JSON.stringify(link)}`);
+    assert.strictEqual(link.candidateAfterLinkDown, false,
+      `Clicking a detached type link must not arm window dragging. ${JSON.stringify(link)}`);
+    assert.strictEqual(link.activeAfterLinkDown, false,
+      `Clicking a detached type link must not start window movement. ${JSON.stringify(link)}`);
+    assert.strictEqual(link.previewPayloadCount, 1,
+      `A detached type-link click should emit exactly one isolated preview request. ${JSON.stringify(link)}`);
+    assert.strictEqual(link.previewPayload?.op, 'preview',
+      `Detached links should use the detached preview protocol. ${JSON.stringify(link)}`);
+    assert.ok(link.previewPayload?.sessionKey && Number(link.previewPayload?.requestId) > 0,
+      `Detached preview requests should carry a window session and request sequence. ${JSON.stringify(link)}`);
+    assert.deepStrictEqual(link.legacyPayloads, [],
+      `A detached click must not also emit native PREVIEW/goto traffic. ${JSON.stringify(link)}`);
+    assert.ok(link.clonedSafeLink?.href === 'https://example.com/cloned-detached-docs'
+      && link.clonedSafeLink?.dataHref === ''
+      && link.clonedSafeLink?.target === '_blank'
+      && link.clonedSafeLink?.pointerEvents !== 'none',
+    `A cloned VS Code anchor backed only by data-href should become a clickable native link. ${JSON.stringify(link)}`);
+    assert.strictEqual(link.applyResult?.ok, true,
+      `The targeted detached preview response should apply to its requesting window. ${JSON.stringify(link)}`);
+    assert.strictEqual(link.commitResult?.ok, true,
+      `The detached preview should unlock only after its isolated history commit. ${JSON.stringify(link)}`);
+    assert.ok(String(link.firstTextAfterApply || '').includes('DetachedTargetModel preview'),
+      `The clicked detached window should render its preview result. ${JSON.stringify(link)}`);
+    assert.ok(link.safeLink?.href === 'https://example.com/detached-docs'
+      && link.safeLink?.target === '_blank'
+      && link.safeLink?.pointerEvents !== 'none',
+    `Safe Markdown links in a detached drill page should remain clickable. ${JSON.stringify(link)}`);
+    assert.ok(String(link.otherTextAfterApply || '').includes('DragSecondModel')
+      && !String(link.otherTextAfterApply || '').includes('DetachedTargetModel preview'),
+    `A detached preview response must not replace another detached window. ${JSON.stringify(link)}`);
+    assert.strictEqual(link.backVisibleBeforeClick, true,
+      `Detached forward navigation should expose its own back control. ${JSON.stringify(link)}`);
+    assert.ok(String(link.firstTextAfterBack || '').includes('DragFirstModel detail row'),
+      `Detached back should restore the original live snapshot content. ${JSON.stringify(link)}`);
+    assert.strictEqual(link.nativeGlobalsUnchanged, true,
+      `Detached navigation must not borrow native hover target/history globals. ${JSON.stringify(link)}`);
+    assert.ok(link.windowBefore && link.windowAfter
+      && Math.abs(link.windowAfter.left - link.windowBefore.left) <= 1
+      && Math.abs(link.windowAfter.top - link.windowBefore.top) <= 1,
+    `Detached link navigation should not move the window. ${JSON.stringify(link)}`);
+
+    const resize = drag.resizeProbe;
+    assert.ok(resize?.before && resize?.after,
+      `Detached resize probe should run. ${JSON.stringify(drag)}`);
+    assert.notStrictEqual(resize.handlePointerEvents, 'none',
+      `Detached resize handle should accept pointer input. ${JSON.stringify(resize)}`);
+    assert.ok(String(resize.handleCursor || '').includes('resize'),
+      `Detached corner handle should advertise a resize cursor. ${JSON.stringify(resize)}`);
+    assert.strictEqual(resize.hitIsHandle, true,
+      `The detached resize handle should win its center hit-test. ${JSON.stringify(resize)}`);
+    assert.strictEqual(resize.during?.active, true,
+      `Detached resize state should be active during pointer movement. ${JSON.stringify(resize)}`);
+    assert.strictEqual(resize.during?.markerCount, 1,
+      `Exactly one detached window should carry the resize marker. ${JSON.stringify(resize)}`);
+    if ((resize.requestedDelta?.x || 0) > 0) {
+      assert.ok(resize.after.width >= resize.before.width + 40,
+        `Detached width should grow with the corner handle. ${JSON.stringify(resize)}`);
+    } else {
+      assert.ok(resize.after.width <= resize.before.width - 30,
+        `Detached width should shrink when no viewport growth room remains. ${JSON.stringify(resize)}`);
+    }
+    if ((resize.requestedDelta?.y || 0) > 0) {
+      assert.ok(resize.after.height >= resize.before.height + 25,
+        `Detached height should grow with the corner handle. ${JSON.stringify(resize)}`);
+    } else {
+      assert.ok(resize.after.height <= resize.before.height - 20,
+        `Detached height should shrink when no viewport growth room remains. ${JSON.stringify(resize)}`);
+    }
+    assert.ok(resize.after.right <= resize.viewport.width - 8 + 1
+      && resize.after.bottom <= resize.viewport.height - 8 + 1,
+    `Detached resizing should retain the 8px viewport gutter. ${JSON.stringify(resize)}`);
+    assert.ok(resize.rootRect
+      && resize.rootRect.left >= resize.after.left - 1
+      && resize.rootRect.right <= resize.after.right + 1
+      && resize.rootRect.top >= resize.after.top - 1
+      && resize.rootRect.bottom <= resize.after.bottom + 1,
+    `Detached content root should stay contained by the resized outer window. ${JSON.stringify(resize)}`);
+    assert.strictEqual(resize.activeAfter, false,
+      `Pointerup should clear detached resize state. ${JSON.stringify(resize)}`);
+    assert.strictEqual(resize.markerCountAfter, 0,
+      `Pointerup should remove every detached resize marker. ${JSON.stringify(resize)}`);
+
     assert.strictEqual(drag.duringLostButtonsDrag?.dragState?.candidate, true,
       `Crossing the threshold should leave a live drag candidate until button loss is observed. ${JSON.stringify(drag)}`);
     assert.strictEqual(drag.duringLostButtonsDrag?.dragState?.active, true,
@@ -5026,10 +5132,33 @@ suite('Hover Renderer E2E', () => {
       `The recovery re-drag should finish without stale active state. ${JSON.stringify(drag)}`);
     assert.strictEqual(drag.afterClose?.count, 1,
       `The close control should remove only its own detached window. ${JSON.stringify(drag)}`);
+    const closeUi = drag.closeUi;
+    assert.ok(closeUi?.inTitlebar,
+      `Detached close control should live in the visible titlebar. ${JSON.stringify(closeUi)}`);
+    assert.ok(closeUi.width >= 24 && closeUi.height >= 24,
+      `Detached close control should have a clearly hittable 24px target. ${JSON.stringify(closeUi)}`);
+    assert.notStrictEqual(closeUi.display, 'none',
+      `Detached close control should be displayed. ${JSON.stringify(closeUi)}`);
+    assert.notStrictEqual(closeUi.visibility, 'hidden',
+      `Detached close control should be visible. ${JSON.stringify(closeUi)}`);
+    assert.ok(closeUi.opacity >= 0.9 && closeUi.pointerEvents !== 'none',
+      `Detached close control should be opaque and clickable. ${JSON.stringify(closeUi)}`);
+    assert.ok(closeUi.backgroundColor !== 'rgba(0, 0, 0, 0)' || closeUi.borderStyle !== 'none',
+      `Detached close control needs visible surface contrast. ${JSON.stringify(closeUi)}`);
+    assert.strictEqual(closeUi.glyph, '×',
+      `Detached close control should render an unmistakable close glyph. ${JSON.stringify(closeUi)}`);
+    assert.notStrictEqual(closeUi.color, closeUi.backgroundColor,
+      `Detached close glyph should contrast with its button surface. ${JSON.stringify(closeUi)}`);
+    assert.notStrictEqual(closeUi.borderColor, 'rgba(0, 0, 0, 0)',
+      `Detached close control should retain a visible border. ${JSON.stringify(closeUi)}`);
+    assert.ok(closeUi.ariaLabel && closeUi.hitIsClose,
+      `Detached close control should be accessible and win its center hit-test. ${JSON.stringify(closeUi)}`);
     assert.ok(drag.afterClose?.windows?.[0]?.text?.includes('DragFirstModel'),
       `Closing the second window should leave the first one intact. ${JSON.stringify(drag)}`);
     assert.deepStrictEqual(drag.hidePayloads, ['HIDE_HOVER:click-pin-drag-detach'],
       `Only the controller without hideContentHover should use the native-hide fallback. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.cleanupResizeArmed, true,
+      `The cleanup probe should begin with an actively resizing detached window. ${JSON.stringify(drag)}`);
     assert.strictEqual(drag.cleanupState?.candidate, false,
       `clearDetachedHovers should clear any drag candidate. ${JSON.stringify(drag)}`);
     assert.strictEqual(drag.cleanupState?.active, false,
@@ -5038,8 +5167,66 @@ suite('Hover Renderer E2E', () => {
       `clearDetachedHovers should clear the delayed drag-click suppressor. ${JSON.stringify(drag)}`);
     assert.strictEqual(drag.cleanupState?.draggingCount, 0,
       `clearDetachedHovers should leave no dragging markers. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.cleanupState?.resizeActive, false,
+      `clearDetachedHovers should clear active resize state. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.cleanupState?.resizingCount, 0,
+      `clearDetachedHovers should leave no resize markers. ${JSON.stringify(drag)}`);
     assert.strictEqual(drag.cleanupState?.detached?.count, 0,
       `clearDetachedHovers should remove every detached window. ${JSON.stringify(drag)}`);
+  });
+
+  test(`[${lang}] detached hover links use an isolated end-to-end preview protocol`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(120000);
+    const folders = vscode.workspace.workspaceFolders!;
+    const serviceFile = vscode.Uri.file(path.join(folders[0].uri.fsPath, 'service.py'));
+    const doc = await vscode.workspace.openTextDocument(serviceFile);
+    const anchor = findIdentifier(doc, 'Company', 1);
+    assert.ok(anchor, 'Could not find Company annotation in service.py');
+    await vscode.window.showTextDocument(doc, { selection: new vscode.Range(anchor!, anchor!) });
+    await waitForLanguageServer(doc, 'Company');
+    const hoverText = await getHoverText(doc.uri, anchor!);
+    assert.ok(hoverText.length > 0, 'Initial hover should establish a detached-session anchor');
+    await ensureExtensionCommandsReady('intellisenseRecursion.runDetachedPreviewProtocolHarnessForTests');
+
+    const result = await vscode.commands.executeCommand<any>(
+      'intellisenseRecursion.runDetachedPreviewProtocolHarnessForTests',
+      'BaseModel',
+    );
+    assert.strictEqual(result?.ok, true,
+      `Detached protocol harness should complete. ${JSON.stringify(result)}`);
+    assert.strictEqual(result?.setup?.count, 2,
+      `The protocol harness should register two independent detached windows. ${JSON.stringify(result)}`);
+    assert.strictEqual(result?.afterApply?.latestRequest, 1,
+      `One link click should produce exactly one detached request. ${JSON.stringify(result)}`);
+    assert.strictEqual(result?.afterApply?.current, 'BaseModel',
+      `The extension session should commit the resolved BaseModel page. ${JSON.stringify(result)}`);
+    assert.strictEqual(result?.afterApply?.history, 1,
+      `Detached forward navigation should commit one local history entry. ${JSON.stringify(result)}`);
+    assert.ok(String(result?.afterApply?.renderer?.text || '').includes('class BaseModel')
+      && result?.afterApply?.renderer?.busy === false
+      && result?.afterApply?.renderer?.backVisible === true,
+    `The real binding response should update and unlock only the requesting window. ${JSON.stringify(result)}`);
+    assert.ok(String(result?.afterApply?.second?.text || '').includes('DetachedProtocolSecond original sentinel')
+      && !String(result?.afterApply?.second?.text || '').includes('class BaseModel')
+      && result?.afterApply?.second?.requestId === 0,
+    `The second detached window must remain isolated from the first response. ${JSON.stringify(result)}`);
+    assert.ok(result?.back?.session
+      && result.back.session.history === 0
+      && String(result?.back?.renderer?.text || '').includes('DetachedProtocolFirst original sentinel')
+      && result?.back?.restoredOriginalCurrent === true,
+    `Detached Back should restore both renderer and extension session state. ${JSON.stringify(result)}`);
+    assert.strictEqual(result?.dispose?.firstDisposed, true,
+      `Closing the first detached window should dispose only its session. ${JSON.stringify(result)}`);
+    assert.ok(result?.dispose?.secondAfterFirstDispose?.exists
+      && result?.dispose?.secondAfterFirstDispose?.count === 1,
+    `The second detached window should survive the first close. ${JSON.stringify(result)}`);
+    assert.strictEqual(result?.dispose?.secondDisposed, true,
+      `Closing the second detached window should dispose its session. ${JSON.stringify(result)}`);
+    assert.strictEqual(result?.nativeGlobalsUnchanged, true,
+      `Detached navigation must not mutate native hover current/history state. ${JSON.stringify(result)}`);
+    assert.strictEqual(result?.sharedLocationCachesUnchanged, true,
+      `Detached definition building must not repoint native hover location caches. ${JSON.stringify(result)}`);
   });
 
   test(`[${lang}] native sash enables viewport-safe flexible hover resizing`, async function () {

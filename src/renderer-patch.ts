@@ -106,8 +106,12 @@
 //   and therefore lets another native hover open while prior snapshots stay
 //   visible. Snapshot windows retain scroll position, can be moved again, and
 //   have an explicit close control plus patch-cleanup ownership.
+// v312 (L140, 2026-07-13): detached windows get visible titlebar chrome,
+//   titlebar-only dragging, selectable/copyable content, viewport-safe resize
+//   handles, and an isolated per-window preview-link lane. Detached navigation
+//   never borrows the native singleton hover's target or drill history.
 // If the running window still logs v<300, the new build is NOT loaded yet.
-export const RENDERER_PATCH_VERSION = 311;
+export const RENDERER_PATCH_VERSION = 312;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -219,6 +223,7 @@ window.__irDetachedHoverZ = 0;
 window.__irHoverDragCandidate = null;
 window.__irHoverDragActive = null;
 window.__irHoverDragClickSuppress = null;
+window.__irDetachedHoverResizeActive = null;
 window.__irDetachedClampFrame = 0;
 window.__irHoverPatched = true;  // legacy compat
 
@@ -374,6 +379,7 @@ window.__irCleanup=function(reason){
     window.__irHoverDragCandidate=null;
     window.__irHoverDragActive=null;
     window.__irHoverDragClickSuppress=null;
+    window.__irDetachedHoverResizeActive=null;
     if(window.__irDetachedClampFrame){try{cancelAnimationFrame(window.__irDetachedClampFrame)}catch(_){}window.__irDetachedClampFrame=0;}
     window.__irInactiveScanSkipLogCount=0;
     window.__irMonacoCaps=null;
@@ -615,17 +621,31 @@ style.textContent=[
   // not mistake it for the singleton widget. These high-specificity rules
   // restore the sizing that the pre-adoption .monaco-hover rule zeros out.
   '.ir-detached-hover-layer{position:fixed !important;inset:0 !important;width:100vw !important;height:100vh !important;overflow:visible !important;pointer-events:none !important;z-index:2147483646 !important}',
-  '.ir-detached-hover.ir-detached-hover{position:absolute !important;box-sizing:border-box !important;display:block !important;visibility:visible !important;overflow:visible !important;transform:none !important;margin:0 !important;padding:0 !important;pointer-events:auto !important;cursor:grab !important;background:var(--vscode-editorHoverWidget-background,var(--vscode-editor-background,Canvas)) !important;color:var(--vscode-editorHoverWidget-foreground,var(--vscode-editor-foreground,CanvasText)) !important;border:1px solid var(--vscode-focusBorder,var(--vscode-editorHoverWidget-border,rgba(128,128,128,0.85))) !important;border-radius:4px !important;box-shadow:0 4px 14px rgba(0,0,0,0.28) !important;z-index:var(--ir-detached-hover-z,1) !important}',
-  '.ir-detached-hover.ir-detached-hover .monaco-hover,.ir-detached-hover.ir-detached-hover .monaco-editor-hover,.ir-detached-hover.ir-detached-hover .monaco-hover.ir-scrollable,.ir-detached-hover.ir-detached-hover .monaco-editor-hover.ir-scrollable{position:static !important;inset:auto !important;display:flex !important;flex-direction:column !important;box-sizing:border-box !important;width:100% !important;height:100% !important;min-width:0 !important;min-height:0 !important;max-width:100% !important;max-height:100% !important;margin:0 !important;transform:none !important;overflow:hidden !important;visibility:visible !important;opacity:1 !important;pointer-events:auto !important;cursor:inherit !important;border:0 !important;border-radius:inherit !important;outline:0 !important;box-shadow:none !important}',
-  '.ir-detached-hover.ir-detached-hover .monaco-hover .monaco-scrollable-element,.ir-detached-hover.ir-detached-hover .monaco-editor-hover .monaco-scrollable-element{position:static !important;inset:auto !important;top:auto !important;left:auto !important;right:auto !important;bottom:auto !important;transform:none !important;display:block !important;flex:1 1 auto !important;box-sizing:border-box !important;width:calc(100% - 2px) !important;height:auto !important;min-width:0 !important;min-height:0 !important;max-width:calc(100% - 2px) !important;max-height:calc(100% - 2px) !important;margin:1px !important;overflow:auto !important;overscroll-behavior:contain !important;scrollbar-width:auto !important;scrollbar-color:auto !important;visibility:visible !important;pointer-events:auto !important;cursor:inherit !important}',
+  '.ir-detached-hover.ir-detached-hover{position:absolute !important;box-sizing:border-box !important;display:flex !important;flex-direction:column !important;visibility:visible !important;overflow:hidden !important;transform:none !important;margin:0 !important;padding:0 !important;pointer-events:auto !important;cursor:default !important;background:var(--vscode-editorHoverWidget-background,var(--vscode-editor-background,Canvas)) !important;color:var(--vscode-editorHoverWidget-foreground,var(--vscode-editor-foreground,CanvasText)) !important;border:1px solid var(--vscode-focusBorder,var(--vscode-editorHoverWidget-border,rgba(128,128,128,0.85))) !important;border-radius:5px !important;box-shadow:0 6px 18px rgba(0,0,0,0.36) !important;z-index:var(--ir-detached-hover-z,1) !important}',
+  '.ir-detached-hover-titlebar{display:flex !important;align-items:center !important;gap:5px !important;box-sizing:border-box !important;flex:0 0 28px !important;width:100% !important;height:28px !important;min-height:28px !important;padding:2px 3px 2px 7px !important;overflow:hidden !important;cursor:grab !important;touch-action:none !important;user-select:none !important;-webkit-user-select:none !important;background:var(--vscode-titleBar-activeBackground,var(--vscode-editorGroupHeader-tabsBackground,rgba(128,128,128,0.22))) !important;color:var(--vscode-titleBar-activeForeground,var(--vscode-foreground,CanvasText)) !important;border-bottom:1px solid var(--vscode-editorHoverWidget-border,var(--vscode-focusBorder,rgba(128,128,128,0.75))) !important}',
+  '.ir-detached-hover-titlebar-grip{flex:0 0 auto !important;opacity:.72 !important;font:700 12px/1 var(--vscode-font-family,sans-serif) !important;letter-spacing:-2px !important;pointer-events:none !important}',
+  '.ir-detached-hover-title{flex:1 1 auto !important;min-width:0 !important;overflow:hidden !important;text-overflow:ellipsis !important;white-space:nowrap !important;font:600 12px/1.2 var(--vscode-font-family,sans-serif) !important;pointer-events:none !important}',
+  '.ir-detached-hover.ir-detached-hover > .ir-detached-hover-root.ir-detached-hover-root,.ir-detached-hover.ir-detached-hover .monaco-hover.ir-detached-hover-root,.ir-detached-hover.ir-detached-hover .monaco-editor-hover.ir-detached-hover-root{position:static !important;inset:auto !important;z-index:auto !important;display:flex !important;flex:1 1 auto !important;flex-direction:column !important;box-sizing:border-box !important;width:100% !important;height:auto !important;min-width:0 !important;min-height:0 !important;max-width:100% !important;max-height:100% !important;margin:0 !important;transform:none !important;overflow:hidden !important;visibility:visible !important;opacity:1 !important;pointer-events:auto !important;cursor:text !important;user-select:text !important;-webkit-user-select:text !important;border:0 !important;border-radius:0 !important;outline:0 !important;box-shadow:none !important}',
+  '.ir-detached-hover.ir-detached-hover .monaco-hover .monaco-scrollable-element,.ir-detached-hover.ir-detached-hover .monaco-editor-hover .monaco-scrollable-element{position:static !important;inset:auto !important;top:auto !important;left:auto !important;right:auto !important;bottom:auto !important;transform:none !important;display:block !important;flex:1 1 auto !important;box-sizing:border-box !important;width:calc(100% - 2px) !important;height:auto !important;min-width:0 !important;min-height:0 !important;max-width:calc(100% - 2px) !important;max-height:calc(100% - 2px) !important;margin:1px !important;overflow:auto !important;overscroll-behavior:contain !important;scrollbar-width:auto !important;scrollbar-color:auto !important;visibility:visible !important;pointer-events:auto !important;cursor:text !important;user-select:text !important;-webkit-user-select:text !important}',
   '.ir-detached-hover.ir-detached-hover .monaco-hover-content,.ir-detached-hover.ir-detached-hover .hover-row,.ir-detached-hover.ir-detached-hover .hover-row-contents,.ir-detached-hover.ir-detached-hover .markdown-hover,.ir-detached-hover.ir-detached-hover .rendered-markdown{width:auto !important;height:auto !important;min-width:0 !important;min-height:0 !important;max-width:100% !important;max-height:none !important;overflow:visible !important;visibility:visible !important}',
   '.ir-detached-hover.ir-detached-hover .monaco-hover-content{position:static !important;inset:auto !important;top:auto !important;left:auto !important;right:auto !important;bottom:auto !important;transform:none !important}',
   '.ir-detached-hover.ir-detached-hover .hover-row{display:flex !important}',
   '.ir-detached-hover.ir-detached-hover .hover-row-contents{display:flex !important;flex-direction:column !important;min-width:0 !important}',
-  '.ir-detached-hover.ir-detached-hover .ir-type-link,.ir-detached-hover.ir-detached-hover .ir-type-link *,.ir-detached-hover.ir-detached-hover .ir-back-btn,.ir-detached-hover.ir-detached-hover a,.ir-detached-hover.ir-detached-hover button:not(.ir-detached-hover-close),.ir-detached-hover.ir-detached-hover input,.ir-detached-hover.ir-detached-hover textarea,.ir-detached-hover.ir-detached-hover select,.ir-detached-hover.ir-detached-hover [contenteditable="true"],.ir-detached-hover.ir-detached-hover [role="button"]{pointer-events:none !important;cursor:inherit !important}',
-  '.ir-detached-hover-close{position:absolute !important;top:-7px !important;right:-7px !important;display:flex !important;align-items:center !important;justify-content:center !important;width:22px !important;height:22px !important;min-width:22px !important;min-height:22px !important;padding:0 !important;border:0 !important;border-radius:11px !important;background:var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.18)) !important;color:var(--vscode-foreground,CanvasText) !important;font:16px/1 var(--vscode-font-family,sans-serif) !important;cursor:pointer !important;pointer-events:auto !important;z-index:4 !important}',
-  '.ir-detached-hover-close:hover{background:var(--vscode-toolbar-activeBackground,var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.3))) !important}',
+  '.ir-detached-hover.ir-detached-hover .monaco-hover-content,.ir-detached-hover.ir-detached-hover .markdown-hover,.ir-detached-hover.ir-detached-hover .rendered-markdown,.ir-detached-hover.ir-detached-hover pre,.ir-detached-hover.ir-detached-hover code{cursor:text !important;user-select:text !important;-webkit-user-select:text !important}',
+  '.ir-detached-hover.ir-detached-hover .ir-type-link,.ir-detached-hover.ir-detached-hover .ir-type-link *,.ir-detached-hover.ir-detached-hover a[data-ir-detached-safe-link="1"]{pointer-events:auto !important;cursor:pointer !important}',
+  '.ir-detached-hover.ir-detached-hover button:not(.ir-detached-hover-close):not(.ir-detached-hover-back),.ir-detached-hover.ir-detached-hover input,.ir-detached-hover.ir-detached-hover textarea,.ir-detached-hover.ir-detached-hover select,.ir-detached-hover.ir-detached-hover [contenteditable="true"],.ir-detached-hover.ir-detached-hover [role="button"]:not(.ir-detached-hover-close):not(.ir-detached-hover-back){pointer-events:none !important}',
+  '.ir-detached-hover-back,.ir-detached-hover-close{position:static !important;display:flex !important;align-items:center !important;justify-content:center !important;flex:0 0 24px !important;width:24px !important;height:24px !important;min-width:24px !important;min-height:24px !important;padding:0 !important;border:1px solid var(--vscode-contrastBorder,var(--vscode-focusBorder,rgba(255,255,255,0.48))) !important;border-radius:4px !important;background:var(--vscode-button-secondaryBackground,var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.42))) !important;color:var(--vscode-button-secondaryForeground,var(--vscode-foreground,CanvasText)) !important;font:700 17px/1 var(--vscode-font-family,sans-serif) !important;cursor:pointer !important;pointer-events:auto !important;opacity:1 !important;z-index:7 !important}',
+  '.ir-detached-hover-back{display:none !important;font-size:15px !important}',
+  '.ir-detached-hover-back.ir-detached-hover-back-visible{display:flex !important}',
+  '.ir-detached-hover-back:hover{background:var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.58)) !important}',
+  '.ir-detached-hover-close:hover{background:var(--vscode-inputValidation-errorBackground,#c42b1c) !important;color:var(--vscode-button-foreground,#fff) !important}',
+  '.ir-detached-hover-back:focus-visible,.ir-detached-hover-close:focus-visible{outline:2px solid var(--vscode-focusBorder,#007fd4) !important;outline-offset:-2px !important}',
+  '.ir-detached-hover-resize-handle{position:absolute !important;display:block !important;box-sizing:border-box !important;pointer-events:auto !important;touch-action:none !important;user-select:none !important;-webkit-user-select:none !important;z-index:6 !important}',
+  '.ir-detached-hover-resize-right{top:28px !important;right:0 !important;bottom:10px !important;width:6px !important;cursor:ew-resize !important}',
+  '.ir-detached-hover-resize-bottom{left:0 !important;right:10px !important;bottom:0 !important;height:6px !important;cursor:ns-resize !important}',
+  '.ir-detached-hover-resize-corner{right:0 !important;bottom:0 !important;width:15px !important;height:15px !important;cursor:nwse-resize !important;background:linear-gradient(135deg,transparent 0 45%,var(--vscode-focusBorder,rgba(128,128,128,.9)) 46% 52%,transparent 53% 64%,var(--vscode-focusBorder,rgba(128,128,128,.9)) 65% 72%,transparent 73%) !important}',
   '.ir-detached-hover-dragging,.ir-detached-hover-dragging *{cursor:grabbing !important;user-select:none !important}',
+  '.ir-detached-hover-resizing,.ir-detached-hover-resizing *{user-select:none !important;-webkit-user-select:none !important}',
   // L47: native virtual list for large hover bodies. content-visibility:
   // auto makes the brower skip layout+paint for off-screen .rendered-
   // markdown blocks (and their descendants) — turning a 57K-char drill
@@ -4682,6 +4702,9 @@ track(window,'blur',irFinishFlexibleHoverResize,true);
 // class; this keeps Monaco's wrapper discovery and layout code away from them.
 var IR_HOVER_DRAG_THRESHOLD_PX=5;
 var IR_DETACHED_HOVER_MAX=12;
+var IR_DETACHED_HOVER_TITLEBAR_HEIGHT=28;
+var IR_DETACHED_HOVER_MIN_WIDTH=240;
+var IR_DETACHED_HOVER_MIN_HEIGHT=120;
 function irIsDetachedHoverElement(el){
   try{
     var node=el&&(el.nodeType===1?el:el.parentElement);
@@ -4720,6 +4743,15 @@ function irBringDetachedHoverToFront(state){
     state.el.style.setProperty('--ir-detached-hover-z',String(next));
     irEnsureDetachedHoverLayer();
   }catch(_){ }
+}
+function irNotifyDetachedHover(state,op,details){
+  try{
+    if(!state||!state.sessionKey||typeof window.irGoToType!=='function')return false;
+    var payload={op:String(op||''),sessionKey:String(state.sessionKey)};
+    if(details)for(var key in details)if(Object.prototype.hasOwnProperty.call(details,key))payload[key]=details[key];
+    window.irGoToType('DETACHED:'+JSON.stringify(payload));
+    return true;
+  }catch(_){return false}
 }
 function irClampDetachedHoverPosition(state,left,top){
   var margin=8;
@@ -4890,6 +4922,16 @@ function irClearHoverInteractionRefsForRoot(root,reason){
     if(irRootContainsMaybe(root,window.__irLastPreviewTarget))window.__irLastPreviewTarget=null;
   }catch(_){ }
 }
+function irCancelDetachedHoverResize(state){
+  try{
+    var active=window.__irDetachedHoverResizeActive;
+    if(!active||state&&active.state!==state)return false;
+    window.__irDetachedHoverResizeActive=null;
+    irReleaseHoverDragPointerCapture(active);
+    if(active.state&&active.state.el)active.state.el.classList.remove('ir-detached-hover-resizing');
+    return true;
+  }catch(_){window.__irDetachedHoverResizeActive=null;return false}
+}
 function irRemoveDetachedHover(stateOrEl,reason){
   try{
     var state=stateOrEl&&stateOrEl.el?stateOrEl:irDetachedHoverStateFromElement(stateOrEl);
@@ -4899,6 +4941,7 @@ function irRemoveDetachedHover(stateOrEl,reason){
       irReleaseHoverDragPointerCapture(window.__irHoverDragCandidate);
       window.__irHoverDragCandidate=null;
     }
+    irCancelDetachedHoverResize(state);
     var list=window.__irDetachedHovers||[];
     for(var i=list.length-1;i>=0;i--)if(list[i]===state)list.splice(i,1);
     try{irClearHoverInteractionRefsForRoot(state.root,'detached-close');}catch(_){ }
@@ -4908,10 +4951,20 @@ function irRemoveDetachedHover(stateOrEl,reason){
       var suppress=window.__irHoverDragClickSuppress;
       if(suppress&&suppress.detached&&state.el.contains(suppress.detached))window.__irHoverDragClickSuppress=null;
     }catch(_){ }
+    try{
+      if(state.linkScrollTarget&&state.linkScrollListener)state.linkScrollTarget.removeEventListener('scroll',state.linkScrollListener);
+    }catch(_){ }
+    try{if(state.previewCommitTimer)irClearTimer(state.previewCommitTimer);}catch(_){ }
+    try{if(state.previewRequestTimer)irClearTimer(state.previewRequestTimer);}catch(_){ }
+    irNotifyDetachedHover(state,'dispose',{reason:String(reason||'close')});
     if(state.el&&state.el.parentNode)state.el.parentNode.removeChild(state.el);
     state.el=null;
     state.root=null;
     state.vtailRenders=null;
+    state.pageStack=null;
+    state.currentPage=null;
+    state.linkScrollTarget=null;
+    state.linkScrollListener=null;
     irHERecord('hover-detached-closed',{reason:String(reason||'close'),remaining:list.length});
     return true;
   }catch(_){return false}
@@ -4920,6 +4973,7 @@ function irClearDetachedHovers(reason){
   try{
     if(window.__irDetachedClampFrame){try{cancelAnimationFrame(window.__irDetachedClampFrame)}catch(_){}window.__irDetachedClampFrame=0;}
     if(window.__irHoverDragCandidate)irReleaseHoverDragPointerCapture(window.__irHoverDragCandidate);
+    irCancelDetachedHoverResize(null);
     var list=(window.__irDetachedHovers||[]).slice();
     for(var i=0;i<list.length;i++)irRemoveDetachedHover(list[i],reason||'clear');
     var layer=window.__irDetachedHoverLayer;
@@ -4929,6 +4983,7 @@ function irClearDetachedHovers(reason){
     window.__irHoverDragCandidate=null;
     window.__irHoverDragActive=null;
     window.__irHoverDragClickSuppress=null;
+    window.__irDetachedHoverResizeActive=null;
     return list.length;
   }catch(_){return 0}
 }
@@ -4951,7 +5006,10 @@ function irDetachedHoverSnapshot(){
         clientHeight:sc?Number(sc.clientHeight)||0:0,
         capturedScrollTop:Number(state.capturedScrollTop)||0,
         z:state.z||0,
-        dragging:!!(state.el.classList&&state.el.classList.contains('ir-detached-hover-dragging'))
+        dragging:!!(state.el.classList&&state.el.classList.contains('ir-detached-hover-dragging')),
+        resizing:!!(state.el.classList&&state.el.classList.contains('ir-detached-hover-resizing')),
+        previewBusy:!!state.previewBusy,
+        previewType:String(state.currentTypeName||'')
       });
     }
     return {count:windows.length,windows:windows,nativePinned:!!window.__irClickPinnedHover};
@@ -4994,20 +5052,67 @@ function irCreateDetachedHoverSnapshot(pin){
     var inactiveControls=clone.querySelectorAll?clone.querySelectorAll('a,button,input,textarea,select,[contenteditable="true"],[role="button"]'):[];
     for(var ci=0;ci<inactiveControls.length;ci++){
       var inactive=inactiveControls[ci];
+      var inactiveTag=String(inactive.tagName||'').toLowerCase();
+      if(inactiveTag==='a'){
+        var href=String(inactive.getAttribute('href')||inactive.getAttribute('data-href')||'').trim();
+        if(/^(https?:|mailto:)/i.test(href)){
+          inactive.setAttribute('data-ir-detached-safe-link','1');
+          // VS Code may keep the destination only in data-href and rely on a
+          // listener that cloneNode cannot copy.  Materialize the validated
+          // destination so the detached snapshot has native anchor behavior.
+          inactive.setAttribute('href',href);
+          inactive.removeAttribute('data-href');
+          inactive.removeAttribute('aria-disabled');
+          inactive.removeAttribute('tabindex');
+          if(/^https?:/i.test(href)){
+            inactive.setAttribute('target','_blank');
+            inactive.setAttribute('rel','noopener noreferrer');
+          }
+          continue;
+        }
+      }
       inactive.setAttribute('tabindex','-1');
       inactive.setAttribute('aria-disabled','true');
-      var inactiveTag=String(inactive.tagName||'').toLowerCase();
       if(inactiveTag==='button'||inactiveTag==='input'||inactiveTag==='textarea'||inactiveTag==='select')inactive.disabled=true;
       if(inactiveTag==='a'){inactive.removeAttribute('href');inactive.removeAttribute('data-href');}
       if(inactive.hasAttribute&&inactive.hasAttribute('contenteditable'))inactive.setAttribute('contenteditable','false');
     }
+    var titlebar=document.createElement('div');
+    titlebar.className='ir-detached-hover-titlebar';
+    titlebar.setAttribute('data-ir-detached-hover-drag-handle','1');
+    titlebar.setAttribute('aria-label','Pinned hover window');
+    var grip=document.createElement('span');
+    grip.className='ir-detached-hover-titlebar-grip';
+    grip.setAttribute('aria-hidden','true');
+    grip.textContent='⠿';
+    var back=document.createElement('button');
+    back.className='ir-detached-hover-back';
+    back.type='button';
+    back.setAttribute('aria-label','Back in pinned hover');
+    back.setAttribute('title','Back');
+    back.textContent='←';
+    var title=document.createElement('span');
+    title.className='ir-detached-hover-title';
+    title.textContent='Pinned hover';
     var close=document.createElement('button');
     close.className='ir-detached-hover-close';
     close.type='button';
     close.setAttribute('aria-label','Close pinned hover');
     close.setAttribute('title','Close pinned hover');
     close.textContent='×';
-    clone.appendChild(close);
+    titlebar.appendChild(grip);
+    titlebar.appendChild(back);
+    titlebar.appendChild(title);
+    titlebar.appendChild(close);
+    clone.insertBefore(titlebar,clone.firstChild||null);
+    var resizeEdges=['right','bottom','corner'];
+    for(var rei=0;rei<resizeEdges.length;rei++){
+      var resizeHandle=document.createElement('div');
+      resizeHandle.className='ir-detached-hover-resize-handle ir-detached-hover-resize-'+resizeEdges[rei];
+      resizeHandle.setAttribute('data-ir-resize-edge',resizeEdges[rei]);
+      resizeHandle.setAttribute('aria-hidden','true');
+      clone.appendChild(resizeHandle);
+    }
     var seq=(Number(window.__irDetachedHoverSeq)||0)+1;
     window.__irDetachedHoverSeq=seq;
     clone.setAttribute('data-ir-detached-hover-id',String(seq));
@@ -5015,22 +5120,45 @@ function irCreateDetachedHoverSnapshot(pin){
     clone.style.removeProperty('bottom');
     clone.style.removeProperty('transform');
     clone.style.setProperty('width',Math.round(rect.width)+'px','important');
-    clone.style.setProperty('height',Math.round(rect.height)+'px','important');
+    var detachedHeight=Math.round(rect.height)+IR_DETACHED_HOVER_TITLEBAR_HEIGHT;
+    clone.style.setProperty('height',detachedHeight+'px','important');
     clone.style.setProperty('min-width',Math.round(rect.width)+'px','important');
-    clone.style.setProperty('min-height',Math.round(rect.height)+'px','important');
+    clone.style.setProperty('min-height',detachedHeight+'px','important');
     clone.style.setProperty('max-width',Math.round(rect.width)+'px','important');
-    clone.style.setProperty('max-height',Math.round(rect.height)+'px','important');
+    clone.style.setProperty('max-height',detachedHeight+'px','important');
+    var sessionKey=String(window.__irHostWindowId||'?')+':'+String(IR_PATCH_VERSION)+':'+String(seq)+':'+String(Date.now());
+    var previewTarget=null;
+    try{
+      previewTarget=root.querySelector('.rendered-markdown.ir-primary-preview-target')
+        ||root.querySelector('.rendered-markdown.ir-applied')
+        ||root.querySelector('.rendered-markdown');
+      if(previewTarget)irSetPreviewTarget(root,previewTarget);
+    }catch(_){ }
     var state={
       id:seq,
+      sessionKey:sessionKey,
       el:clone,
       root:root,
       width:Math.round(rect.width),
-      height:Math.round(rect.height),
+      height:detachedHeight,
       naturalWidth:Math.round(rect.width),
-      naturalHeight:Math.round(rect.height),
+      naturalHeight:detachedHeight,
       left:Math.round(rect.left),
       top:Math.round(rect.top),
       z:0,
+      titlebar:titlebar,
+      titleLabel:title,
+      backButton:back,
+      previewTarget:previewTarget,
+      previewRequestSeq:0,
+      previewBusy:false,
+      previewAwaitingCommit:0,
+      previewCommitTimer:null,
+      previewRequestTimer:null,
+      lastAppliedPreview:null,
+      currentTypeName:'',
+      currentPage:{kind:'live',typeName:'',md:null},
+      pageStack:[],
       createdAt:Date.now(),
       capturedScrollTop:(function(){
         for(var si=0;si<scrollOffsets.length;si++)if(scrollOffsets[si].top)return scrollOffsets[si].top;
@@ -5068,14 +5196,315 @@ function irCreateDetachedHoverSnapshot(pin){
       try{e.preventDefault();e.stopImmediatePropagation();}catch(_){ }
       irRemoveDetachedHover(state,'close-button');
     });
+    back.addEventListener('click',function(e){
+      try{e.preventDefault();e.stopImmediatePropagation();}catch(_){ }
+      irDetachedHoverBack(state);
+    });
     var list=window.__irDetachedHovers||[];
     list.push(state);
     window.__irDetachedHovers=list;
+    if(previewTarget){
+      irWrapDetachedPreviewLinks(previewTarget,state);
+      irEnsureDetachedPreviewLinkScroll(state);
+    }
+    irNotifyDetachedHover(state,'register',{id:state.id});
     while(list.length>IR_DETACHED_HOVER_MAX)irRemoveDetachedHover(list[0],'window-cap');
     irHERecord('hover-detached-created',{id:seq,left:state.left,top:state.top,width:state.width,height:state.height,count:list.length});
     return state;
   }catch(_){return null}
 }
+function irDetachedHoverStateForSessionKey(sessionKey){
+  try{
+    var list=window.__irDetachedHovers||[];
+    for(var i=0;i<list.length;i++)if(list[i]&&String(list[i].sessionKey)===String(sessionKey))return list[i];
+  }catch(_){ }
+  return null;
+}
+function irDetachedPreviewTarget(state){
+  try{
+    if(!state||!state.root)return null;
+    var target=state.previewTarget;
+    if(target&&state.root.contains(target))return target;
+    target=irStoredPreviewTarget(state.root)
+      ||state.root.querySelector('.rendered-markdown.ir-primary-preview-target')
+      ||state.root.querySelector('.rendered-markdown.ir-applied')
+      ||state.root.querySelector('.rendered-markdown');
+    if(target){
+      state.previewTarget=target;
+      irSetPreviewTarget(state.root,target);
+    }
+    return target;
+  }catch(_){return null}
+}
+function irDetachedPageScrollSnapshot(state){
+  try{
+    var sc=state&&state.root?irPrimaryHoverScroller(state.root):null;
+    return {top:sc?Number(sc.scrollTop)||0:0,left:sc?Number(sc.scrollLeft)||0:0};
+  }catch(_){return {top:0,left:0}}
+}
+function irRestoreDetachedPageScroll(state,scroll){
+  try{
+    var sc=state&&state.root?irPrimaryHoverScroller(state.root):null;
+    if(!sc)return;
+    void sc.scrollHeight;
+    sc.scrollTop=Math.max(0,Number(scroll&&scroll.top)||0);
+    sc.scrollLeft=Math.max(0,Number(scroll&&scroll.left)||0);
+  }catch(_){ }
+}
+function irUpdateDetachedHoverChrome(state){
+  try{
+    if(!state)return;
+    var label=state.previewBusy&&state.pendingTypeName
+      ? 'Loading '+state.pendingTypeName+'…'
+      :(state.currentTypeName||'Pinned hover');
+    if(state.titleLabel)state.titleLabel.textContent=label;
+    if(state.backButton){
+      var visible=!!(state.pageStack&&state.pageStack.length);
+      var enabled=visible&&!state.previewBusy;
+      state.backButton.classList.toggle('ir-detached-hover-back-visible',visible);
+      state.backButton.disabled=!enabled;
+      state.backButton.setAttribute('aria-disabled',enabled?'false':'true');
+    }
+  }catch(_){ }
+}
+function irWrapDetachedPreviewLinks(block,state){
+  try{
+    if(!block||!state||!state.el||!document.body.contains(block))return 0;
+    var text=String(block.textContent||'');
+    if(text.length<3)return 0;
+    var defer=text.length>IR_HOVER_EAGER_WRAP_MAX_TEXT;
+    var types=null,linkRe=null;
+    if(block.__irDetachedLinkText===text&&block.__irDetachedLinkTypes){
+      types=block.__irDetachedLinkTypes;
+      linkRe=block.__irDetachedLinkRegex||null;
+    }else{
+      types=irCollectHoverLinkNames(text,IR_HOVER_LINK_SKIP,defer);
+      linkRe=irBuildHoverLinkRegex(types);
+      block.__irDetachedLinkText=text;
+      block.__irDetachedLinkTypes=types;
+      block.__irDetachedLinkRegex=linkRe;
+      irSetHoverLinkCandidates(block,types);
+    }
+    if(!linkRe)return 0;
+    // Large pages are linked on demand at the actual pointer position.  A
+    // scroll listener that TreeWalks every text node and measures every span
+    // recreates the multi-hundred-ms scroll storm this patch otherwise avoids.
+    if(defer)return 0;
+    var walker=document.createTreeWalker(block,NodeFilter.SHOW_TEXT);
+    var node,nodes=[];
+    while(node=walker.nextNode())nodes.push(node);
+    var wrapped=0,wc=/[A-Za-z0-9_]/;
+    for(var ni=0;ni<nodes.length&&wrapped<500;ni++){
+      node=nodes[ni];
+      if(!node||!node.parentNode)continue;
+      var parentEl=node.parentElement;
+      if(parentEl&&parentEl.closest&&parentEl.closest('a,button,.ir-type-link'))continue;
+      var value=String(node.nodeValue||'');
+      var matches=[],match;
+      linkRe.lastIndex=0;
+      while((match=linkRe.exec(value))!==null){
+        var name=match[0],idx=match.index;
+        if(!name){linkRe.lastIndex++;continue;}
+        var before=idx>0?value.charAt(idx-1):'';
+        var after=value.charAt(idx+name.length)||'';
+        if(!before&&node.previousSibling){var prevText=String(node.previousSibling.textContent||'');before=prevText.charAt(prevText.length-1)||'';}
+        if(!after&&node.nextSibling)after=String(node.nextSibling.textContent||'').charAt(0)||'';
+        if((!wc.test(before)&&!wc.test(after))||before==='@')matches.push({type:name,idx:idx});
+      }
+      for(var mi=matches.length-1;mi>=0;mi--){
+        var rep=matches[mi];
+        try{
+          if(!node.parentNode||rep.idx>String(node.nodeValue||'').length)continue;
+          var selected=node.splitText(rep.idx);
+          selected.splitText(rep.type.length);
+          var holder=selected.parentNode;
+          if(!holder)continue;
+          var span=document.createElement('span');
+          span.className='ir-type-link';
+          span.setAttribute('data-type',rep.type);
+          holder.insertBefore(span,selected);
+          span.appendChild(selected);
+          wrapped++;
+        }catch(_){ }
+      }
+    }
+    return wrapped;
+  }catch(_){return 0}
+}
+function irEnsureDetachedPreviewLinkScroll(state){
+  try{
+    if(!state||!state.root)return;
+    if(state.linkScrollTarget&&state.linkScrollListener)state.linkScrollTarget.removeEventListener('scroll',state.linkScrollListener);
+    state.linkScrollTarget=null;
+    state.linkScrollListener=null;
+  }catch(_){ }
+}
+function irRenderDetachedPreviewPage(state,target,typeName,md){
+  if(!state||!target)return false;
+  try{
+    while(target.firstChild)target.removeChild(target.firstChild);
+    target.classList.add('ir-applied','ir-primary-preview-target');
+    irSetPreviewTarget(state.root,target);
+    state.previewTarget=target;
+    irBuildMdDom(irDecodeContent(String(md||'')),target);
+    irWrapDetachedPreviewLinks(target,state);
+    irEnsureDetachedPreviewLinkScroll(state);
+    state.currentTypeName=String(typeName||'');
+    state.currentPage={kind:'md',typeName:String(typeName||''),md:String(md||'')};
+    irRestoreDetachedPageScroll(state,{top:0,left:0});
+    return true;
+  }catch(_){return false}
+}
+function irDetachedCurrentPageHistoryEntry(state,target){
+  var scroll=irDetachedPageScrollSnapshot(state);
+  var page=state.currentPage||{kind:'live',typeName:'',md:null};
+  if(page.kind==='md')return {kind:'md',typeName:String(page.typeName||''),md:String(page.md||''),scroll:scroll};
+  var fragment=document.createDocumentFragment();
+  while(target.firstChild)fragment.appendChild(target.firstChild);
+  return {kind:'fragment',typeName:String(page.typeName||''),fragment:fragment,scroll:scroll};
+}
+function irApplyDetachedPreview(sessionKey,requestId,typeName,md){
+  var state=irDetachedHoverStateForSessionKey(sessionKey);
+  if(!state||!state.el)return {ok:false,reason:'missing-session'};
+  requestId=Number(requestId)||0;
+  if(state.lastAppliedPreview&&Number(state.lastAppliedPreview.requestId)===requestId){
+    return {ok:true,id:state.id,typeName:String(state.lastAppliedPreview.typeName||''),depth:Number(state.lastAppliedPreview.depth)||0,idempotent:true};
+  }
+  if(requestId!==Number(state.previewRequestSeq))return {ok:false,reason:'stale-request',latest:Number(state.previewRequestSeq)||0};
+  if(state.previewRequestTimer){irClearTimer(state.previewRequestTimer);state.previewRequestTimer=null;}
+  var target=irDetachedPreviewTarget(state);
+  if(!target)return {ok:false,reason:'missing-target'};
+  var previous=null;
+  try{
+    previous=irDetachedCurrentPageHistoryEntry(state,target);
+    if(previous.kind!=='fragment')while(target.firstChild)target.removeChild(target.firstChild);
+    if(!irRenderDetachedPreviewPage(state,target,typeName,md))throw new Error('render-failed');
+    state.pageStack=state.pageStack||[];
+    state.pageStack.push(previous);
+    if(state.pageStack.length>20)state.pageStack.splice(0,state.pageStack.length-20);
+    state.previewAwaitingCommit=requestId;
+    state.lastAppliedPreview={requestId:requestId,typeName:String(typeName||''),depth:state.pageStack.length};
+    if(state.previewCommitTimer)irClearTimer(state.previewCommitTimer);
+    state.previewCommitTimer=irSetTimer(function(){
+      if(!state.el||Number(state.previewAwaitingCommit)!==requestId)return;
+      state.previewAwaitingCommit=0;
+      state.previewCommitTimer=null;
+      state.previewBusy=false;
+      state.pendingTypeName='';
+      irUpdateDetachedHoverChrome(state);
+    // Longer than the extension's one retry window (2 × 6s).  This is only a
+    // last-resort unlock if the commit acknowledgement channel disappears;
+    // normal requests are unlocked immediately by irCommitDetachedPreview.
+    },15000);
+    irUpdateDetachedHoverChrome(state);
+    irHERecord('hover-detached-preview-applied',{id:state.id,typeName:String(typeName||''),depth:state.pageStack.length,requestId:requestId});
+    return {ok:true,id:state.id,typeName:String(typeName||''),depth:state.pageStack.length};
+  }catch(error){
+    try{
+      while(target.firstChild)target.removeChild(target.firstChild);
+      if(previous&&previous.kind==='fragment'&&previous.fragment)target.appendChild(previous.fragment);
+      else if(previous&&previous.kind==='md')irRenderDetachedPreviewPage(state,target,previous.typeName,previous.md);
+      if(previous)irRestoreDetachedPageScroll(state,previous.scroll);
+    }catch(_){ }
+    state.previewBusy=false;
+    state.pendingTypeName='';
+    irUpdateDetachedHoverChrome(state);
+    return {ok:false,reason:String(error&&error.message||error)};
+  }
+}
+function irCommitDetachedPreview(sessionKey,requestId){
+  var state=irDetachedHoverStateForSessionKey(sessionKey);
+  if(!state||!state.el)return {ok:false,reason:'missing-session'};
+  requestId=Number(requestId)||0;
+  if(!state.lastAppliedPreview||Number(state.lastAppliedPreview.requestId)!==requestId)return {ok:false,reason:'not-applied'};
+  if(state.previewCommitTimer){irClearTimer(state.previewCommitTimer);state.previewCommitTimer=null;}
+  if(state.previewRequestTimer){irClearTimer(state.previewRequestTimer);state.previewRequestTimer=null;}
+  state.previewAwaitingCommit=0;
+  state.previewBusy=false;
+  state.pendingTypeName='';
+  irUpdateDetachedHoverChrome(state);
+  return {ok:true,id:state.id,requestId:requestId,depth:Number(state.lastAppliedPreview.depth)||0};
+}
+function irFailDetachedPreview(sessionKey,requestId,reason){
+  var state=irDetachedHoverStateForSessionKey(sessionKey);
+  if(!state||Number(requestId)!==Number(state.previewRequestSeq))return false;
+  if(state.previewCommitTimer){irClearTimer(state.previewCommitTimer);state.previewCommitTimer=null;}
+  if(state.previewRequestTimer){irClearTimer(state.previewRequestTimer);state.previewRequestTimer=null;}
+  state.previewAwaitingCommit=0;
+  state.previewBusy=false;
+  state.pendingTypeName='';
+  irUpdateDetachedHoverChrome(state);
+  irHERecord('hover-detached-preview-failed',{id:state.id,requestId:Number(requestId)||0,reason:String(reason||'failed')});
+  return true;
+}
+function irDetachedHoverBack(state){
+  try{
+    if(!state||!state.el||state.previewBusy||!state.pageStack||!state.pageStack.length)return false;
+    var target=irDetachedPreviewTarget(state);
+    if(!target)return false;
+    var nextRequestId=(Number(state.previewRequestSeq)||0)+1;
+    var nextPage=state.pageStack[state.pageStack.length-1];
+    if(!irNotifyDetachedHover(state,'back',{
+      requestId:nextRequestId,
+      currentIdentifier:String(nextPage&&nextPage.typeName||''),
+      pageDepth:Math.max(0,state.pageStack.length-1)
+    }))return false;
+    state.previewRequestSeq=nextRequestId;
+    state.previewBusy=false;
+    state.pendingTypeName='';
+    var previous=state.pageStack.pop();
+    while(target.firstChild)target.removeChild(target.firstChild);
+    if(previous.kind==='fragment'&&previous.fragment){
+      target.appendChild(previous.fragment);
+      state.currentTypeName=String(previous.typeName||'');
+      state.currentPage={kind:'live',typeName:String(previous.typeName||''),md:null};
+    }else{
+      irRenderDetachedPreviewPage(state,target,previous.typeName,previous.md);
+    }
+    irRestoreDetachedPageScroll(state,previous.scroll);
+    try{requestAnimationFrame(function(){if(state.el)irRestoreDetachedPageScroll(state,previous.scroll);});}catch(_){ }
+    irUpdateDetachedHoverChrome(state);
+    irHERecord('hover-detached-preview-back',{id:state.id,depth:state.pageStack.length,requestId:state.previewRequestSeq});
+    return true;
+  }catch(_){return false}
+}
+function irRunDetachedTypeLinkAction(state,link,e){
+  try{
+    if(!state||!link)return false;
+    var typeName=String(link.getAttribute&&link.getAttribute('data-type')||'');
+    if(!typeName||typeName.length<=2)return false;
+    if(e){try{e.preventDefault();e.stopImmediatePropagation();}catch(_){ }}
+    if(state.previewBusy)return true;
+    if(String(state.currentTypeName||'')===typeName)return true;
+    var requestId=(Number(state.previewRequestSeq)||0)+1;
+    state.previewRequestSeq=requestId;
+    if(e&&(e.metaKey||e.ctrlKey)){
+      state.previewBusy=false;
+      state.pendingTypeName='';
+      irUpdateDetachedHoverChrome(state);
+      irNotifyDetachedHover(state,'goto',{requestId:requestId,identifier:typeName,pageDepth:(state.pageStack||[]).length});
+      return true;
+    }
+    state.previewBusy=true;
+    state.pendingTypeName=typeName;
+    irUpdateDetachedHoverChrome(state);
+    if(state.previewRequestTimer)irClearTimer(state.previewRequestTimer);
+    state.previewRequestTimer=irSetTimer(function(){
+      if(!state.el||Number(state.previewRequestSeq)!==requestId||!state.previewBusy)return;
+      state.previewRequestTimer=null;
+      irFailDetachedPreview(state.sessionKey,requestId,'request-timeout');
+    },15000);
+    if(!irNotifyDetachedHover(state,'preview',{requestId:requestId,identifier:typeName,pageDepth:(state.pageStack||[]).length})){
+      irFailDetachedPreview(state.sessionKey,requestId,'binding-unavailable');
+      return false;
+    }
+    irHERecord('hover-detached-preview-requested',{id:state.id,typeName:typeName,requestId:requestId});
+    return true;
+  }catch(_){return false}
+}
+window.irApplyDetachedPreview=irApplyDetachedPreview;
+window.irCommitDetachedPreview=irCommitDetachedPreview;
+window.irFailDetachedPreview=irFailDetachedPreview;
 function irNativeHoverPinSourceIsVisible(pin){
   try{
     if(!pin||!pin.wrapper||!document.body||!document.body.contains(pin.wrapper))return false;
@@ -5161,7 +5590,7 @@ function irReleaseNativeHoverAfterDetach(pin){
 }
 function irHoverDragExcludedTarget(target){
   try{
-    return !!(target&&target.closest&&target.closest('a,button,input,textarea,select,option,[contenteditable="true"],.ir-type-link,.monaco-sash,[class*="sash"],.scrollbar,.slider,.scroll-decoration'));
+    return !!(target&&target.closest&&target.closest('a,button,input,textarea,select,option,[contenteditable="true"],.ir-type-link,.ir-detached-hover-resize-handle,.monaco-sash,[class*="sash"],.scrollbar,.slider,.scroll-decoration'));
   }catch(_){return false}
 }
 function irSetHoverDragPointerCapture(candidate,el){
@@ -5197,6 +5626,80 @@ function irCancelHoverDragCandidate(){
     if(active&&active.state&&active.state.el)active.state.el.classList.remove('ir-detached-hover-dragging');
   }catch(_){ }
 }
+function irArmDetachedHoverResize(state,e,target){
+  try{
+    var handle=target&&target.closest?target.closest('.ir-detached-hover-resize-handle'):null;
+    if(!state||!state.el||!handle||!state.el.contains(handle)||!e)return false;
+    if(typeof e.buttons==='number'&&(e.buttons&1)===0)return false;
+    irCancelHoverDragCandidate();
+    irCancelDetachedHoverResize(null);
+    var rect=state.el.getBoundingClientRect?state.el.getBoundingClientRect():null;
+    if(!rect)return false;
+    var active={
+      state:state,
+      edge:String(handle.getAttribute('data-ir-resize-edge')||'corner'),
+      startX:Number(e.clientX)||0,startY:Number(e.clientY)||0,
+      startWidth:rect.width,startHeight:rect.height,
+      pointerId:typeof e.pointerId==='number'?e.pointerId:null,captureEl:null
+    };
+    window.__irDetachedHoverResizeActive=active;
+    state.el.classList.add('ir-detached-hover-resizing');
+    irBringDetachedHoverToFront(state);
+    irSetHoverDragPointerCapture(active,handle);
+    irHERecord('hover-detached-resize-start',{id:state.id,edge:active.edge,width:Math.round(rect.width),height:Math.round(rect.height)});
+    return true;
+  }catch(_){return false}
+}
+function irDetachedHoverResizeEventMatches(active,e){
+  try{
+    if(!active||!e)return false;
+    return !(active.pointerId!==null&&typeof e.pointerId==='number'&&active.pointerId!==e.pointerId);
+  }catch(_){return false}
+}
+function irDetachedHoverResizeMove(e){
+  try{
+    if(window.PointerEvent&&e&&e.type==='mousemove')return;
+    var active=window.__irDetachedHoverResizeActive;
+    if(!active||!irDetachedHoverResizeEventMatches(active,e))return;
+    if(typeof e.buttons==='number'&&(e.buttons&1)===0){irDetachedHoverResizeEnd(e);return;}
+    var state=active.state;
+    if(!state||!state.el||!document.body.contains(state.el)){irCancelDetachedHoverResize(null);return;}
+    var viewportW=window.innerWidth||document.documentElement.clientWidth||1200;
+    var viewportH=window.innerHeight||document.documentElement.clientHeight||900;
+    var maxWidth=Math.max(1,viewportW-8-(Number(state.left)||0));
+    var maxHeight=Math.max(1,viewportH-8-(Number(state.top)||0));
+    var minWidth=Math.min(IR_DETACHED_HOVER_MIN_WIDTH,maxWidth);
+    var minHeight=Math.min(IR_DETACHED_HOVER_MIN_HEIGHT,maxHeight);
+    var dx=(Number(e.clientX)||0)-active.startX;
+    var dy=(Number(e.clientY)||0)-active.startY;
+    var width=active.startWidth;
+    var height=active.startHeight;
+    if(active.edge==='right'||active.edge==='corner')width=Math.max(minWidth,Math.min(maxWidth,active.startWidth+dx));
+    if(active.edge==='bottom'||active.edge==='corner')height=Math.max(minHeight,Math.min(maxHeight,active.startHeight+dy));
+    irSetDetachedHoverSize(state,width,height);
+    state.naturalWidth=state.width;
+    state.naturalHeight=state.height;
+    var renders=state.vtailRenders||[];
+    for(var ri=0;ri<renders.length;ri++)try{renders[ri]();}catch(_){ }
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }catch(_){ }
+}
+function irDetachedHoverResizeEnd(e){
+  try{
+    if(window.PointerEvent&&e&&e.type==='mouseup')return;
+    var active=window.__irDetachedHoverResizeActive;
+    if(!active)return;
+    if(e&&!irDetachedHoverResizeEventMatches(active,e))return;
+    var state=active.state;
+    irCancelDetachedHoverResize(null);
+    if(state&&state.el){
+      irHERecord('hover-detached-resize-end',{id:state.id,width:state.width,height:state.height});
+      var target=irDetachedPreviewTarget(state);
+      if(target)irWrapDetachedPreviewLinks(target,state);
+    }
+  }catch(_){ }
+}
 function irArmPinnedHoverDrag(pin,e,target){
   try{
     if(!pin||!e||irHoverDragExcludedTarget(target))return false;
@@ -5216,7 +5719,9 @@ function irArmPinnedHoverDrag(pin,e,target){
 }
 function irArmDetachedHoverDrag(state,e,target){
   try{
-    if(!state||!state.el||!e||irHoverDragExcludedTarget(target))return false;
+    var titlebar=target&&target.closest?target.closest('.ir-detached-hover-titlebar'):null;
+    if(!state||!state.el||!e||!titlebar||!state.el.contains(titlebar)||irHoverDragExcludedTarget(target))return false;
+    if(window.__irDetachedHoverResizeActive)return false;
     if(typeof e.buttons==='number'&&(e.buttons&1)===0)return false;
     var rect=state.el.getBoundingClientRect?state.el.getBoundingClientRect():null;
     if(!rect)return false;
@@ -5257,6 +5762,8 @@ function irHoverDragMove(e){
         state=irCreateDetachedHoverSnapshot(candidate.pin);
         if(!state){irCancelHoverDragCandidate();return;}
         candidate.state=state;
+        candidate.originLeft=state.left;
+        candidate.originTop=state.top;
         irClearPendingTypeLinkPointerDown(null,'hover-drag-detach');
         irReleaseNativeHoverAfterDetach(candidate.pin);
       }
@@ -5341,7 +5848,8 @@ function irHoverDragSnapshot(){
     return {
       candidate:!!window.__irHoverDragCandidate,
       active:!!window.__irHoverDragActive,
-      clickSuppressed:!!(suppress&&Date.now()<=suppress.until)
+      clickSuppressed:!!(suppress&&Date.now()<=suppress.until),
+      resizing:!!window.__irDetachedHoverResizeActive
     };
   }catch(_){return {candidate:false,active:false,clickSuppressed:false,error:true}}
 }
@@ -5506,6 +6014,13 @@ function irClickPinPointerDown(e){
         e.stopImmediatePropagation();
         return;
       }
+      if(target&&target.closest&&target.closest('.ir-detached-hover-resize-handle')){
+        if(irArmDetachedHoverResize(detached,e,target)){
+          e.preventDefault();
+          e.stopImmediatePropagation();
+        }
+        return;
+      }
       irArmDetachedHoverDrag(detached,e,target);
       return;
     }
@@ -5562,8 +6077,13 @@ function irClickPinnedHoverSnapshot(){
 }
 track(window,'pointerdown',irClickPinPointerDown,true);
 track(window,'mousedown',irClickPinPointerDown,true);
+track(window,'pointermove',irDetachedHoverResizeMove,true);
+track(window,'mousemove',irDetachedHoverResizeMove,true);
 track(window,'pointermove',irHoverDragMove,true);
 track(window,'mousemove',irHoverDragMove,true);
+track(window,'pointerup',irDetachedHoverResizeEnd,true);
+track(window,'mouseup',irDetachedHoverResizeEnd,true);
+track(window,'pointercancel',irDetachedHoverResizeEnd,true);
 track(window,'pointerup',irHoverDragEnd,true);
 track(window,'mouseup',irHoverDragEnd,true);
 track(window,'pointercancel',irHoverDragEnd,true);
@@ -5571,6 +6091,7 @@ track(window,'pointercancel',irHoverDragEnd,true);
 // hover root. Detach deliberately blurs that root, so listen in the normal
 // phase and react only when the window itself loses focus.
 track(window,'blur',irHoverDragEnd,false);
+track(window,'blur',irDetachedHoverResizeEnd,false);
 track(window,'click',irSuppressHoverDragClick,true);
 track(window,'resize',irClampAllDetachedHovers,true);
 track(window,'mouseleave',irClickPinnedHoverLeaveGuard,true);
@@ -5580,9 +6101,17 @@ track(window,'pointerleave',irClickPinnedHoverLeaveGuard,true);
 // logic can't fire before our click handler — some hover widgets
 // dismiss on mousedown outside the editor.
 function irTypeLinkPointerDown(e){
-  // Detached hovers are immutable painted snapshots. Their cloned links must
-  // not schedule a drill action or reconnect the released native history.
-  if(irIsDetachedHoverElement(e&&e.target))return;
+  // Detached windows use their own request lane. Stop Monaco's selection /
+  // focus gesture only for an actual detached type link; ordinary body text
+  // remains untouched so native range selection and copy work normally.
+  if(irIsDetachedHoverElement(e&&e.target)){
+    var detachedState=irDetachedHoverStateFromElement(e&&e.target);
+    var detachedLink=irClosestTypeLink(e&&e.target)||irWrapDetachedWordAtPoint(e,detachedState);
+    if(detachedLink){
+      try{e.preventDefault();e.stopImmediatePropagation();}catch(_){ }
+    }
+    return;
+  }
   // L94 (2026-05-31): native mode — a pointerdown on VS Code's native resize sash must NOT be
   // treated as an outside-click. The no-link branch below calls irDisposeActiveHoverForEditorTarget,
   // so grabbing the resize handle instantly dismissed the hover. Bow out so native resize runs.
@@ -9233,7 +9762,7 @@ function irLogPointWrapReject(e,reason,extra){
     irLog('renderer: point-wrap reject reason='+reason+' event='+(e&&e.type||'')+' target='+irElementBrief(irEventElement(e&&e.target))+' hoverRect='+irRectBrief(hover)+(extra?' '+extra:'')+irPointWordSummary(e,hover));
   }catch(_){}
 }
-function irWrapTextNodeWord(node,info){
+function irWrapTextNodeWord(node,info,trackGlobal){
   if(!node||!node.parentNode||!info||info.start<0||info.end<=info.start||info.end>(node.nodeValue||'').length)return null;
   var after=node.splitText(info.start);
   var rest=after.splitText(info.end-info.start);
@@ -9244,7 +9773,7 @@ function irWrapTextNodeWord(node,info){
   span.setAttribute('data-type',info.word);
   parent.insertBefore(span,after);
   span.appendChild(after);
-  try{
+  if(trackGlobal!==false)try{
     var prev=window.__irPointActiveLink;
     if(prev&&prev!==span&&prev.classList)prev.classList.remove('ir-point-active');
     window.__irPointActiveLink=span;
@@ -9252,6 +9781,36 @@ function irWrapTextNodeWord(node,info){
     irRememberTypeLinkGeometry(span,'point-wrap',true);
   }catch(_){}
   return span;
+}
+function irWrapDetachedWordAtPoint(e,state){
+  try{
+    if(!e||!state||!state.root||!state.el)return null;
+    var direct=irClosestTypeLink(e.target);
+    if(direct&&state.el.contains(direct))return direct;
+    var range=irPointRange(e);
+    var node=range&&range.startContainer;
+    if(!node||node.nodeType!==3||!node.parentNode)return null;
+    var parentEl=node.parentNode.nodeType===1?node.parentNode:node.parentNode.parentElement;
+    var existing=parentEl&&parentEl.closest?parentEl.closest('.ir-type-link'):null;
+    if(existing&&state.el.contains(existing))return existing;
+    var block=parentEl&&parentEl.closest?parentEl.closest('.rendered-markdown'):null;
+    if(!block||!state.root.contains(block)||irTextNodeInAnchor(node,block))return null;
+    // Prepare the candidate set once for an initial clone or freshly rendered
+    // page.  For a large block this only scans its text; no DOM walk/layout.
+    if(!block.__irHoverLinkCandidates)irWrapDetachedPreviewLinks(block,state);
+    var info=irWordAtOffset(node.nodeValue||'',range.startOffset||0);
+    if(!info||IR_HOVER_LINK_SKIP[info.word]||info.word.length<=2)return null;
+    var candidateKnown=irBlockCandidateAllowsWord(block,info.word);
+    var hasCandidateSet=!!block.__irHoverLinkCandidates;
+    var lowerCallable=irPointAllowsLowerCallable(node,info);
+    var decoratorContext=irPointAllowsDecorator(node,info,block);
+    if(hasCandidateSet){
+      if(!candidateKnown&&!lowerCallable&&!decoratorContext&&!irTypeShapedName(info.word)&&!irConstantHoverLinkName(info.word))return null;
+    }else if(!irTypeShapedName(info.word)&&!irConstantHoverLinkName(info.word)&&!lowerCallable&&!decoratorContext){
+      return null;
+    }
+    return irWrapTextNodeWord(node,info,false);
+  }catch(_){return null}
 }
 function irWrapWordAtPoint(e){
   if(irIsDetachedHoverElement(e&&e.target))return null;
@@ -9824,8 +10383,9 @@ function irApplyHoverSizeTier(hoverEl,fallbackTextLength,resetScroll){
 
 function irTypeLinkClick(e){
   if(irIsDetachedHoverElement(e&&e.target)){
-    var detachedLink=irClosestTypeLink(e&&e.target);
-    if(detachedLink)try{e.preventDefault();e.stopImmediatePropagation();}catch(_){ }
+    var detachedState=irDetachedHoverStateFromElement(e&&e.target);
+    var detachedLink=irClosestTypeLink(e&&e.target)||irWrapDetachedWordAtPoint(e,detachedState);
+    if(detachedLink&&detachedState)irRunDetachedTypeLinkAction(detachedState,detachedLink,e);
     return;
   }
   var directLink=irClosestTypeLink(e.target);
@@ -9963,8 +10523,13 @@ window.__irTestHooks={
   pinNativeHoverRoot:irPinNativeHoverRoot,
   clearClickPinnedHover:irClearClickPinnedHover,
   clickPinnedHoverSnapshot:irClickPinnedHoverSnapshot,
+  createDetachedHoverSnapshot:irCreateDetachedHoverSnapshot,
   detachedHoverSnapshot:irDetachedHoverSnapshot,
   hoverDragSnapshot:irHoverDragSnapshot,
+  applyDetachedPreview:irApplyDetachedPreview,
+  commitDetachedPreview:irCommitDetachedPreview,
+  failDetachedPreview:irFailDetachedPreview,
+  detachedHoverBack:irDetachedHoverBack,
   clearDetachedHovers:irClearDetachedHovers,
   removeDetachedHover:irRemoveDetachedHover,
   hoverBoxCornerSnapshot:irHoverBoxCornerSnapshot,
@@ -9981,23 +10546,36 @@ window.__irTestHooks={
 // We never set innerHTML or use DOMParser.parseFromString — both are
 // blocked by VS Code's CSP. Build everything via createElement and
 // createTextNode. Handles fenced code, inline \`code\`, paragraphs,
-// headings, hr, line breaks. Other markdown is rendered as plain text.
+// headings, hr, line breaks, and safe http(s)/mailto links. Other markdown is
+// rendered as plain text.
+function irAppendInlineText(text,parent){
+  var re=/\\[([^\\]\\n]+)\\]\\(((?:https?:\\/\\/|mailto:)[^)\\s]+)\\)/gi;
+  var last=0,m;
+  function plain(value){
+    if(!value)return;
+    var parts=value.split('\\n');
+    for(var i=0;i<parts.length;i++){
+      if(parts[i])parent.appendChild(document.createTextNode(parts[i]));
+      if(i<parts.length-1)parent.appendChild(document.createElement('br'));
+    }
+  }
+  while((m=re.exec(text))!==null){
+    if(m.index>last)plain(text.substring(last,m.index));
+    var a=document.createElement('a');
+    a.textContent=m[1];a.href=m[2];a.setAttribute('data-ir-detached-safe-link','1');
+    if(/^https?:/i.test(m[2])){a.target='_blank';a.rel='noopener noreferrer';}
+    parent.appendChild(a);last=m.index+m[0].length;
+  }
+  if(last<text.length)plain(text.substring(last));
+}
 function irBuildInline(text, parent){
   var re=/\\\`([^\\\`]+)\\\`/g; var last=0; var m;
   while((m=re.exec(text))!==null){
-    if(m.index>last) parent.appendChild(document.createTextNode(text.substring(last,m.index)));
+    if(m.index>last) irAppendInlineText(text.substring(last,m.index),parent);
     var c=document.createElement('code'); c.textContent=m[1]; parent.appendChild(c);
     last=m.index+m[0].length;
   }
-  if(last<text.length){
-    var rest=text.substring(last);
-    if(rest.indexOf('\\n')<0){ parent.appendChild(document.createTextNode(rest)); return; }
-    var parts=rest.split('\\n');
-    for(var i=0;i<parts.length;i++){
-      if(parts[i]) parent.appendChild(document.createTextNode(parts[i]));
-      if(i<parts.length-1) parent.appendChild(document.createElement('br'));
-    }
-  }
+  if(last<text.length)irAppendInlineText(text.substring(last),parent);
 }
 function irBuildParagraphs(text,parent){
   var paras=text.split(/\\n\\s*\\n/);

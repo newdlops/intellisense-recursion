@@ -220,13 +220,23 @@ export function buildDefinitionPreviewResult(
   defDoc: vscode.TextDocument,
   startLine: number,
   hintedEndLine?: number,
+  rememberLocations = true,
 ): NonNullable<DefCacheEntry['result']> {
   const resolvedStartLine = refineDefinitionLineForIdentifier(defDoc, typeName, startLine);
   const previewBlock = collectDefinitionPreview(defDoc, resolvedStartLine, hintedEndLine);
   const relPath = vscode.workspace.asRelativePath(defUri);
   const lang = defDoc.languageId || 'python';
   const preview = `\`${typeName}\` — *${relPath}:${previewBlock.definitionLine + 1}*\n${renderPreviewCodeFences(lang, previewBlock.code)}`;
-  const location = rememberPreviewLocations(typeName, defUri, previewBlock);
+  // Detached hover windows keep their own navigation lane.  Building one of
+  // those pages must not repoint the singleton location LRUs used by the
+  // native hover.  Callers can therefore request the same preview payload
+  // without the global indexing side effect.
+  const location = rememberLocations
+    ? rememberPreviewLocations(typeName, defUri, previewBlock)
+    : new vscode.Location(
+      defUri,
+      new vscode.Range(previewBlock.definitionLine, 0, previewBlock.endLine, 0),
+    );
   return {
     preview,
     location,

@@ -853,6 +853,7 @@ function clearAllExtensionCaches() {
   clearClickNegCache();
   clearPrefetchState();
   clearPreviewLocations();
+  detachedPreviewSessions.clear();
 }
 
 /**
@@ -1147,6 +1148,10 @@ export async function activate(context: vscode.ExtensionContext) {
       vscode.commands.registerCommand(
         'intellisenseRecursion.runHoverRendererHarnessForTests',
         runHoverRendererHarnessForTests,
+      ),
+      vscode.commands.registerCommand(
+        'intellisenseRecursion.runDetachedPreviewProtocolHarnessForTests',
+        runDetachedPreviewProtocolHarnessForTests,
       ),
       vscode.commands.registerCommand(
         'intellisenseRecursion.runHoverSplitColumnHarnessForTests',
@@ -2654,6 +2659,212 @@ async function reinjectRenderer() {
   } catch {}
 }
 
+interface DetachedPreviewSession {
+  key: string;
+  ws: any | null;
+  docUri: string;
+  anchor: { uri: vscode.Uri; line: number; character: number };
+  current: PreviewState | null;
+  history: Array<PreviewState | null>;
+  latestRequest: number;
+  lastUsed: number;
+}
+
+interface DetachedPreviewRequestContext {
+  session: DetachedPreviewSession;
+  requestId: number;
+  ws: any;
+}
+
+const detachedPreviewSessions = new Map<string, DetachedPreviewSession>();
+const DETACHED_PREVIEW_SESSION_TTL_MS = 30 * 60 * 1000;
+const DETACHED_PREVIEW_SESSION_MAX = 36;
+
+function copyPreviewStateForDetached(state: PreviewState | null): PreviewState | null {
+  if (!state) { return null; }
+  return {
+    ...state,
+    anchor: { uri: state.anchor.uri, line: state.anchor.line, character: state.anchor.character },
+  };
+}
+
+function pruneDetachedPreviewSessions(now = Date.now()): void {
+  for (const [key, session] of detachedPreviewSessions) {
+    if (now - session.lastUsed > DETACHED_PREVIEW_SESSION_TTL_MS) {
+      detachedPreviewSessions.delete(key);
+    }
+  }
+  while (detachedPreviewSessions.size > DETACHED_PREVIEW_SESSION_MAX) {
+    const oldest = Array.from(detachedPreviewSessions.entries())
+      .sort((a, b) => a[1].lastUsed - b[1].lastUsed)[0];
+    if (!oldest) { break; }
+    detachedPreviewSessions.delete(oldest[0]);
+  }
+}
+
+function registerDetachedPreviewSession(key: string, ws: any): DetachedPreviewSession | null {
+  const existing = detachedPreviewSessions.get(key);
+  if (existing) {
+    existing.ws = ws;
+    existing.lastUsed = Date.now();
+    return existing;
+  }
+  const editor = vscode.window.activeTextEditor;
+  const rawAnchor = lastHoverFetchPosition;
+  const anchor = rawAnchor
+    ? { uri: rawAnchor.uri, line: rawAnchor.line, character: rawAnchor.character }
+    : editor
+      ? { uri: editor.document.uri, line: editor.selection.active.line, character: editor.selection.active.character }
+      : null;
+  if (!anchor) { return null; }
+  const now = Date.now();
+  const current = currentPreviewState
+    && (!currentPreviewState.lastActivityAt
+      || now - currentPreviewState.lastActivityAt <= PREVIEW_STATE_IDLE_TTL_MS)
+    && previewStateMatchesHoverRequest(
+      currentPreviewState,
+      hoverRequestUriKey(anchor.uri),
+      anchor.line,
+      anchor.character,
+    )
+      ? copyPreviewStateForDetached(currentPreviewState)
+      : null;
+  const session: DetachedPreviewSession = {
+    key,
+    ws,
+    docUri: rawAnchor?.uri.toString() || lastHoverDocUri || editor?.document.uri.toString() || anchor.uri.toString(),
+    anchor,
+    current,
+    history: [],
+    latestRequest: 0,
+    lastUsed: now,
+  };
+  detachedPreviewSessions.set(key, session);
+  pruneDetachedPreviewSessions();
+  return session;
+}
+
+async function evaluateDetachedPreviewRendererCall(
+  ws: any,
+  method: 'irApplyDetachedPreview' | 'irCommitDetachedPreview' | 'irFailDetachedPreview',
+  args: unknown[],
+): Promise<any> {
+  if (!ws || ws.readyState !== WebSocket.OPEN) { return { ok: false, reason: 'renderer-disconnected' }; }
+  const rendererExpression = `(function(){try{var fn=window[${jsonStringifyAscii(method)}];if(typeof fn!=='function')return {ok:false,reason:'missing-${method}'};return fn.apply(window,${jsonStringifyAscii(args)});}catch(e){return {ok:false,reason:String(e&&e.message||e)}}})()`;
+  try {
+    if (!mainWsRefIsRendererTarget && !isTestRendererDebugMode()) {
+      const sessionKey = String(args[0] || '');
+      const rendererWindowId = Number(sessionKey.split(':', 1)[0]);
+      if (Number.isFinite(rendererWindowId) && rendererWindowId > 0) {
+        const mainExpression = `(async function(){try{var BW=require('electron').BrowserWindow;var w=BW.fromId(${Math.trunc(rendererWindowId)});if(!w||!w.webContents||w.webContents.isDestroyed())return {ok:false,reason:'renderer-window-missing'};return await w.webContents.executeJavaScript(${jsonStringifyAscii(rendererExpression)},true);}catch(e){return {ok:false,reason:String(e&&e.message||e)}}})()`;
+        return await evaluateInMainProcessForTests(mainExpression, 6000);
+      }
+      const rows = await evaluateInMainProcessForTests(rendererTestWindowEvalExpression(rendererExpression), 6000);
+      const values = (rows || []).map((row: any) => row?.value).filter(Boolean);
+      return values.find((value: any) => value?.ok) ?? values[0]
+        ?? { ok: false, reason: 'empty-renderer-result' };
+    }
+    const response = await cdpRequest(ws, 'Runtime.evaluate', {
+      expression: rendererExpression,
+      returnByValue: true,
+      includeCommandLineAPI: true,
+      awaitPromise: false,
+    }, 5000);
+    return response?.result?.value ?? response?.result ?? { ok: false, reason: 'empty-renderer-result' };
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  }
+}
+
+async function failDetachedPreviewRequest(context: DetachedPreviewRequestContext, reason: string): Promise<void> {
+  await evaluateDetachedPreviewRendererCall(context.ws, 'irFailDetachedPreview', [
+    context.session.key,
+    context.requestId,
+    reason,
+  ]);
+}
+
+function detachedPreviewRequestIsCurrent(context: DetachedPreviewRequestContext): boolean {
+  const session = detachedPreviewSessions.get(context.session.key);
+  return !!session
+    && session === context.session
+    && session.latestRequest === context.requestId;
+}
+
+async function handleDetachedPreviewBinding(raw: string, ws: any): Promise<void> {
+  let message: any;
+  try { message = JSON.parse(raw.substring('DETACHED:'.length)); }
+  catch { return; }
+  const key = typeof message?.sessionKey === 'string' ? message.sessionKey : '';
+  const op = typeof message?.op === 'string' ? message.op : '';
+  if (!key || !op) { return; }
+  pruneDetachedPreviewSessions();
+  if (op === 'register') {
+    registerDetachedPreviewSession(key, ws);
+    return;
+  }
+  if (op === 'dispose') {
+    detachedPreviewSessions.delete(key);
+    return;
+  }
+  const session = detachedPreviewSessions.get(key) ?? registerDetachedPreviewSession(key, ws);
+  if (!session) { return; }
+  session.lastUsed = Date.now();
+  session.ws = ws;
+  const requestId = Math.max(0, Number(message.requestId) || 0);
+  const rawPageDepth = Number(message.pageDepth);
+  const pageDepth = Number.isInteger(rawPageDepth) && rawPageDepth >= 0 && rawPageDepth <= 20
+    ? rawPageDepth
+    : null;
+  const syncRendererPageDepth = () => {
+    if (pageDepth === null) { return; }
+    // A renderer can perform a local Back just as its binding transport is
+    // reconnecting.  Every later request carries the visible DOM depth, so
+    // trim extension history to the renderer's authoritative stack before
+    // resolving another link.
+    while (session.history.length > pageDepth) {
+      session.current = session.history.pop() ?? null;
+    }
+  };
+  if (op === 'back') {
+    if (requestId <= session.latestRequest) { return; }
+    if (pageDepth === null) {
+      if (session.history.length) { session.current = session.history.pop() ?? null; }
+    } else {
+      syncRendererPageDepth();
+    }
+    session.latestRequest = requestId;
+    return;
+  }
+  const identifier = typeof message.identifier === 'string' ? message.identifier : '';
+  if (!identifier || identifier.length <= 2) {
+    if (op === 'preview' && requestId > session.latestRequest) {
+      session.latestRequest = requestId;
+      await failDetachedPreviewRequest({ session, requestId, ws }, 'invalid-identifier');
+    }
+    return;
+  }
+  if (op === 'goto') {
+    if (requestId <= session.latestRequest) { return; }
+    syncRendererPageDepth();
+    session.latestRequest = requestId;
+    await goToTypeHandler(session.docUri, identifier);
+    return;
+  }
+  if (op !== 'preview') { return; }
+  if (requestId <= session.latestRequest) { return; }
+  syncRendererPageDepth();
+  session.latestRequest = requestId;
+  const context: DetachedPreviewRequestContext = { session, requestId, ws };
+  try {
+    await previewTypeHandler(session.docUri, identifier, false, context);
+  } catch (error) {
+    const reason = error instanceof Error ? error.message : String(error);
+    log.warn(`detached preview: "${identifier}" error: ${reason}`);
+    await failDetachedPreviewRequest(context, reason);
+  }
+}
+
 function startClickListener(mainWs: any, isRendererTarget = false) {
   if (mainWsRef && mainWsRef !== mainWs) {
     closeMainWebSocket();
@@ -2678,6 +2889,10 @@ function startClickListener(mainWs: any, isRendererTarget = false) {
         }
         if (val.startsWith('SEND:')) {
           log.info(`[send] ${val.substring(5)}`);
+          return;
+        }
+        if (val.startsWith('DETACHED:')) {
+          void handleDetachedPreviewBinding(val, mainWs);
           return;
         }
         if (val === 'HIDE_HOVER' || val.startsWith('HIDE_HOVER:')) {
@@ -2735,6 +2950,12 @@ function startClickListener(mainWs: any, isRendererTarget = false) {
   mainWs.on('close', () => {
     log.warn('[listen] CDP WebSocket closed — click listener lost. Will attempt reconnect...');
     if (mainWsRef === mainWs) { mainWsRef = null; }
+    for (const session of detachedPreviewSessions.values()) {
+      // Detached DOM survives a debugger reconnect.  Keep its isolated
+      // current/history state until the normal TTL and simply rebind the
+      // transport when the next renderer message arrives.
+      if (session.ws === mainWs) { session.ws = null; }
+    }
     scheduleRendererReconnect();
   });
 
@@ -3909,6 +4130,264 @@ async function markRendererNativeHoverRefireGrace(durationMs = 1600): Promise<vo
   } catch {}
 }
 
+function detachedPreviewLocationCacheFingerprintForTests(): string {
+  const rows = (map: Map<string, vscode.Location>) => Array.from(map.entries()).map(([key, loc]) => [
+    key,
+    loc.uri.toString(),
+    loc.range.start.line,
+    loc.range.start.character,
+    loc.range.end.line,
+    loc.range.end.character,
+  ]);
+  return JSON.stringify({
+    locations: rows(lastPreviewLocations),
+    declarations: rows(lastPreviewDeclarationLocations),
+  });
+}
+
+function detachedNativeStateFingerprintForTests(): string {
+  return JSON.stringify({
+    current: currentPreviewState ? {
+      identifier: currentPreviewState.identifier,
+      markdown: currentPreviewState.markdown,
+      uri: currentPreviewState.anchor.uri.toString(),
+      line: currentPreviewState.anchor.line,
+      character: currentPreviewState.anchor.character,
+    } : null,
+    history: previewHistory.map(state => ({
+      identifier: state.identifier,
+      markdown: state.markdown,
+      uri: state.anchor.uri.toString(),
+      line: state.anchor.line,
+      character: state.anchor.character,
+    })),
+    pending: pendingPreviewHover ? {
+      identifier: pendingPreviewHover.identifier,
+      anchorUriKey: pendingPreviewHover.anchorUriKey,
+      anchorLine: pendingPreviewHover.anchorLine,
+      anchorCharacter: pendingPreviewHover.anchorCharacter,
+    } : null,
+  });
+}
+
+async function runDetachedPreviewProtocolHarnessForTests(identifier = 'BaseModel'): Promise<any> {
+  await ensureRendererPatchForHarness();
+  await cleanupRendererTestArtifactsAcrossWindowsForTests();
+  detachedPreviewSessions.clear();
+  const nativeBefore = detachedNativeStateFingerprintForTests();
+  const cacheBefore = detachedPreviewLocationCacheFingerprintForTests();
+  const createdKeys: string[] = [];
+
+  const rendererValue = async (rendererExpr: string, timeoutMs = 8000): Promise<any> => {
+    const rows = await evaluateInMainProcessForTests(
+      rendererTestWindowEvalExpression(rendererExpr, true),
+      timeoutMs,
+    );
+    return (Array.isArray(rows) ? rows : [{ value: rows }])
+      .map((row: any) => row?.value)
+      .find((value: any) => value && value.__irDetachedProtocolHarness)
+      ?? null;
+  };
+  const waitFor = async <T>(probe: () => T | Promise<T>, timeoutMs = 10000): Promise<T | null> => {
+    const deadline = Date.now() + timeoutMs;
+    while (Date.now() < deadline) {
+      const value = await probe();
+      if (value) { return value; }
+      await new Promise(resolve => setTimeout(resolve, 60));
+    }
+    return null;
+  };
+  const statusExpr = (sessionKey: string) => `
+    (function(){
+      var state=(window.__irDetachedHovers||[]).find(function(row){return row&&String(row.sessionKey)===${jsonStringifyAscii(sessionKey)}});
+      if(!state||!state.el)return {__irDetachedProtocolHarness:true,exists:false,count:(window.__irDetachedHovers||[]).length};
+      var back=state.el.querySelector('.ir-detached-hover-back');
+      return {
+        __irDetachedProtocolHarness:true,
+        exists:true,
+        sessionKey:String(state.sessionKey),
+        text:String(state.root&&state.root.textContent||''),
+        busy:!!state.previewBusy,
+        requestId:Number(state.previewRequestSeq)||0,
+        depth:(state.pageStack||[]).length,
+        backVisible:!!(back&&back.classList.contains('ir-detached-hover-back-visible')),
+        count:(window.__irDetachedHovers||[]).length
+      };
+    })()
+  `.trim();
+
+  try {
+    if (!lastHoverFetchPosition) {
+      return { ok: false, reason: 'missing-hover-anchor' };
+    }
+    const setup = await rendererValue(`
+      (function(){
+        var hooks=window.__irTestHooks;
+        if(!hooks||typeof hooks.createDetachedHoverSnapshot!=='function')return {__irDetachedProtocolHarness:true,ok:false,reason:'missing-create-hook'};
+        try{hooks.clearDetachedHovers('detached-protocol-start');}catch(_){}
+        function make(label,left){
+          var wrapper=document.createElement('div');
+          wrapper.className='monaco-resizable-hover ir-e2e-detached-protocol-source';
+          wrapper.style.cssText='position:fixed;left:'+left+'px;top:90px;width:330px;height:190px;display:block;visibility:visible;z-index:2147483000;';
+          var root=document.createElement('div');
+          root.className='monaco-hover ir-scrollable';
+          root.style.cssText='display:flex;flex-direction:column;width:100%;height:100%;visibility:visible;';
+          var sc=document.createElement('div');
+          sc.className='monaco-scrollable-element';
+          sc.style.cssText='display:block;width:100%;height:100%;overflow:auto;';
+          var content=document.createElement('div');
+          content.className='monaco-hover-content';
+          var md=document.createElement('div');
+          md.className='rendered-markdown ir-primary-preview-target';
+          md.appendChild(document.createTextNode(label+' original sentinel '));
+          var link=document.createElement('span');
+          link.className='ir-type-link';
+          link.setAttribute('data-type',${jsonStringifyAscii(identifier)});
+          link.textContent=${jsonStringifyAscii(identifier)};
+          md.appendChild(link);
+          md.appendChild(document.createTextNode(' copyable body text'));
+          content.appendChild(md);sc.appendChild(content);root.appendChild(sc);wrapper.appendChild(root);document.body.appendChild(wrapper);
+          void wrapper.offsetWidth;
+          var state=hooks.createDetachedHoverSnapshot({wrapper:wrapper,root:root});
+          if(wrapper.parentNode)wrapper.parentNode.removeChild(wrapper);
+          return state?{sessionKey:String(state.sessionKey),id:Number(state.id),label:label}:null;
+        }
+        var first=make('DetachedProtocolFirst',64);
+        var second=make('DetachedProtocolSecond',Math.max(410,Math.min((window.innerWidth||1000)-350,520)));
+        return {__irDetachedProtocolHarness:true,ok:!!(first&&second),first:first,second:second,count:(window.__irDetachedHovers||[]).length};
+      })()
+    `.trim(), 8000);
+    if (!setup?.ok || !setup.first?.sessionKey || !setup.second?.sessionKey) {
+      return { ok: false, reason: 'renderer-setup-failed', setup };
+    }
+    createdKeys.push(setup.first.sessionKey, setup.second.sessionKey);
+    const registered = await waitFor(() => {
+      const first = detachedPreviewSessions.get(setup.first.sessionKey);
+      const second = detachedPreviewSessions.get(setup.second.sessionKey);
+      return first && second && first.ws === mainWsRef && second.ws === mainWsRef
+        ? { first: { latestRequest: first.latestRequest }, second: { latestRequest: second.latestRequest } }
+        : null;
+    }, 6000);
+    if (!registered) {
+      return { ok: false, reason: 'register-timeout', setup, keys: Array.from(detachedPreviewSessions.keys()) };
+    }
+    const originalCurrent = copyPreviewStateForDetached(detachedPreviewSessions.get(setup.first.sessionKey)?.current ?? null);
+
+    const click = await rendererValue(`
+      (function(){
+        var state=(window.__irDetachedHovers||[]).find(function(row){return row&&String(row.sessionKey)===${jsonStringifyAscii(setup.first.sessionKey)}});
+        var link=state&&state.el&&state.el.querySelector('.ir-type-link[data-type=${JSON.stringify(identifier)}]');
+        if(link)link.click();
+        return {__irDetachedProtocolHarness:true,ok:!!link,requestId:state?Number(state.previewRequestSeq)||0:0};
+      })()
+    `.trim());
+    if (!click?.ok) { return { ok: false, reason: 'link-click-failed', setup, click }; }
+
+    const appliedSession = await waitFor(() => {
+      const first = detachedPreviewSessions.get(setup.first.sessionKey);
+      return first?.current?.identifier === identifier && first.history.length === 1
+        ? first
+        : null;
+    }, 15000);
+    const appliedRenderer = appliedSession
+      ? await waitFor(async () => {
+        const status = await rendererValue(statusExpr(setup.first.sessionKey), 4000);
+        return status?.exists && !status.busy && status.depth === 1
+          && String(status.text || '').includes(`class ${identifier}`)
+          ? status
+          : null;
+      }, 10000)
+      : null;
+    const secondAfterApply = await rendererValue(statusExpr(setup.second.sessionKey), 4000);
+    if (!appliedSession || !appliedRenderer) {
+      return {
+        ok: false,
+        reason: 'preview-apply-timeout',
+        setup,
+        click,
+        session: appliedSession ? { latestRequest: appliedSession.latestRequest, current: appliedSession.current?.identifier, history: appliedSession.history.length } : null,
+        renderer: await rendererValue(statusExpr(setup.first.sessionKey), 4000),
+      };
+    }
+    const afterApply = {
+      latestRequest: appliedSession.latestRequest,
+      current: appliedSession.current?.identifier,
+      history: appliedSession.history.length,
+      renderer: appliedRenderer,
+      second: secondAfterApply,
+    };
+
+    const backClick = await rendererValue(`
+      (function(){
+        var state=(window.__irDetachedHovers||[]).find(function(row){return row&&String(row.sessionKey)===${jsonStringifyAscii(setup.first.sessionKey)}});
+        var back=state&&state.el&&state.el.querySelector('.ir-detached-hover-back');
+        if(back)back.click();
+        return {__irDetachedProtocolHarness:true,ok:!!back,requestId:state?Number(state.previewRequestSeq)||0:0};
+      })()
+    `.trim());
+    const backSession = await waitFor(() => {
+      const first = detachedPreviewSessions.get(setup.first.sessionKey);
+      return first && first.latestRequest === backClick?.requestId && first.history.length === 0
+        ? first
+        : null;
+    }, 6000);
+    const backRenderer = await waitFor(async () => {
+      const status = await rendererValue(statusExpr(setup.first.sessionKey), 4000);
+      return status?.exists && status.depth === 0 && String(status.text || '').includes('DetachedProtocolFirst original sentinel')
+        ? status
+        : null;
+    }, 6000);
+
+    const closeFirst = await rendererValue(`
+      (function(){
+        var state=(window.__irDetachedHovers||[]).find(function(row){return row&&String(row.sessionKey)===${jsonStringifyAscii(setup.first.sessionKey)}});
+        var close=state&&state.el&&state.el.querySelector('.ir-detached-hover-close');if(close)close.click();
+        return {__irDetachedProtocolHarness:true,ok:!!close,count:(window.__irDetachedHovers||[]).length};
+      })()
+    `.trim());
+    const firstDisposed = !!await waitFor(() => !detachedPreviewSessions.has(setup.first.sessionKey), 5000);
+    const secondAfterFirstDispose = await rendererValue(statusExpr(setup.second.sessionKey), 4000);
+    const closeSecond = await rendererValue(`
+      (function(){
+        var state=(window.__irDetachedHovers||[]).find(function(row){return row&&String(row.sessionKey)===${jsonStringifyAscii(setup.second.sessionKey)}});
+        var close=state&&state.el&&state.el.querySelector('.ir-detached-hover-close');if(close)close.click();
+        return {__irDetachedProtocolHarness:true,ok:!!close,count:(window.__irDetachedHovers||[]).length};
+      })()
+    `.trim());
+    const secondDisposed = !!await waitFor(() => !detachedPreviewSessions.has(setup.second.sessionKey), 5000);
+    const nativeAfter = detachedNativeStateFingerprintForTests();
+    const cacheAfter = detachedPreviewLocationCacheFingerprintForTests();
+    return {
+      ok: true,
+      setup,
+      registered,
+      afterApply,
+      back: {
+        click: backClick,
+        session: backSession ? { latestRequest: backSession.latestRequest, current: backSession.current?.identifier ?? null, history: backSession.history.length } : null,
+        renderer: backRenderer,
+        restoredOriginalCurrent: JSON.stringify(copyPreviewStateForDetached(backSession?.current ?? null)) === JSON.stringify(originalCurrent),
+      },
+      dispose: {
+        closeFirst,
+        firstDisposed,
+        secondAfterFirstDispose,
+        closeSecond,
+        secondDisposed,
+      },
+      nativeGlobalsUnchanged: nativeBefore === nativeAfter,
+      sharedLocationCachesUnchanged: cacheBefore === cacheAfter,
+    };
+  } catch (error) {
+    return { ok: false, reason: error instanceof Error ? error.message : String(error) };
+  } finally {
+    try {
+      await rendererValue(`(function(){try{if(window.__irTestHooks)window.__irTestHooks.clearDetachedHovers('detached-protocol-finally');}catch(_){}return {__irDetachedProtocolHarness:true,ok:true};})()`, 4000);
+    } catch {}
+    for (const key of createdKeys) { detachedPreviewSessions.delete(key); }
+  }
+}
+
 async function runHoverRendererHarnessForTests(): Promise<any[]> {
   await ensureRendererPatchForHarness();
   await cleanupRendererTestArtifactsAcrossWindowsForTests();
@@ -4266,7 +4745,9 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
             candidate: !!window.__irHoverDragCandidate,
             active: !!window.__irHoverDragActive,
             clickSuppress: !!window.__irHoverDragClickSuppress,
-            draggingCount: document.querySelectorAll('.ir-detached-hover-dragging').length
+            draggingCount: document.querySelectorAll('.ir-detached-hover-dragging').length,
+            resizeActive: !!window.__irDetachedHoverResizeActive,
+            resizingCount: document.querySelectorAll('.ir-detached-hover-resizing').length
           };
         }
         function makeController(wrapper, directHide) {
@@ -4282,6 +4763,24 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
           }
           wrapper.__irHoverPinController = controller;
           return controller;
+        }
+        function paintPinnedSourceContent(content, label) {
+          while (content.firstChild) content.removeChild(content.firstChild);
+          var markdown = document.createElement('div');
+          markdown.className = 'rendered-markdown ir-primary-preview-target';
+          markdown.appendChild(document.createTextNode(label + ' field: '));
+          var link = document.createElement('span');
+          link.className = 'ir-type-link';
+          link.setAttribute('data-type', label === 'DragFirstModel' ? 'DetachedTargetModel' : 'DetachedSecondTargetModel');
+          link.textContent = link.getAttribute('data-type');
+          markdown.appendChild(link);
+          var external = document.createElement('a');
+          external.setAttribute('data-href', 'https://example.com/cloned-detached-docs');
+          external.textContent = ' External docs';
+          markdown.appendChild(external);
+          markdown.appendChild(document.createTextNode('\\n' + new Array(32).fill(label + ' detail row').join(String.fromCharCode(10))));
+          content.appendChild(markdown);
+          return link;
         }
         function makePinnedSource(label, left, top, directHide) {
           var wrapper = document.createElement('div');
@@ -4301,7 +4800,7 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
           content.style.cssText = 'padding:8px;';
           content.style.setProperty('height', '620px', 'important');
           content.style.setProperty('min-height', '620px', 'important');
-          content.textContent = label + ' field: str\\n' + new Array(32).fill(label + ' detail row').join(String.fromCharCode(10));
+          var link = paintPinnedSourceContent(content, label);
           scroller.appendChild(content);
           hover.appendChild(scroller);
           wrapper.appendChild(hover);
@@ -4309,13 +4808,13 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
           document.body.appendChild(wrapper);
           void scroller.scrollHeight;
           scroller.scrollTop = 37;
-          return { wrapper: wrapper, hover: hover, scroller: scroller, content: content, controller: controller };
+          return { wrapper: wrapper, hover: hover, scroller: scroller, content: content, link: link, controller: controller };
         }
         function repaintPinnedSource(source, label, left, top, directHide) {
           source.wrapper.style.setProperty('left', left + 'px');
           source.wrapper.style.setProperty('top', top + 'px');
           source.wrapper.style.setProperty('display', 'block', 'important');
-          source.content.textContent = label + ' field: str\\n' + new Array(32).fill(label + ' detail row').join(String.fromCharCode(10));
+          source.link = paintPinnedSourceContent(source.content, label);
           source.controller = makeController(source.wrapper, directHide);
           void source.scroller.scrollHeight;
           source.scroller.scrollTop = 29;
@@ -4343,6 +4842,8 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
         var upType = window.PointerEvent ? 'pointerup' : 'mouseup';
         var sources = [];
         var hidePayloads = [];
+        var detachedPayloads = [];
+        var legacyPayloads = [];
         var fallbackSource = null;
         var originalGoToType = window.irGoToType;
         var result = { ok: false };
@@ -4352,7 +4853,9 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
             if (value.indexOf('HIDE_HOVER:') === 0) {
               hidePayloads.push(value);
               if (fallbackSource && fallbackSource.wrapper) fallbackSource.wrapper.style.setProperty('display', 'none', 'important');
-            }
+            } else if (value.indexOf('DETACHED:') === 0) {
+              try { detachedPayloads.push(JSON.parse(value.slice('DETACHED:'.length))); } catch (_) {}
+            } else legacyPayloads.push(value);
           };
           var first = makePinnedSource('DragFirstModel', 60, 70, true);
           sources.push(first);
@@ -4410,11 +4913,175 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
           var firstEl = firstWindow && document.querySelector('.ir-detached-hover[data-ir-detached-hover-id="' + firstWindow.id + '"]');
           var duringLostButtonsDrag = null;
           var afterLostButtonsMove = null;
+          var selectionProbe = null;
+          var linkProbe = null;
+          var resizeProbe = null;
           if (firstEl) {
-            var movableTarget = firstEl.querySelector('.monaco-hover') || firstEl;
-            var moveRect = firstEl.getBoundingClientRect();
-            var moveX = moveRect.left + 30;
-            var moveY = moveRect.top + 42;
+            var contentTarget = firstEl.querySelector('.monaco-hover-content') || firstEl.querySelector('.monaco-hover');
+            if (contentTarget) {
+              var contentRect = contentTarget.getBoundingClientRect();
+              var contentX = contentRect.left + Math.min(24, Math.max(4, contentRect.width / 4));
+              var contentY = contentRect.top + Math.min(52, Math.max(8, contentRect.height / 3));
+              var beforeContentGestureRect = rectObj(firstEl.getBoundingClientRect());
+              fire(contentTarget, downType, contentX, contentY, 1, 51);
+              fire(contentTarget, moveType, contentX + 24, contentY + 18, 1, 51);
+              var contentDragState = dragStateSnapshot();
+              fire(contentTarget, upType, contentX + 24, contentY + 18, 0, 51);
+              var afterContentGestureRect = rectObj(firstEl.getBoundingClientRect());
+              // Link preparation can split every candidate into several text
+              // nodes.  Select across the first/last non-empty nodes to prove
+              // the complete detached body remains a normal browser Range.
+              var firstTextNode = null;
+              var lastTextNode = null;
+              var walker = document.createTreeWalker(contentTarget, NodeFilter.SHOW_TEXT);
+              var walked;
+              while (walked = walker.nextNode()) {
+                if (!String(walked.nodeValue || '').trim()) continue;
+                if (!firstTextNode) firstTextNode = walked;
+                lastTextNode = walked;
+              }
+              var selectedText = '';
+              var selectionInsideDetached = false;
+              try {
+                var selection = window.getSelection();
+                if (selection && firstTextNode && lastTextNode) {
+                  var range = document.createRange();
+                  range.setStart(firstTextNode, 0);
+                  range.setEnd(lastTextNode, String(lastTextNode.nodeValue || '').length);
+                  selection.removeAllRanges();
+                  selection.addRange(range);
+                  selectedText = selection.toString();
+                  selectionInsideDetached = !!(selection.anchorNode && firstEl.contains(selection.anchorNode));
+                  selection.removeAllRanges();
+                }
+              } catch (_) {}
+              selectionProbe = {
+                dragCandidateFromContent: contentDragState.candidate,
+                dragActiveFromContent: contentDragState.active,
+                userSelect: window.getComputedStyle(contentTarget).userSelect,
+                selectedText: selectedText,
+                selectionInsideDetached: selectionInsideDetached,
+                beforeRect: beforeContentGestureRect,
+                afterRect: afterContentGestureRect
+              };
+            }
+
+            var detachedLink = firstEl.querySelector('.ir-type-link[data-type="DetachedTargetModel"]');
+            if (detachedLink) {
+              var clonedSafeLink = firstEl.querySelector('a[href="https://example.com/cloned-detached-docs"]');
+              var clonedSafeLinkState = clonedSafeLink ? {
+                href: String(clonedSafeLink.getAttribute('href') || ''),
+                dataHref: String(clonedSafeLink.getAttribute('data-href') || ''),
+                target: String(clonedSafeLink.getAttribute('target') || ''),
+                pointerEvents: window.getComputedStyle(clonedSafeLink).pointerEvents
+              } : null;
+              var linkRect = detachedLink.getBoundingClientRect();
+              var linkX = linkRect.left + linkRect.width / 2;
+              var linkY = linkRect.top + linkRect.height / 2;
+              var linkWindowBefore = rectObj(firstEl.getBoundingClientRect());
+              var nativePreviewTargetBefore = window.__irLastPreviewTarget;
+              var nativeHistoryForBefore = window.__irHistoryFor;
+              var nativeHistoryLengthBefore = (window.__irHistory || []).length;
+              var legacyPayloadCountBefore = legacyPayloads.length;
+              fire(detachedLink, downType, linkX, linkY, 1, 61);
+              var linkDownDragState = dragStateSnapshot();
+              fire(detachedLink, upType, linkX, linkY, 0, 61);
+              fire(detachedLink, 'click', linkX, linkY, 0, 61);
+              var previewMessages = detachedPayloads.filter(function(message) {
+                return message && message.op === 'preview' && message.identifier === 'DetachedTargetModel';
+              });
+              var previewMessage = previewMessages[previewMessages.length - 1] || null;
+              var applyResult = previewMessage && hooks.applyDetachedPreview
+                ? hooks.applyDetachedPreview(
+                    previewMessage.sessionKey,
+                    previewMessage.requestId,
+                    'DetachedTargetModel',
+                    'DetachedTargetModel preview\\n\\nclass DetachedTargetModel:\\n    nested: NestedTargetModel\\n\\n[Docs](https://example.com/detached-docs)'
+                  )
+                : { ok: false, reason: 'missing-preview-message' };
+              var commitResult = previewMessage && applyResult && applyResult.ok && hooks.commitDetachedPreview
+                ? hooks.commitDetachedPreview(previewMessage.sessionKey, previewMessage.requestId)
+                : { ok: false, reason: 'missing-apply' };
+              var firstTextAfterApply = String(firstEl.textContent || '');
+              var safeLink = firstEl.querySelector('a[data-ir-detached-safe-link="1"]');
+              var safeLinkState = safeLink ? {
+                href: String(safeLink.getAttribute('href') || ''),
+                target: String(safeLink.getAttribute('target') || ''),
+                pointerEvents: window.getComputedStyle(safeLink).pointerEvents
+              } : null;
+              var otherEl = Array.prototype.slice.call(document.querySelectorAll('.ir-detached-hover')).find(function(el) { return el !== firstEl; });
+              var otherTextAfterApply = String(otherEl && otherEl.textContent || '');
+              var backButton = firstEl.querySelector('.ir-detached-hover-back');
+              var backVisibleBeforeClick = !!(backButton && backButton.classList.contains('ir-detached-hover-back-visible'));
+              if (backButton) {
+                var backRect = backButton.getBoundingClientRect();
+                fire(backButton, 'click', backRect.left + backRect.width / 2, backRect.top + backRect.height / 2, 0, 62);
+              }
+              var firstTextAfterBack = String(firstEl.textContent || '');
+              linkProbe = {
+                pointerEvents: window.getComputedStyle(detachedLink).pointerEvents,
+                candidateAfterLinkDown: linkDownDragState.candidate,
+                activeAfterLinkDown: linkDownDragState.active,
+                previewPayloadCount: previewMessages.length,
+                previewPayload: previewMessage,
+                legacyPayloads: legacyPayloads.slice(legacyPayloadCountBefore),
+                applyResult: applyResult,
+                commitResult: commitResult,
+                firstTextAfterApply: firstTextAfterApply,
+                clonedSafeLink: clonedSafeLinkState,
+                safeLink: safeLinkState,
+                otherTextAfterApply: otherTextAfterApply,
+                backVisibleBeforeClick: backVisibleBeforeClick,
+                firstTextAfterBack: firstTextAfterBack,
+                windowBefore: linkWindowBefore,
+                windowAfter: rectObj(firstEl.getBoundingClientRect()),
+                nativeGlobalsUnchanged: nativePreviewTargetBefore === window.__irLastPreviewTarget
+                  && nativeHistoryForBefore === window.__irHistoryFor
+                  && nativeHistoryLengthBefore === (window.__irHistory || []).length
+              };
+            }
+
+            var resizeHandle = firstEl.querySelector('.ir-detached-hover-resize-corner');
+            if (resizeHandle) {
+              var resizeBefore = rectObj(firstEl.getBoundingClientRect());
+              var handleRect = resizeHandle.getBoundingClientRect();
+              var resizeX = handleRect.left + handleRect.width / 2;
+              var resizeY = handleRect.top + handleRect.height / 2;
+              var resizeHit = document.elementFromPoint(resizeX, resizeY);
+              var growX = ((window.innerWidth || 0) - 8 - resizeBefore.right) >= 48 ? 72 : -48;
+              var growY = ((window.innerHeight || 0) - 8 - resizeBefore.bottom) >= 36 ? 52 : -36;
+              fire(resizeHandle, downType, resizeX, resizeY, 1, 71);
+              fire(resizeHandle, moveType, resizeX + growX, resizeY + growY, 1, 71);
+              var resizeDuring = {
+                active: !!window.__irDetachedHoverResizeActive,
+                markerCount: document.querySelectorAll('.ir-detached-hover-resizing').length
+              };
+              fire(resizeHandle, upType, resizeX + growX, resizeY + growY, 0, 71);
+              var resizeAfter = rectObj(firstEl.getBoundingClientRect());
+              var resizeRoot = firstEl.querySelector('.ir-detached-hover-root');
+              var resizeScroller = resizeRoot && hooks.primaryHoverScroller(resizeRoot);
+              resizeProbe = {
+                handlePointerEvents: window.getComputedStyle(resizeHandle).pointerEvents,
+                handleCursor: window.getComputedStyle(resizeHandle).cursor,
+                hitIsHandle: !!(resizeHit && (resizeHit === resizeHandle || (resizeHit.closest && resizeHit.closest('.ir-detached-hover-resize-corner') === resizeHandle))),
+                hitTag: resizeHit ? String(resizeHit.tagName || '') : '',
+                hitClass: resizeHit ? String(resizeHit.className || '') : '',
+                before: resizeBefore,
+                after: resizeAfter,
+                requestedDelta: { x: growX, y: growY },
+                during: resizeDuring,
+                activeAfter: !!window.__irDetachedHoverResizeActive,
+                markerCountAfter: document.querySelectorAll('.ir-detached-hover-resizing').length,
+                viewport: { width: window.innerWidth || 0, height: window.innerHeight || 0 },
+                rootRect: resizeRoot ? rectObj(resizeRoot.getBoundingClientRect()) : null,
+                scrollerRect: resizeScroller ? rectObj(resizeScroller.getBoundingClientRect()) : null
+              };
+            }
+
+            var movableTarget = firstEl.querySelector('.ir-detached-hover-titlebar') || firstEl;
+            var moveRect = movableTarget.getBoundingClientRect();
+            var moveX = moveRect.left + Math.min(72, Math.max(30, moveRect.width / 3));
+            var moveY = moveRect.top + moveRect.height / 2;
             fire(movableTarget, downType, moveX, moveY, 1, 33);
             fire(movableTarget, moveType, moveX + 28, moveY + 24, 1, 33);
             duringLostButtonsDrag = hooks.detachedHoverSnapshot();
@@ -4423,9 +5090,9 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
             afterLostButtonsMove = hooks.detachedHoverSnapshot();
             afterLostButtonsMove.dragState = dragStateSnapshot();
 
-            var recoveryRect = firstEl.getBoundingClientRect();
-            var recoveryX = recoveryRect.left + 30;
-            var recoveryY = recoveryRect.top + 42;
+            var recoveryRect = movableTarget.getBoundingClientRect();
+            var recoveryX = recoveryRect.left + Math.min(72, Math.max(30, recoveryRect.width / 3));
+            var recoveryY = recoveryRect.top + recoveryRect.height / 2;
             fire(movableTarget, downType, recoveryX, recoveryY, 1, 34);
             fire(movableTarget, moveType, recoveryX + 28, recoveryY + 24, 1, 34);
             fire(movableTarget, upType, recoveryX + 28, recoveryY + 24, 0, 34);
@@ -4436,8 +5103,40 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
           var secondDetached = afterSecondDrag.windows && afterSecondDrag.windows.find(function(row) { return row.id !== firstDetached.id; });
           var secondEl = secondDetached && document.querySelector('.ir-detached-hover[data-ir-detached-hover-id="' + secondDetached.id + '"]');
           var close = secondEl && secondEl.querySelector('.ir-detached-hover-close');
-          if (close) fire(close, downType, secondDetached.rect.right - 12, secondDetached.rect.top + 12, 1, 44);
+          var closeUi = null;
+          if (close) {
+            var closeRect = close.getBoundingClientRect();
+            var closeStyle = window.getComputedStyle(close);
+            var closeHit = document.elementFromPoint(closeRect.left + closeRect.width / 2, closeRect.top + closeRect.height / 2);
+            closeUi = {
+              inTitlebar: !!close.closest('.ir-detached-hover-titlebar'),
+              width: closeRect.width,
+              height: closeRect.height,
+              display: closeStyle.display,
+              visibility: closeStyle.visibility,
+              opacity: Number(closeStyle.opacity),
+              pointerEvents: closeStyle.pointerEvents,
+              backgroundColor: closeStyle.backgroundColor,
+              color: closeStyle.color,
+              borderStyle: closeStyle.borderStyle,
+              borderColor: closeStyle.borderColor,
+              glyph: String(close.textContent || '').trim(),
+              fontWeight: closeStyle.fontWeight,
+              ariaLabel: close.getAttribute('aria-label') || '',
+              hitIsClose: !!(closeHit && (closeHit === close || (closeHit.closest && closeHit.closest('.ir-detached-hover-close') === close)))
+            };
+            fire(close, downType, closeRect.left + closeRect.width / 2, closeRect.top + closeRect.height / 2, 1, 44);
+          }
           var afterClose = hooks.detachedHoverSnapshot();
+          var cleanupResizeArmed = false;
+          if (firstEl) {
+            var cleanupHandle = firstEl.querySelector('.ir-detached-hover-resize-corner');
+            if (cleanupHandle) {
+              var cleanupHandleRect = cleanupHandle.getBoundingClientRect();
+              fire(cleanupHandle, downType, cleanupHandleRect.left + cleanupHandleRect.width / 2, cleanupHandleRect.top + cleanupHandleRect.height / 2, 1, 91);
+              cleanupResizeArmed = !!window.__irDetachedHoverResizeActive;
+            }
+          }
           result = {
             ok: true,
             belowThreshold: belowThreshold,
@@ -4449,10 +5148,16 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
             afterLostButtonsMove: afterLostButtonsMove,
             afterRedrag: afterRedrag,
             afterClose: afterClose,
+            selectionProbe: selectionProbe,
+            linkProbe: linkProbe,
+            resizeProbe: resizeProbe,
+            closeUi: closeUi,
+            cleanupResizeArmed: cleanupResizeArmed,
             sameNativeWrapperReused: sameNativeWrapperReused,
             firstStableRect: firstStableRect,
             redraggedFirst: redraggedFirst,
-            hidePayloads: hidePayloads.slice()
+            hidePayloads: hidePayloads.slice(),
+            detachedPayloads: detachedPayloads.slice()
           };
         } catch (error) {
           result = { ok: false, error: String(error && error.message || error), hidePayloads: hidePayloads.slice() };
@@ -9624,6 +10329,8 @@ async function resolvePreviewIdentifierViaDefinitionProvider(
   identifier: string,
   docUriStr: string,
   ms: () => string,
+  previewState: PreviewState | null = currentPreviewState,
+  useSharedPreviewCache = true,
 ): Promise<vscode.Location | null> {
   const candidates: Array<{ uri: vscode.Uri; range?: vscode.Range; label: string }> = [];
   const addCandidate = (uri: vscode.Uri | undefined, range: vscode.Range | undefined, label: string) => {
@@ -9636,12 +10343,14 @@ async function resolvePreviewIdentifierViaDefinitionProvider(
   };
   const seen = new Set<string>();
 
-  if (currentPreviewState) {
-    const currentPreviewLoc = cappedPreviewLocationGet(lastPreviewLocations, currentPreviewState.identifier);
+  if (previewState && useSharedPreviewCache) {
+    const currentPreviewLoc = cappedPreviewLocationGet(lastPreviewLocations, previewState.identifier);
     addCandidate(currentPreviewLoc?.uri, currentPreviewLoc?.range, 'current-preview');
   }
-  const identifierPreviewLoc = cappedPreviewLocationGet(lastPreviewLocations, identifier);
-  addCandidate(identifierPreviewLoc?.uri, identifierPreviewLoc?.range, 'preview-identifier');
+  if (useSharedPreviewCache) {
+    const identifierPreviewLoc = cappedPreviewLocationGet(lastPreviewLocations, identifier);
+    addCandidate(identifierPreviewLoc?.uri, identifierPreviewLoc?.range, 'preview-identifier');
+  }
   if (docUriStr) {
     try { addCandidate(vscode.Uri.parse(docUriStr), undefined, 'origin-doc'); } catch {}
   }
@@ -9681,9 +10390,11 @@ async function resolvePreviewIdentifierViaDefinitionProvider(
 async function resolvePreviewIdentifierFromCurrentMarkdown(
   identifier: string,
   ms: () => string,
+  previewState: PreviewState | null = currentPreviewState,
+  rememberLocations = true,
 ): Promise<vscode.Location | null> {
-  if (!currentPreviewState?.markdown) { return null; }
-  const parsed = parsePreviewMarkdownSource(currentPreviewState.markdown);
+  if (!previewState?.markdown) { return null; }
+  const parsed = parsePreviewMarkdownSource(previewState.markdown);
   if (!parsed) { return null; }
   const uri = await resolvePreviewMarkdownUri(parsed.relPath);
   if (!uri) { return null; }
@@ -9693,9 +10404,16 @@ async function resolvePreviewIdentifierFromCurrentMarkdown(
   catch { return null; }
   if (!isCodeDoc(doc)) { return null; }
 
-  const sourceLoc = registerPreviewMarkdownLocations(parsed.typeName, uri, parsed.definitionLine, parsed.code);
   const lineTexts = parsed.code.split('\n');
-  const previewStartLine = sourceLoc.previewStartLine;
+  const previewStartLine = rememberLocations
+    ? registerPreviewMarkdownLocations(parsed.typeName, uri, parsed.definitionLine, parsed.code).previewStartLine
+    : Math.max(
+      0,
+      parsed.definitionLine - Math.max(
+        0,
+        lineTexts.findIndex(line => declarationIndexInLine(line, parsed.typeName) !== null),
+      ),
+    );
   const re = identifierWordRegex(identifier, 'g');
 
   for (let offset = 0; offset < lineTexts.length; offset++) {
@@ -9765,6 +10483,7 @@ async function previewTypeHandler(
   docUriStr: string,
   identifier: string,
   dedupeRendererClick = true,
+  detachedContext?: DetachedPreviewRequestContext,
 ): Promise<void> {
   if (identifier.length <= 2) { return; }
   const t0 = Date.now();
@@ -9774,19 +10493,32 @@ async function previewTypeHandler(
   // (e.g. drilling into a definition far down the file), so without this
   // snapshot showHover can end up firing outside the viewport and the
   // user perceives it as "hover disappeared".
-  const rawAnchorPos = lastHoverFetchPosition;
+  const rawAnchorPos = detachedContext?.session.anchor ?? lastHoverFetchPosition;
   if (!rawAnchorPos) {
     log.warn(`preview: "${identifier}" no anchorPos — skipping (no prior hover position)`);
+    if (detachedContext) { await failDetachedPreviewRequest(detachedContext, 'missing-anchor'); }
     return;
   }
   // Keep docUriStr (the backing analysis document) for definition lookup,
   // but let an overlay owner replace the anchor used by state, pending-hover
   // matching, click dedupe, and the eventual refire.
-  const anchorPos = await resolveOverlayHoverAnchor(rawAnchorPos);
+  const anchorPos = detachedContext
+    ? rawAnchorPos
+    : await resolveOverlayHoverAnchor(rawAnchorPos);
   const anchorUriKey = hoverRequestUriKey(anchorPos.uri);
-  const originScrollState = currentPreviewState?.originScrollState
-    ?? (previewHistory.length === 0 ? await capturePreviewScrollStateInRenderer() : undefined);
-  if (dedupeRendererClick) {
+  const previewCurrentState = detachedContext?.session.current ?? currentPreviewState;
+  const detachedRequestCurrent = () => !detachedContext || detachedPreviewRequestIsCurrent(detachedContext);
+  if (!detachedRequestCurrent()) { return; }
+  if (detachedContext && previewCurrentState?.identifier === identifier) {
+    log.info(`detached preview: "${identifier}" duplicate ignored (same as current page)`);
+    await failDetachedPreviewRequest(detachedContext, 'already-current');
+    return;
+  }
+  const originScrollState = detachedContext
+    ? previewCurrentState?.originScrollState
+    : currentPreviewState?.originScrollState
+      ?? (previewHistory.length === 0 ? await capturePreviewScrollStateInRenderer() : undefined);
+  if (dedupeRendererClick && !detachedContext) {
     // (1) Anchor-and-identifier match: already showing this exact identifier
     // at this exact anchor — never re-drill.
     if (currentPreviewState?.identifier === identifier
@@ -9841,14 +10573,31 @@ async function previewTypeHandler(
   // Resolve location: declaration in the current preview first (nested
   // classes/methods), then sidecar, then hover-side cache+find fallback.
   let loc: vscode.Location | null = null;
-  const declaredInPreview = cappedPreviewLocationGet(lastPreviewDeclarationLocations, identifier);
+  if (detachedContext && previewCurrentState?.markdown) {
+    // A detached page is its own document context.  Resolve declarations and
+    // references in that visible page before consulting the original hover
+    // document, active editor, or shared sidecar index.
+    loc = await resolvePreviewIdentifierFromCurrentMarkdown(
+      identifier,
+      ms,
+      previewCurrentState,
+      false,
+    );
+    if (!detachedRequestCurrent()) { return; }
+  }
+  const declaredInPreview = detachedContext
+    ? undefined
+    : cappedPreviewLocationGet(lastPreviewDeclarationLocations, identifier);
   if (declaredInPreview) {
     loc = declaredInPreview;
     log.info(`preview:   loc from preview declaration: ${vscode.workspace.asRelativePath(loc.uri)}:${loc.range.start.line + 1}:${loc.range.start.character + 1}`);
   }
   const preferDefinitionProvider = preferDefinitionProviderForPreviewIdentifier(identifier);
   if (!loc && preferDefinitionProvider) {
-    loc = await resolvePreviewIdentifierViaDefinitionProvider(identifier, docUriStr, ms);
+    loc = await resolvePreviewIdentifierViaDefinitionProvider(
+      identifier, docUriStr, ms, previewCurrentState, !detachedContext,
+    );
+    if (!detachedRequestCurrent()) { return; }
   }
   let originFs = '';
   try { if (docUriStr) { originFs = vscode.Uri.parse(docUriStr).fsPath; } } catch {}
@@ -9864,14 +10613,18 @@ async function previewTypeHandler(
         log.info(`preview:   loc from sidecar: ${vscode.workspace.asRelativePath(loc.uri)}:${fastHit.line}`);
       }
     } catch (err) { log.warn(`preview: sidecar error: ${err}`); }
+    if (!detachedRequestCurrent()) { return; }
   }
   if (!loc) {
-    loc = await resolvePreviewIdentifierViaDefinitionProvider(identifier, docUriStr, ms);
+    loc = await resolvePreviewIdentifierViaDefinitionProvider(
+      identifier, docUriStr, ms, previewCurrentState, !detachedContext,
+    );
+    if (!detachedRequestCurrent()) { return; }
   }
-  if (!loc) {
-    loc = await resolvePreviewIdentifierFromCurrentMarkdown(identifier, ms);
+  if (!loc && !detachedContext) {
+    loc = await resolvePreviewIdentifierFromCurrentMarkdown(identifier, ms, previewCurrentState, true);
   }
-  if (!loc) {
+  if (!loc && !detachedContext) {
     const cached = cappedPreviewLocationGet(lastPreviewLocations, identifier);
     if (cached) {
       try {
@@ -9899,6 +10652,7 @@ async function previewTypeHandler(
   }
   if (!loc) {
     loc = await resolvePreviewIdentifierFromWorkspaceScan(identifier, docUriStr, ms);
+    if (!detachedRequestCurrent()) { return; }
   }
   const builtinPreviewMarkdown = preferDefinitionProvider ? builtinDecoratorPreviewMarkdown(identifier) : null;
   if (builtinPreviewMarkdown) {
@@ -9909,12 +10663,18 @@ async function previewTypeHandler(
   }
   if (!loc) {
     log.info(`preview: "${identifier}" no location (${ms()})`);
+    if (detachedContext) { await failDetachedPreviewRequest(detachedContext, 'definition-not-found'); }
     return;
   }
 
   let doc: vscode.TextDocument;
   try { doc = await vscode.workspace.openTextDocument(loc.uri); }
-  catch (err) { log.warn(`preview: openDoc error: ${err} (${ms()})`); return; }
+  catch (err) {
+    log.warn(`preview: openDoc error: ${err} (${ms()})`);
+    if (detachedContext) { await failDetachedPreviewRequest(detachedContext, 'open-document-failed'); }
+    return;
+  }
+  if (!detachedRequestCurrent()) { return; }
 
   let markdown = '';
   if (builtinPreviewMarkdown) {
@@ -9923,7 +10683,14 @@ async function previewTypeHandler(
   } else try {
     const startLine = loc.range.start.line;
     const hintedEndLine = loc.range.end.line > startLine ? loc.range.end.line : undefined;
-    const sourcePreview = buildDefinitionPreviewResult(identifier, loc.uri, doc, startLine, hintedEndLine);
+    const sourcePreview = buildDefinitionPreviewResult(
+      identifier,
+      loc.uri,
+      doc,
+      startLine,
+      hintedEndLine,
+      !detachedContext,
+    );
     markdown = sourcePreview.preview;
     log.info(`preview: source block ${vscode.workspace.asRelativePath(loc.uri)}:${sourcePreview.location.range.start.line + 1}-${sourcePreview.location.range.end.line} lines=${sourcePreview.previewLineCount ?? '?'} md=${markdown.length} (${ms()})`);
   } catch (err) {
@@ -9961,23 +10728,23 @@ async function previewTypeHandler(
   } catch (err) {
     log.warn(`preview: hoverProvider error: ${err} (${ms()})`);
   }
+  if (!detachedRequestCurrent()) { return; }
 
   if (!markdown) {
     const startLine = loc.range.start.line;
     const hintedEndLine = loc.range.end.line > startLine ? loc.range.end.line : undefined;
-    const sourcePreview = buildDefinitionPreviewResult(identifier, loc.uri, doc, startLine, hintedEndLine);
+    const sourcePreview = buildDefinitionPreviewResult(
+      identifier,
+      loc.uri,
+      doc,
+      startLine,
+      hintedEndLine,
+      !detachedContext,
+    );
     markdown = sourcePreview.preview;
     log.info(`preview: source fallback block ${vscode.workspace.asRelativePath(loc.uri)}:${sourcePreview.location.range.start.line + 1}-${sourcePreview.location.range.end.line} lines=${sourcePreview.previewLineCount ?? '?'} md=${markdown.length} (${ms()})`);
   }
 
-  // Drill-down history: push the page we're navigating away from (if
-  // any) onto the stack before installing the new one. The back link
-  // is appended via applyPreviewStateAsHover below — when history is
-  // non-empty, the rendered hover will include a "← Back" command link.
-  if (currentPreviewState) {
-    setCurrentPreviewState(await withCurrentRendererScrollState(currentPreviewState));
-    previewHistory.push(currentPreviewState!);
-  }
   const anchorDoc = findOpenDoc(anchorPos.uri);
   const anchorRange = anchorDoc
     ? fullWordRangeAt(anchorDoc, new vscode.Position(anchorPos.line, anchorPos.character))
@@ -9989,6 +10756,67 @@ async function previewTypeHandler(
     anchorRange,
     originScrollState,
   };
+
+  if (detachedContext) {
+    const session = detachedPreviewSessions.get(detachedContext.session.key);
+    if (!session || session !== detachedContext.session
+      || session.latestRequest !== detachedContext.requestId) {
+      return;
+    }
+    const previousCurrent = session.current ? copyPreviewStateForDetached(session.current) : null;
+    const rendererArgs = [
+      session.key,
+      detachedContext.requestId,
+      identifier,
+      markdown,
+    ];
+    let delivered = await evaluateDetachedPreviewRendererCall(
+      detachedContext.ws,
+      'irApplyDetachedPreview',
+      rendererArgs,
+    );
+    // Runtime.evaluate may time out after the renderer already applied the
+    // page.  The renderer operation is request-idempotent, so one retry turns
+    // that ambiguous transport failure into a definite acknowledgement.
+    if (!delivered?.ok && /time(?:d out|out)/i.test(String(delivered?.reason || ''))) {
+      delivered = await evaluateDetachedPreviewRendererCall(
+        detachedContext.ws,
+        'irApplyDetachedPreview',
+        rendererArgs,
+      );
+    }
+    if (!delivered?.ok) {
+      await failDetachedPreviewRequest(detachedContext, String(delivered?.reason || 'renderer-apply-failed'));
+      return;
+    }
+    if (!detachedPreviewRequestIsCurrent(detachedContext)) { return; }
+    // Commit extension-side history only after the exact renderer window has
+    // acknowledged its page transition.  Renderer interaction stays busy
+    // until the commit acknowledgement below, closing the rapid-click race.
+    session.history.push(previousCurrent);
+    nextPreviewState.lastActivityAt = Date.now();
+    session.current = copyPreviewStateForDetached(nextPreviewState);
+    session.lastUsed = Date.now();
+    if (session.history.length > 20) { session.history.splice(0, session.history.length - 20); }
+    const committed = await evaluateDetachedPreviewRendererCall(
+      detachedContext.ws,
+      'irCommitDetachedPreview',
+      [session.key, detachedContext.requestId],
+    );
+    if (!committed?.ok) {
+      log.warn(`detached preview: renderer commit acknowledgement failed session=${session.key} request=${detachedContext.requestId}: ${String(committed?.reason || 'unknown')}`);
+    }
+    log.info(`detached preview: "${identifier}" applied session=${session.key} request=${detachedContext.requestId} depth=${session.history.length} (${ms()})`);
+    return;
+  }
+
+  // Native drill-down history: push the page we're navigating away from (if
+  // any) onto the stack before installing the new one. Detached windows take
+  // the isolated branch above and never mutate this singleton state.
+  if (currentPreviewState) {
+    setCurrentPreviewState(await withCurrentRendererScrollState(currentPreviewState));
+    previewHistory.push(currentPreviewState!);
+  }
 
   await applyPreviewStateAsHover(nextPreviewState, ms);
   nextPreviewState.lastActivityAt = Date.now();

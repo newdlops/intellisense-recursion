@@ -153,15 +153,19 @@ normal `editor.action.hideHover` request as fallback), returning VS Code's
 single reusable hover widget for the next symbol. This is the transition that
 allows multiple moved hover windows to coexist.
 
-Detached windows are isolated from native-hover activation, markdown rescans,
-history, and wrapper-layout observers. They can be dragged again, are clamped
-to an 8 px viewport gutter, and remain until their `×` control closes them or
-the renderer patch is cleaned up. At most 12 detached windows are retained;
-creating another closes the oldest snapshot to bound large-hover DOM memory.
-They are intentionally read-only: cloned links, copy actions, and form controls
-are disabled, while scrolling, window dragging, and the `×` control remain
-active. Large virtualized hover tails get their own scroll renderer so moving a
-window does not freeze it at the lines that happened to be visible at detach.
+Detached windows are isolated from native-hover activation, native drill
+history, and wrapper-layout observers. A 28 px titlebar owns all subsequent
+window dragging, leaving the content surface selectable so text can be copied.
+Right, bottom, and corner handles resize each window within the same 8 px
+viewport gutter; the titlebar contains a high-contrast 24 px `×` control.
+
+Type links use a detached-session request ID and apply their result only to the
+window that issued the request. Each window keeps its own DOM/markdown back
+stack, including a live `DocumentFragment` for restoring the original snapshot,
+so detached navigation never mutates the native singleton hover's target or
+history. Safe `http:`, `https:`, and `mailto:` anchors remain active; cloned
+command links and form controls stay disabled. At most 12 detached windows are
+retained, and large virtualized tails keep their own scroll renderer.
 
 ## Box-corner contract (what the golden E2E checks)
 
