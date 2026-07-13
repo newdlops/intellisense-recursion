@@ -100,8 +100,14 @@
 //   outside click. We use ContentHoverController's native
 //   shouldKeepOpenOnEditorMouseMoveOrLeave flag plus real hover focus, and
 //   restore the controller flag before requesting the normal native dismiss.
+// v311 (L139, 2026-07-13): a click-pinned hover becomes draggable. Crossing
+//   the drag threshold promotes the painted native hover to an independent
+//   snapshot window, releases VS Code's singleton hover widget immediately,
+//   and therefore lets another native hover open while prior snapshots stay
+//   visible. Snapshot windows retain scroll position, can be moved again, and
+//   have an explicit close control plus patch-cleanup ownership.
 // If the running window still logs v<300, the new build is NOT loaded yet.
-export const RENDERER_PATCH_VERSION = 310;
+export const RENDERER_PATCH_VERSION = 311;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -133,6 +139,14 @@ try {
   }
   if (window.__irStyleEl && window.__irStyleEl.parentNode) {
     window.__irStyleEl.parentNode.removeChild(window.__irStyleEl);
+  }
+  var staleDetachedLayer = document.querySelector('.ir-detached-hover-layer');
+  if (staleDetachedLayer && staleDetachedLayer.parentNode) {
+    staleDetachedLayer.parentNode.removeChild(staleDetachedLayer);
+  }
+  var staleDetachedWindows = document.querySelectorAll('.ir-detached-hover');
+  for (var di = 0; di < staleDetachedWindows.length; di++) {
+    try { if (staleDetachedWindows[di].parentNode) staleDetachedWindows[di].parentNode.removeChild(staleDetachedWindows[di]); } catch(_) {}
   }
   if (window.__irScanInterval) { clearInterval(window.__irScanInterval); }
   if (window.__irScanTimer) { clearTimeout(window.__irScanTimer); }
@@ -198,6 +212,14 @@ window.__irHoverGuardNoLinkLogCount = 0;
 window.__irPointWrapRejectLogCount = 0;
 window.__irNearLinkLogCount = 0;
 window.__irPendingLinkPointerDown = null;
+window.__irDetachedHovers = [];
+window.__irDetachedHoverLayer = null;
+window.__irDetachedHoverSeq = 0;
+window.__irDetachedHoverZ = 0;
+window.__irHoverDragCandidate = null;
+window.__irHoverDragActive = null;
+window.__irHoverDragClickSuppress = null;
+window.__irDetachedClampFrame = 0;
 window.__irHoverPatched = true;  // legacy compat
 
 function irLogPrefix(){
@@ -296,6 +318,7 @@ function irPruneDetachedHoverState(){
 window.__irCleanup=function(reason){
   try{
     try{irClearClickPinnedHover('patch-cleanup',false);}catch(_){}
+    try{irClearDetachedHovers('patch-cleanup');}catch(_){}
     try{
       var flexibleWrappers=document.querySelectorAll('.monaco-resizable-hover.ir-flexible-hover-size');
       for(var fi=0;fi<flexibleWrappers.length;fi++)irResetFlexibleHoverResize(flexibleWrappers[fi],false);
@@ -346,6 +369,12 @@ window.__irCleanup=function(reason){
     window.__irActiveHoverEl=null;
     window.__irFlexibleResizeActiveWrapper=null;
     window.__irClickPinnedHover=null;
+    window.__irDetachedHovers=[];
+    window.__irDetachedHoverLayer=null;
+    window.__irHoverDragCandidate=null;
+    window.__irHoverDragActive=null;
+    window.__irHoverDragClickSuppress=null;
+    if(window.__irDetachedClampFrame){try{cancelAnimationFrame(window.__irDetachedClampFrame)}catch(_){}window.__irDetachedClampFrame=0;}
     window.__irInactiveScanSkipLogCount=0;
     window.__irMonacoCaps=null;
     window.__irMdRenderer=null;
@@ -580,6 +609,23 @@ style.textContent=[
   '.monaco-resizable-hover.ir-flexible-hover-size.ir-flexible-hover-size{--ir-flex-hover-max-width:680px;--ir-flex-hover-max-height:48vh;max-width:min(var(--ir-flex-hover-max-width),calc(100vw - 16px)) !important;max-height:min(var(--ir-flex-hover-max-height),calc(100vh - 16px)) !important}',
   '.monaco-resizable-hover.ir-flexible-hover-size .monaco-hover,.monaco-resizable-hover.ir-flexible-hover-size .monaco-editor-hover,.monaco-resizable-hover.ir-flexible-hover-size .monaco-hover.ir-scrollable,.monaco-resizable-hover.ir-flexible-hover-size .monaco-editor-hover.ir-scrollable{width:100% !important;height:100% !important;max-width:100% !important;max-height:100% !important}',
   '.monaco-resizable-hover.ir-flexible-hover-size .monaco-hover.ir-scrollable > .monaco-scrollable-element,.monaco-resizable-hover.ir-flexible-hover-size .monaco-editor-hover.ir-scrollable > .monaco-scrollable-element{max-width:calc(100% - 2px) !important;max-height:calc(100% - 2px) !important}',
+  // L139: once a pinned native hover starts moving, its painted DOM is
+  // snapshotted under this workbench-level layer. The native wrapper class is
+  // removed from the snapshot so VS Code and our native-wrapper observers do
+  // not mistake it for the singleton widget. These high-specificity rules
+  // restore the sizing that the pre-adoption .monaco-hover rule zeros out.
+  '.ir-detached-hover-layer{position:fixed !important;inset:0 !important;width:100vw !important;height:100vh !important;overflow:visible !important;pointer-events:none !important;z-index:2147483646 !important}',
+  '.ir-detached-hover.ir-detached-hover{position:absolute !important;box-sizing:border-box !important;display:block !important;visibility:visible !important;overflow:visible !important;transform:none !important;margin:0 !important;padding:0 !important;pointer-events:auto !important;cursor:grab !important;background:var(--vscode-editorHoverWidget-background,var(--vscode-editor-background,Canvas)) !important;color:var(--vscode-editorHoverWidget-foreground,var(--vscode-editor-foreground,CanvasText)) !important;border:1px solid var(--vscode-focusBorder,var(--vscode-editorHoverWidget-border,rgba(128,128,128,0.85))) !important;border-radius:4px !important;box-shadow:0 4px 14px rgba(0,0,0,0.28) !important;z-index:var(--ir-detached-hover-z,1) !important}',
+  '.ir-detached-hover.ir-detached-hover .monaco-hover,.ir-detached-hover.ir-detached-hover .monaco-editor-hover,.ir-detached-hover.ir-detached-hover .monaco-hover.ir-scrollable,.ir-detached-hover.ir-detached-hover .monaco-editor-hover.ir-scrollable{position:static !important;inset:auto !important;display:flex !important;flex-direction:column !important;box-sizing:border-box !important;width:100% !important;height:100% !important;min-width:0 !important;min-height:0 !important;max-width:100% !important;max-height:100% !important;margin:0 !important;transform:none !important;overflow:hidden !important;visibility:visible !important;opacity:1 !important;pointer-events:auto !important;cursor:inherit !important;border:0 !important;border-radius:inherit !important;outline:0 !important;box-shadow:none !important}',
+  '.ir-detached-hover.ir-detached-hover .monaco-hover .monaco-scrollable-element,.ir-detached-hover.ir-detached-hover .monaco-editor-hover .monaco-scrollable-element{position:static !important;inset:auto !important;top:auto !important;left:auto !important;right:auto !important;bottom:auto !important;transform:none !important;display:block !important;flex:1 1 auto !important;box-sizing:border-box !important;width:calc(100% - 2px) !important;height:auto !important;min-width:0 !important;min-height:0 !important;max-width:calc(100% - 2px) !important;max-height:calc(100% - 2px) !important;margin:1px !important;overflow:auto !important;overscroll-behavior:contain !important;scrollbar-width:auto !important;scrollbar-color:auto !important;visibility:visible !important;pointer-events:auto !important;cursor:inherit !important}',
+  '.ir-detached-hover.ir-detached-hover .monaco-hover-content,.ir-detached-hover.ir-detached-hover .hover-row,.ir-detached-hover.ir-detached-hover .hover-row-contents,.ir-detached-hover.ir-detached-hover .markdown-hover,.ir-detached-hover.ir-detached-hover .rendered-markdown{width:auto !important;height:auto !important;min-width:0 !important;min-height:0 !important;max-width:100% !important;max-height:none !important;overflow:visible !important;visibility:visible !important}',
+  '.ir-detached-hover.ir-detached-hover .monaco-hover-content{position:static !important;inset:auto !important;top:auto !important;left:auto !important;right:auto !important;bottom:auto !important;transform:none !important}',
+  '.ir-detached-hover.ir-detached-hover .hover-row{display:flex !important}',
+  '.ir-detached-hover.ir-detached-hover .hover-row-contents{display:flex !important;flex-direction:column !important;min-width:0 !important}',
+  '.ir-detached-hover.ir-detached-hover .ir-type-link,.ir-detached-hover.ir-detached-hover .ir-type-link *,.ir-detached-hover.ir-detached-hover .ir-back-btn,.ir-detached-hover.ir-detached-hover a,.ir-detached-hover.ir-detached-hover button:not(.ir-detached-hover-close),.ir-detached-hover.ir-detached-hover input,.ir-detached-hover.ir-detached-hover textarea,.ir-detached-hover.ir-detached-hover select,.ir-detached-hover.ir-detached-hover [contenteditable="true"],.ir-detached-hover.ir-detached-hover [role="button"]{pointer-events:none !important;cursor:inherit !important}',
+  '.ir-detached-hover-close{position:absolute !important;top:-7px !important;right:-7px !important;display:flex !important;align-items:center !important;justify-content:center !important;width:22px !important;height:22px !important;min-width:22px !important;min-height:22px !important;padding:0 !important;border:0 !important;border-radius:11px !important;background:var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.18)) !important;color:var(--vscode-foreground,CanvasText) !important;font:16px/1 var(--vscode-font-family,sans-serif) !important;cursor:pointer !important;pointer-events:auto !important;z-index:4 !important}',
+  '.ir-detached-hover-close:hover{background:var(--vscode-toolbar-activeBackground,var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.3))) !important}',
+  '.ir-detached-hover-dragging,.ir-detached-hover-dragging *{cursor:grabbing !important;user-select:none !important}',
   // L47: native virtual list for large hover bodies. content-visibility:
   // auto makes the brower skip layout+paint for off-screen .rendered-
   // markdown blocks (and their descendants) — turning a 57K-char drill
@@ -2557,6 +2603,7 @@ function irInstallBareHoverHandler(){
   window.__irBareHoverHandlerInstalled=true;
   function liftClamp(el){
     if(!el||!el.style||typeof el.style.setProperty!=='function')return false;
+    if(irIsDetachedHoverRoot(el))return false;
     if(el.__irBareLifted)return false;
     try{
       // Restore visibility + natural sizing. Use !important inline so
@@ -2583,6 +2630,7 @@ function irInstallBareHoverHandler(){
       for(var i=0;i<allHovers.length;i++){
         var el=allHovers[i];
         if(!document.body.contains(el))continue;
+        if(irIsDetachedHoverRoot(el))continue;
         // Skip if inside a resizable wrapper — those go through the
         // normal path that lifts the clamp via the descendant CSS rule.
         if(el.closest&&el.closest('.monaco-resizable-hover'))continue;
@@ -4627,7 +4675,679 @@ track(window,'pointercancel',irFinishFlexibleHoverResize,true);
 track(window,'mouseup',irFinishFlexibleHoverResize,true);
 track(window,'blur',irFinishFlexibleHoverResize,true);
 
-// L138: click-to-pin stays entirely on VS Code's native hover path. The
+// L139: a detached hover is a painted snapshot, not another native hover
+// widget. VS Code keeps one resizable content-hover widget per editor, so the
+// original wrapper must be returned to it as soon as a drag starts. Snapshot
+// windows live in a separate layer and deliberately lose the native wrapper
+// class; this keeps Monaco's wrapper discovery and layout code away from them.
+var IR_HOVER_DRAG_THRESHOLD_PX=5;
+var IR_DETACHED_HOVER_MAX=12;
+function irIsDetachedHoverElement(el){
+  try{
+    var node=el&&(el.nodeType===1?el:el.parentElement);
+    return !!(node&&node.closest&&node.closest('.ir-detached-hover'));
+  }catch(_){return false}
+}
+function irIsDetachedHoverRoot(root){
+  try{return !!(root&&root.closest&&root.closest('.ir-detached-hover'))}catch(_){return false}
+}
+function irEnsureDetachedHoverLayer(){
+  try{
+    var layer=window.__irDetachedHoverLayer;
+    if(layer&&document.body&&document.body.contains(layer))return layer;
+    layer=document.createElement('div');
+    layer.className='ir-detached-hover-layer';
+    layer.setAttribute('data-ir-detached-hover-layer','1');
+    (document.body||document.documentElement).appendChild(layer);
+    window.__irDetachedHoverLayer=layer;
+    return layer;
+  }catch(_){return null}
+}
+function irDetachedHoverStateFromElement(el){
+  try{
+    var node=el&&(el.nodeType===1?el:el.parentElement);
+    var win=node&&node.closest?node.closest('.ir-detached-hover'):null;
+    return win&&win.__irDetachedHoverState?win.__irDetachedHoverState:null;
+  }catch(_){return null}
+}
+function irBringDetachedHoverToFront(state){
+  try{
+    if(!state||!state.el)return;
+    var next=(Number(window.__irDetachedHoverZ)||0)+1;
+    if(next>2000000000)next=1;
+    window.__irDetachedHoverZ=next;
+    state.z=next;
+    state.el.style.setProperty('--ir-detached-hover-z',String(next));
+    irEnsureDetachedHoverLayer();
+  }catch(_){ }
+}
+function irClampDetachedHoverPosition(state,left,top){
+  var margin=8;
+  try{
+    var viewportW=window.innerWidth||document.documentElement.clientWidth||1200;
+    var viewportH=window.innerHeight||document.documentElement.clientHeight||900;
+    var width=Math.max(1,Number(state&&state.width)||0);
+    var height=Math.max(1,Number(state&&state.height)||0);
+    var maxLeft=Math.max(margin,viewportW-width-margin);
+    var maxTop=Math.max(margin,viewportH-height-margin);
+    return {
+      left:Math.round(Math.min(maxLeft,Math.max(margin,Number(left)||0))),
+      top:Math.round(Math.min(maxTop,Math.max(margin,Number(top)||0)))
+    };
+  }catch(_){return {left:Math.round(Number(left)||0),top:Math.round(Number(top)||0)}}
+}
+function irSetDetachedHoverPosition(state,left,top){
+  try{
+    if(!state||!state.el)return null;
+    var next=irClampDetachedHoverPosition(state,left,top);
+    state.left=next.left;
+    state.top=next.top;
+    state.el.style.setProperty('left',next.left+'px','important');
+    state.el.style.setProperty('top',next.top+'px','important');
+    return next;
+  }catch(_){return null}
+}
+function irSetDetachedHoverSize(state,width,height){
+  try{
+    if(!state||!state.el)return null;
+    width=Math.max(1,Math.round(Number(width)||1));
+    height=Math.max(1,Math.round(Number(height)||1));
+    state.width=width;
+    state.height=height;
+    var props=[['width',width],['min-width',width],['max-width',width],['height',height],['min-height',height],['max-height',height]];
+    for(var i=0;i<props.length;i++)state.el.style.setProperty(props[i][0],props[i][1]+'px','important');
+    return {width:width,height:height};
+  }catch(_){return null}
+}
+function irFitDetachedHoverSizeToViewport(state){
+  try{
+    if(!state||!state.el)return null;
+    var viewportW=window.innerWidth||document.documentElement.clientWidth||1200;
+    var viewportH=window.innerHeight||document.documentElement.clientHeight||900;
+    var naturalWidth=Math.max(1,Number(state.naturalWidth)||Number(state.width)||1);
+    var naturalHeight=Math.max(1,Number(state.naturalHeight)||Number(state.height)||1);
+    return irSetDetachedHoverSize(state,Math.min(naturalWidth,Math.max(1,viewportW-16)),Math.min(naturalHeight,Math.max(1,viewportH-16)));
+  }catch(_){return null}
+}
+function irCaptureHoverScrollOffsets(source){
+  var values=[];
+  try{
+    var selector='.monaco-hover,.monaco-editor-hover,.monaco-scrollable-element,.monaco-hover-content,.hover-row,.hover-row-contents,.markdown-hover,.rendered-markdown';
+    var nodes=source.querySelectorAll?source.querySelectorAll(selector):[];
+    for(var i=0;i<nodes.length;i++)values.push({top:Number(nodes[i].scrollTop)||0,left:Number(nodes[i].scrollLeft)||0});
+  }catch(_){ }
+  return values;
+}
+function irRestoreHoverScrollOffsets(clone,values){
+  try{
+    var selector='.monaco-hover,.monaco-editor-hover,.monaco-scrollable-element,.monaco-hover-content,.hover-row,.hover-row-contents,.markdown-hover,.rendered-markdown';
+    var nodes=clone.querySelectorAll?clone.querySelectorAll(selector):[];
+    for(var i=0;i<nodes.length&&i<values.length;i++){
+      if(values[i].top||values[i].left){
+        // Commit the detached window's exact-size CSS before assigning the
+        // offsets. Chromium clamps scrollTop to zero when it is written while
+        // a freshly appended clone still has its pre-adoption 0x0 geometry.
+        void nodes[i].scrollHeight;
+      }
+      if(values[i].top)nodes[i].scrollTop=values[i].top;
+      if(values[i].left)nodes[i].scrollLeft=values[i].left;
+    }
+  }catch(_){ }
+}
+function irCopyDetachedComputedProperties(source,target,properties){
+  try{
+    if(!source||!target||!properties||!window.getComputedStyle)return;
+    var computed=window.getComputedStyle(source);
+    for(var i=0;i<properties.length;i++){
+      var value=computed.getPropertyValue(properties[i]);
+      if(value)target.style.setProperty(properties[i],value);
+    }
+  }catch(_){ }
+}
+function irCopyDetachedHoverPresentation(sourceWrapper,clone,sourceRoot,cloneRoot){
+  try{
+    var typography=['font-family','font-size','font-weight','font-style','font-variant','line-height','letter-spacing','color','text-align'];
+    var surface=typography.concat(['background-color']);
+    irCopyDetachedComputedProperties(sourceWrapper,clone,surface);
+    irCopyDetachedComputedProperties(sourceRoot,cloneRoot,surface);
+    var groups=[
+      {selector:'.hover-row,.hover-row-contents,.markdown-hover,.rendered-markdown,.code-hover-contents',properties:surface.concat(['display','flex-direction','align-items','justify-content','gap','padding-top','padding-right','padding-bottom','padding-left','margin-top','margin-right','margin-bottom','margin-left','border-top-color','border-top-style','border-top-width'])},
+      {selector:'.monaco-tokenized-source,pre,code',properties:surface.concat(['display','white-space','tab-size','padding-top','padding-right','padding-bottom','padding-left','margin-top','margin-right','margin-bottom','margin-left','border-radius'])},
+      {selector:'a',properties:['color','text-decoration-line','text-decoration-style']}
+    ];
+    var copied=0;
+    for(var gi=0;gi<groups.length&&copied<240;gi++){
+      var sources=sourceWrapper.querySelectorAll(groups[gi].selector);
+      var targets=clone.querySelectorAll(groups[gi].selector);
+      for(var ni=0;ni<sources.length&&ni<targets.length&&copied<240;ni++,copied++){
+        irCopyDetachedComputedProperties(sources[ni],targets[ni],groups[gi].properties);
+      }
+    }
+  }catch(_){ }
+}
+function irRehydrateDetachedVtails(sourceWrapper,clone,cloneRoot){
+  var renders=[];
+  try{
+    var sources=sourceWrapper.querySelectorAll?sourceWrapper.querySelectorAll('.ir-vtail-scroller'):[];
+    var targets=clone.querySelectorAll?clone.querySelectorAll('.ir-vtail-scroller'):[];
+    for(var i=0;i<sources.length&&i<targets.length;i++){
+      (function(sourceWrap,wrap){
+        var meta=sourceWrap&&sourceWrap.__irVtailSnapshot;
+        if(!meta||!meta.lines||!meta.lines.length)return;
+        var lines=meta.lines,total=meta.total||lines.length,lh=Number(meta.lh)||18;
+        var topSp=wrap.children&&wrap.children[0];
+        var win=wrap.querySelector?wrap.querySelector('.ir-vtail-window'):null;
+        var winCode=win&&win.querySelector?win.querySelector('code'):null;
+        var botSp=wrap.children&&wrap.children[wrap.children.length-1];
+        var scroller=(wrap.closest&&(wrap.closest('.monaco-scrollable-element')||cloneRoot))||cloneRoot;
+        if(!topSp||!winCode||!botSp||!scroller)return;
+        var lastS=-1,lastE=-1,pend=false,BUFFER=12;
+        function render(){
+          try{
+            if(!document.body.contains(wrap))return;
+            var scRect=scroller.getBoundingClientRect();
+            var wRect=wrap.getBoundingClientRect();
+            var scTop=scroller.scrollTop||0;
+            var vpH=scroller.clientHeight||scRect.height||400;
+            var tailOffset=(wRect.top-scRect.top)+scTop;
+            var relTop=scTop-tailOffset;
+            var start=Math.max(0,Math.floor(relTop/lh)-BUFFER);
+            var end=Math.min(total,Math.ceil((relTop+vpH)/lh)+BUFFER);
+            if(end<start)end=start;
+            if(start===lastS&&end===lastE)return;
+            lastS=start;lastE=end;
+            winCode.textContent=lines.slice(start,end).join('\\n');
+            topSp.style.height=Math.round(start*lh)+'px';
+            botSp.style.height=Math.round(Math.max(0,total-end)*lh)+'px';
+          }catch(_){ }
+        }
+        function onScroll(){
+          if(pend)return;
+          pend=true;
+          (window.requestAnimationFrame||function(fn){return setTimeout(fn,16);})(function(){pend=false;render();});
+        }
+        try{scroller.addEventListener('scroll',onScroll,{passive:true});}catch(_){ }
+        wrap.__irDetachedVtail={render:render,onScroll:onScroll,scroller:scroller,id:meta.id||''};
+        renders.push(render);
+      })(sources[i],targets[i]);
+    }
+  }catch(_){ }
+  return renders;
+}
+function irRootContainsMaybe(root,node){
+  try{return !!(root&&node&&(root===node||(root.contains&&root.contains(node))))}catch(_){return false}
+}
+function irClearHoverInteractionRefsForRoot(root,reason){
+  try{
+    if(!root)return;
+    if(irRootContainsMaybe(root,window.__irPointActiveLink))window.__irPointActiveLink=null;
+    var lastLink=window.__irLastTypeLinkAtPoint;
+    if(lastLink&&(lastLink.hover===root||irRootContainsMaybe(root,lastLink.link)||irRootContainsMaybe(root,lastLink.target)))window.__irLastTypeLinkAtPoint=null;
+    var near=window.__irNearLinkCache;
+    if(near&&(near.hover===root||irRootContainsMaybe(root,near.link)))window.__irNearLinkCache=null;
+    var pending=window.__irPendingLinkPointerDown;
+    if(pending&&(irRootContainsMaybe(root,pending.link)||irRootContainsMaybe(root,pending.target)))irClearPendingTypeLinkPointerDown(null,reason||'hover-release');
+    if(irRootContainsMaybe(root,window.__irLastPreviewTarget))window.__irLastPreviewTarget=null;
+  }catch(_){ }
+}
+function irRemoveDetachedHover(stateOrEl,reason){
+  try{
+    var state=stateOrEl&&stateOrEl.el?stateOrEl:irDetachedHoverStateFromElement(stateOrEl);
+    if(!state)return false;
+    if(window.__irHoverDragActive&&window.__irHoverDragActive.state===state)window.__irHoverDragActive=null;
+    if(window.__irHoverDragCandidate&&window.__irHoverDragCandidate.state===state){
+      irReleaseHoverDragPointerCapture(window.__irHoverDragCandidate);
+      window.__irHoverDragCandidate=null;
+    }
+    var list=window.__irDetachedHovers||[];
+    for(var i=list.length-1;i>=0;i--)if(list[i]===state)list.splice(i,1);
+    try{irClearHoverInteractionRefsForRoot(state.root,'detached-close');}catch(_){ }
+    try{
+      if(window.__irHistoryFor&&(window.__irHistoryFor===state.root||state.root.contains(window.__irHistoryFor)))irReleaseDrillHistoryForRoot(window.__irHistoryFor,'detached-close');
+      if(window.__irOriginalHoverSnapshot&&window.__irOriginalHoverSnapshot.hoverEl&&(window.__irOriginalHoverSnapshot.hoverEl===state.root||state.root.contains(window.__irOriginalHoverSnapshot.hoverEl)))window.__irOriginalHoverSnapshot=null;
+      var suppress=window.__irHoverDragClickSuppress;
+      if(suppress&&suppress.detached&&state.el.contains(suppress.detached))window.__irHoverDragClickSuppress=null;
+    }catch(_){ }
+    if(state.el&&state.el.parentNode)state.el.parentNode.removeChild(state.el);
+    state.el=null;
+    state.root=null;
+    state.vtailRenders=null;
+    irHERecord('hover-detached-closed',{reason:String(reason||'close'),remaining:list.length});
+    return true;
+  }catch(_){return false}
+}
+function irClearDetachedHovers(reason){
+  try{
+    if(window.__irDetachedClampFrame){try{cancelAnimationFrame(window.__irDetachedClampFrame)}catch(_){}window.__irDetachedClampFrame=0;}
+    if(window.__irHoverDragCandidate)irReleaseHoverDragPointerCapture(window.__irHoverDragCandidate);
+    var list=(window.__irDetachedHovers||[]).slice();
+    for(var i=0;i<list.length;i++)irRemoveDetachedHover(list[i],reason||'clear');
+    var layer=window.__irDetachedHoverLayer;
+    if(layer&&layer.parentNode)layer.parentNode.removeChild(layer);
+    window.__irDetachedHoverLayer=null;
+    window.__irDetachedHovers=[];
+    window.__irHoverDragCandidate=null;
+    window.__irHoverDragActive=null;
+    window.__irHoverDragClickSuppress=null;
+    return list.length;
+  }catch(_){return 0}
+}
+function irDetachedHoverSnapshot(){
+  try{
+    var list=window.__irDetachedHovers||[];
+    var windows=[];
+    for(var i=0;i<list.length;i++){
+      var state=list[i];
+      if(!state||!state.el)continue;
+      var rect=state.el.getBoundingClientRect?state.el.getBoundingClientRect():null;
+      var sc=state.root?irPrimaryHoverScroller(state.root):null;
+      windows.push({
+        id:state.id,
+        connected:!!(document.body&&document.body.contains(state.el)),
+        text:String((state.root&&state.root.textContent)||'').replace(/\\s+/g,' ').trim(),
+        rect:rect?{left:rect.left,top:rect.top,right:rect.right,bottom:rect.bottom,width:rect.width,height:rect.height}:null,
+        scrollTop:sc?Number(sc.scrollTop)||0:0,
+        scrollHeight:sc?Number(sc.scrollHeight)||0:0,
+        clientHeight:sc?Number(sc.clientHeight)||0:0,
+        capturedScrollTop:Number(state.capturedScrollTop)||0,
+        z:state.z||0,
+        dragging:!!(state.el.classList&&state.el.classList.contains('ir-detached-hover-dragging'))
+      });
+    }
+    return {count:windows.length,windows:windows,nativePinned:!!window.__irClickPinnedHover};
+  }catch(_){return {count:0,windows:[],error:true}}
+}
+function irCreateDetachedHoverSnapshot(pin){
+  try{
+    if(!pin||!pin.wrapper||!pin.root||!document.body.contains(pin.wrapper))return null;
+    var rect=pin.wrapper.getBoundingClientRect?pin.wrapper.getBoundingClientRect():null;
+    if(!rect||rect.width<60||rect.height<20)return null;
+    var sourcePrimaryScroller=irPrimaryHoverScroller(pin.root);
+    var primaryScrollTop=sourcePrimaryScroller?Number(sourcePrimaryScroller.scrollTop)||0:0;
+    var primaryScrollLeft=sourcePrimaryScroller?Number(sourcePrimaryScroller.scrollLeft)||0:0;
+    var scrollOffsets=irCaptureHoverScrollOffsets(pin.wrapper);
+    var clone=pin.wrapper.cloneNode(true);
+    if(!clone||!clone.classList)return null;
+    clone.classList.remove('monaco-resizable-hover','ir-click-pinned-hover','ir-flexible-hover-size','ir-hover-staging','ir-drill-hover');
+    clone.classList.add('ir-detached-hover');
+    clone.removeAttribute('data-ir-click-pinned-hover');
+    clone.removeAttribute('id');
+    var duplicateIds=clone.querySelectorAll?clone.querySelectorAll('[id]'):[];
+    for(var ii=0;ii<duplicateIds.length;ii++)duplicateIds[ii].removeAttribute('id');
+    var deadHandles=clone.querySelectorAll?clone.querySelectorAll('.monaco-sash,[class*="sash"],.scrollbar,.slider,.shadow,.scroll-decoration,.decorationsOverviewRuler'):[];
+    for(var hi=deadHandles.length-1;hi>=0;hi--){
+      try{if(deadHandles[hi].parentNode)deadHandles[hi].parentNode.removeChild(deadHandles[hi]);}catch(_){ }
+    }
+    var deadActions=clone.querySelectorAll?clone.querySelectorAll('.hover-copy-button,.verbosity-actions,.verbosity-actions-container,.hover-row > .actions,.hover-row .action-container'):[];
+    for(var ai=deadActions.length-1;ai>=0;ai--){
+      try{if(deadActions[ai].parentNode)deadActions[ai].parentNode.removeChild(deadActions[ai]);}catch(_){ }
+    }
+    var root=clone.querySelector?clone.querySelector('.monaco-hover,.monaco-editor-hover'):null;
+    if(!root)return null;
+    root.classList.remove('ir-click-pinned-hover','hidden','ir-native-released-hover','ir-stale-hover');
+    root.classList.add('ir-detached-hover-root');
+    root.removeAttribute('data-ir-click-pinned-hover');
+    root.removeAttribute('data-ir-native-released-hover');
+    root.removeAttribute('aria-hidden');
+    root.removeAttribute('hidden');
+    irCopyDetachedHoverPresentation(pin.wrapper,clone,pin.root,root);
+    var inactiveControls=clone.querySelectorAll?clone.querySelectorAll('a,button,input,textarea,select,[contenteditable="true"],[role="button"]'):[];
+    for(var ci=0;ci<inactiveControls.length;ci++){
+      var inactive=inactiveControls[ci];
+      inactive.setAttribute('tabindex','-1');
+      inactive.setAttribute('aria-disabled','true');
+      var inactiveTag=String(inactive.tagName||'').toLowerCase();
+      if(inactiveTag==='button'||inactiveTag==='input'||inactiveTag==='textarea'||inactiveTag==='select')inactive.disabled=true;
+      if(inactiveTag==='a'){inactive.removeAttribute('href');inactive.removeAttribute('data-href');}
+      if(inactive.hasAttribute&&inactive.hasAttribute('contenteditable'))inactive.setAttribute('contenteditable','false');
+    }
+    var close=document.createElement('button');
+    close.className='ir-detached-hover-close';
+    close.type='button';
+    close.setAttribute('aria-label','Close pinned hover');
+    close.setAttribute('title','Close pinned hover');
+    close.textContent='×';
+    clone.appendChild(close);
+    var seq=(Number(window.__irDetachedHoverSeq)||0)+1;
+    window.__irDetachedHoverSeq=seq;
+    clone.setAttribute('data-ir-detached-hover-id',String(seq));
+    clone.style.removeProperty('right');
+    clone.style.removeProperty('bottom');
+    clone.style.removeProperty('transform');
+    clone.style.setProperty('width',Math.round(rect.width)+'px','important');
+    clone.style.setProperty('height',Math.round(rect.height)+'px','important');
+    clone.style.setProperty('min-width',Math.round(rect.width)+'px','important');
+    clone.style.setProperty('min-height',Math.round(rect.height)+'px','important');
+    clone.style.setProperty('max-width',Math.round(rect.width)+'px','important');
+    clone.style.setProperty('max-height',Math.round(rect.height)+'px','important');
+    var state={
+      id:seq,
+      el:clone,
+      root:root,
+      width:Math.round(rect.width),
+      height:Math.round(rect.height),
+      naturalWidth:Math.round(rect.width),
+      naturalHeight:Math.round(rect.height),
+      left:Math.round(rect.left),
+      top:Math.round(rect.top),
+      z:0,
+      createdAt:Date.now(),
+      capturedScrollTop:(function(){
+        for(var si=0;si<scrollOffsets.length;si++)if(scrollOffsets[si].top)return scrollOffsets[si].top;
+        return 0;
+      })()
+    };
+    clone.__irDetachedHoverState=state;
+    var layer=irEnsureDetachedHoverLayer();
+    if(!layer)return null;
+    layer.appendChild(clone);
+    irFitDetachedHoverSizeToViewport(state);
+    irSetDetachedHoverPosition(state,rect.left,rect.top);
+    irBringDetachedHoverToFront(state);
+    var vtailRenders=irRehydrateDetachedVtails(pin.wrapper,clone,root);
+    state.vtailRenders=vtailRenders;
+    irRestoreHoverScrollOffsets(clone,scrollOffsets);
+    var clonePrimaryScroller=irPrimaryHoverScroller(root);
+    if(clonePrimaryScroller&&(primaryScrollTop||primaryScrollLeft)){
+      void clonePrimaryScroller.scrollHeight;
+      if(primaryScrollTop)clonePrimaryScroller.scrollTop=primaryScrollTop;
+      if(primaryScrollLeft)clonePrimaryScroller.scrollLeft=primaryScrollLeft;
+    }
+    for(var vr=0;vr<vtailRenders.length;vr++)try{vtailRenders[vr]();}catch(_){ }
+    try{requestAnimationFrame(function(){
+      if(!state.el||!state.root)return;
+      irRestoreHoverScrollOffsets(state.el,scrollOffsets);
+      var delayedScroller=irPrimaryHoverScroller(state.root);
+      if(delayedScroller){
+        if(primaryScrollTop)delayedScroller.scrollTop=primaryScrollTop;
+        if(primaryScrollLeft)delayedScroller.scrollLeft=primaryScrollLeft;
+      }
+      for(var vi=0;vi<vtailRenders.length;vi++)try{vtailRenders[vi]();}catch(_){ }
+    });}catch(_){ }
+    close.addEventListener('click',function(e){
+      try{e.preventDefault();e.stopImmediatePropagation();}catch(_){ }
+      irRemoveDetachedHover(state,'close-button');
+    });
+    var list=window.__irDetachedHovers||[];
+    list.push(state);
+    window.__irDetachedHovers=list;
+    while(list.length>IR_DETACHED_HOVER_MAX)irRemoveDetachedHover(list[0],'window-cap');
+    irHERecord('hover-detached-created',{id:seq,left:state.left,top:state.top,width:state.width,height:state.height,count:list.length});
+    return state;
+  }catch(_){return null}
+}
+function irNativeHoverPinSourceIsVisible(pin){
+  try{
+    if(!pin||!pin.wrapper||!document.body||!document.body.contains(pin.wrapper))return false;
+    var wrapperRect=pin.wrapper.getBoundingClientRect?pin.wrapper.getBoundingClientRect():null;
+    var root=pin.wrapper.querySelector?pin.wrapper.querySelector('.monaco-hover,.monaco-editor-hover'):pin.root;
+    var rootRect=root&&root.getBoundingClientRect?root.getBoundingClientRect():null;
+    if(!wrapperRect||wrapperRect.width<2||wrapperRect.height<2||!rootRect||rootRect.width<2||rootRect.height<2)return false;
+    var ws=window.getComputedStyle?window.getComputedStyle(pin.wrapper):null;
+    var rs=root&&window.getComputedStyle?window.getComputedStyle(root):null;
+    if((ws&&(ws.display==='none'||ws.visibility==='hidden'||Number(ws.opacity)===0))||(rs&&(rs.display==='none'||rs.visibility==='hidden'||Number(rs.opacity)===0)))return false;
+    return true;
+  }catch(_){return false}
+}
+function irNativeHoverControllerSourceIsVisible(controller,pin){
+  try{
+    var contentWidget=controller&&controller._contentWidget;
+    if(contentWidget){
+      var visible=contentWidget.isVisible;
+      if(typeof visible==='function')visible=visible.call(contentWidget);
+      if(typeof visible==='boolean')return visible;
+    }
+    if(controller&&typeof controller.isHoverVisible==='boolean')return controller.isHoverVisible;
+  }catch(_){ }
+  return irNativeHoverPinSourceIsVisible(pin);
+}
+function irNativeHoverWidgetSourceIsVisible(widget,pin){
+  try{
+    if(widget){
+      var visible=widget.isVisible;
+      if(typeof visible==='function')visible=visible.call(widget);
+      if(typeof visible==='boolean')return visible;
+    }
+  }catch(_){ }
+  return irNativeHoverPinSourceIsVisible(pin);
+}
+function irReleaseNativeHoverAfterDetach(pin){
+  try{
+    if(!pin)return;
+    var root=pin.root;
+    var controller=pin.controller;
+    irClearClickPinnedHover('drag-detach',false);
+    irClearHoverInteractionRefsForRoot(root,'drag-detach');
+    try{if(root&&root.blur)root.blur();}catch(_){ }
+    var hidden=false;
+    var directController=false;
+    var directWidget=false;
+    var directCapturedWidget=false;
+    try{
+      if(controller&&typeof controller.hideContentHover==='function'){
+        controller.hideContentHover();
+        directController=true;
+        hidden=!irNativeHoverControllerSourceIsVisible(controller,pin);
+      }
+    }catch(_){hidden=false}
+    try{
+      var contentWidget=controller&&controller._contentWidget;
+      if(!hidden&&contentWidget&&typeof contentWidget.hide==='function'){
+        contentWidget.hide();
+        directWidget=true;
+        hidden=!irNativeHoverControllerSourceIsVisible(controller,pin);
+      }
+    }catch(_){ }
+    try{
+      var capturedWidget=pin.widget;
+      if(!hidden&&capturedWidget&&typeof capturedWidget.hide==='function'){
+        capturedWidget.hide();
+        directCapturedWidget=true;
+        hidden=!irNativeHoverWidgetSourceIsVisible(capturedWidget,pin);
+      }
+    }catch(_){ }
+    try{
+      if(pin.editor&&typeof pin.editor.focus==='function')pin.editor.focus();
+      else if(pin.editorDom&&typeof pin.editorDom.focus==='function')pin.editorDom.focus({preventScroll:true});
+    }catch(_){ }
+    try{if(controller&&typeof controller._isMouseDown==='boolean')controller._isMouseDown=false;}catch(_){ }
+    if(!hidden)irRequestNativeHideHover('click-pin-drag-detach');
+    try{
+      if(window.__irActiveHoverEl===root){irStopActiveHoverHandleObserver();window.__irActiveHoverEl=null;}
+    }catch(_){ }
+    try{irReleaseDrillHistoryForRoot(root,'drag-detach');}catch(_){ }
+    irHERecord('hover-native-released-for-detached',{direct:!!hidden,directController:directController,directWidget:directWidget,directCapturedWidget:directCapturedWidget});
+  }catch(_){ }
+}
+function irHoverDragExcludedTarget(target){
+  try{
+    return !!(target&&target.closest&&target.closest('a,button,input,textarea,select,option,[contenteditable="true"],.ir-type-link,.monaco-sash,[class*="sash"],.scrollbar,.slider,.scroll-decoration'));
+  }catch(_){return false}
+}
+function irSetHoverDragPointerCapture(candidate,el){
+  try{
+    if(!candidate||candidate.pointerId===null||!el||typeof el.setPointerCapture!=='function')return false;
+    var previous=candidate.captureEl||null;
+    if(previous&&previous!==el&&typeof previous.releasePointerCapture==='function'){
+      try{
+        if(typeof previous.hasPointerCapture!=='function'||previous.hasPointerCapture(candidate.pointerId))previous.releasePointerCapture(candidate.pointerId);
+      }catch(_){ }
+    }
+    el.setPointerCapture(candidate.pointerId);
+    candidate.captureEl=el;
+    return true;
+  }catch(_){return false}
+}
+function irReleaseHoverDragPointerCapture(candidate){
+  try{
+    if(!candidate)return;
+    var el=candidate.captureEl;
+    candidate.captureEl=null;
+    if(!el||candidate.pointerId===null||typeof el.releasePointerCapture!=='function')return;
+    if(typeof el.hasPointerCapture!=='function'||el.hasPointerCapture(candidate.pointerId))el.releasePointerCapture(candidate.pointerId);
+  }catch(_){ }
+}
+function irCancelHoverDragCandidate(){
+  try{
+    var candidate=window.__irHoverDragCandidate;
+    var active=window.__irHoverDragActive;
+    window.__irHoverDragCandidate=null;
+    window.__irHoverDragActive=null;
+    irReleaseHoverDragPointerCapture(candidate);
+    if(active&&active.state&&active.state.el)active.state.el.classList.remove('ir-detached-hover-dragging');
+  }catch(_){ }
+}
+function irArmPinnedHoverDrag(pin,e,target){
+  try{
+    if(!pin||!e||irHoverDragExcludedTarget(target))return false;
+    if(typeof e.buttons==='number'&&(e.buttons&1)===0)return false;
+    var rect=pin.wrapper&&pin.wrapper.getBoundingClientRect?pin.wrapper.getBoundingClientRect():null;
+    if(!rect)return false;
+    var candidate={
+      kind:'native',pin:pin,state:null,
+      startX:Number(e.clientX)||0,startY:Number(e.clientY)||0,
+      originLeft:rect.left,originTop:rect.top,
+      pointerId:typeof e.pointerId==='number'?e.pointerId:null,captureEl:null
+    };
+    window.__irHoverDragCandidate=candidate;
+    irSetHoverDragPointerCapture(candidate,pin.wrapper);
+    return true;
+  }catch(_){return false}
+}
+function irArmDetachedHoverDrag(state,e,target){
+  try{
+    if(!state||!state.el||!e||irHoverDragExcludedTarget(target))return false;
+    if(typeof e.buttons==='number'&&(e.buttons&1)===0)return false;
+    var rect=state.el.getBoundingClientRect?state.el.getBoundingClientRect():null;
+    if(!rect)return false;
+    irBringDetachedHoverToFront(state);
+    var candidate={
+      kind:'detached',pin:null,state:state,
+      startX:Number(e.clientX)||0,startY:Number(e.clientY)||0,
+      originLeft:rect.left,originTop:rect.top,
+      pointerId:typeof e.pointerId==='number'?e.pointerId:null,captureEl:null
+    };
+    window.__irHoverDragCandidate=candidate;
+    irSetHoverDragPointerCapture(candidate,state.el);
+    return true;
+  }catch(_){return false}
+}
+function irHoverDragEventMatches(candidate,e){
+  try{
+    if(!candidate||!e)return false;
+    if(candidate.pointerId!==null&&typeof e.pointerId==='number'&&candidate.pointerId!==e.pointerId)return false;
+    return true;
+  }catch(_){return false}
+}
+function irHoverDragMove(e){
+  try{
+    if(window.PointerEvent&&e&&e.type==='mousemove')return;
+    var candidate=window.__irHoverDragCandidate;
+    if(!candidate||!irHoverDragEventMatches(candidate,e))return;
+    if(typeof e.buttons==='number'&&(e.buttons&1)===0){irHoverDragEnd(e);return;}
+    var x=Number(e.clientX)||0;
+    var y=Number(e.clientY)||0;
+    var dx=x-candidate.startX;
+    var dy=y-candidate.startY;
+    var active=window.__irHoverDragActive;
+    if(!active){
+      if((dx*dx)+(dy*dy)<IR_HOVER_DRAG_THRESHOLD_PX*IR_HOVER_DRAG_THRESHOLD_PX)return;
+      var state=candidate.state;
+      if(candidate.kind==='native'){
+        state=irCreateDetachedHoverSnapshot(candidate.pin);
+        if(!state){irCancelHoverDragCandidate();return;}
+        candidate.state=state;
+        irClearPendingTypeLinkPointerDown(null,'hover-drag-detach');
+        irReleaseNativeHoverAfterDetach(candidate.pin);
+      }
+      if(!state||!state.el||!document.body.contains(state.el)){irCancelHoverDragCandidate();return;}
+      active={state:state,candidate:candidate};
+      window.__irHoverDragActive=active;
+      state.el.classList.add('ir-detached-hover-dragging');
+      irBringDetachedHoverToFront(state);
+      irHERecord('hover-detached-drag-start',{id:state.id,kind:candidate.kind});
+    }
+    var nextLeft=candidate.originLeft+dx;
+    var nextTop=candidate.originTop+dy;
+    irSetDetachedHoverPosition(active.state,nextLeft,nextTop);
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }catch(_){ }
+}
+function irHoverDragEnd(e){
+  try{
+    if(window.PointerEvent&&e&&e.type==='mouseup')return;
+    var candidate=window.__irHoverDragCandidate;
+    if(!candidate)return;
+    if(e&&!irHoverDragEventMatches(candidate,e))return;
+    var active=window.__irHoverDragActive;
+    window.__irHoverDragCandidate=null;
+    window.__irHoverDragActive=null;
+    irReleaseHoverDragPointerCapture(candidate);
+    if(!active||!active.state)return;
+    if(active.state.el)active.state.el.classList.remove('ir-detached-hover-dragging');
+    var clickSuppress={
+      until:Date.now()+120,
+      x:e&&typeof e.clientX==='number'?e.clientX:null,
+      y:e&&typeof e.clientY==='number'?e.clientY:null,
+      detached:active.state.el||null
+    };
+    window.__irHoverDragClickSuppress=clickSuppress;
+    irSetTimer(function(){
+      if(window.__irHoverDragClickSuppress===clickSuppress)window.__irHoverDragClickSuppress=null;
+    },130);
+    irHERecord('hover-detached-drag-end',{id:active.state.id,left:active.state.left,top:active.state.top});
+    // Let the release continue through Monaco's native gesture handlers. The
+    // follow-up click is suppressed separately; swallowing pointerup would
+    // leave ContentHoverController/editor mouse-down bookkeeping stuck.
+  }catch(_){ }
+}
+function irSuppressHoverDragClick(e){
+  try{
+    if(e&&e.detail===0)return;
+    var suppress=window.__irHoverDragClickSuppress;
+    if(!suppress)return;
+    if(Date.now()>suppress.until){window.__irHoverDragClickSuppress=null;return;}
+    var target=irEventElement(e&&e.target);
+    var samePoint=typeof suppress.x==='number'&&typeof suppress.y==='number'&&typeof e.clientX==='number'&&typeof e.clientY==='number'
+      &&Math.abs(suppress.x-e.clientX)<=5&&Math.abs(suppress.y-e.clientY)<=5;
+    var matches=!!(target&&((suppress.detached&&suppress.detached.contains&&suppress.detached.contains(target))||samePoint));
+    if(!matches)return;
+    window.__irHoverDragClickSuppress=null;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }catch(_){ }
+}
+function irClampAllDetachedHovers(){
+  try{
+    if(window.__irDetachedClampFrame)return;
+    window.__irDetachedClampFrame=(window.requestAnimationFrame||function(fn){return setTimeout(fn,16);})(function(){
+      window.__irDetachedClampFrame=0;
+      var list=window.__irDetachedHovers||[];
+      for(var i=0;i<list.length;i++)if(list[i]&&list[i].el){
+        irFitDetachedHoverSizeToViewport(list[i]);
+        irSetDetachedHoverPosition(list[i],list[i].left,list[i].top);
+      }
+      for(var wi=0;wi<list.length;wi++)if(list[wi]&&list[wi].el){
+        var renders=list[wi].vtailRenders||[];
+        for(var ri=0;ri<renders.length;ri++)try{renders[ri]();}catch(_){ }
+      }
+    });
+  }catch(_){ }
+}
+function irHoverDragSnapshot(){
+  try{
+    var suppress=window.__irHoverDragClickSuppress;
+    return {
+      candidate:!!window.__irHoverDragCandidate,
+      active:!!window.__irHoverDragActive,
+      clickSuppressed:!!(suppress&&Date.now()<=suppress.until)
+    };
+  }catch(_){return {candidate:false,active:false,clickSuppressed:false,error:true}}
+}
+
+// L138: click-to-pin stays entirely on VS Code's native hover path until a
+// drag crosses the threshold. The
 // focused HoverWidget is already kept by ContentHoverController on editor
 // mousemove; its public shouldKeepOpenOnEditorMouseMoveOrLeave flag covers the
 // editor-leave path. ContentHoverWidgetWrapper also owns one direct
@@ -4636,10 +5356,11 @@ track(window,'blur',irFinishFlexibleHoverResize,true);
 // swallowed and no visibility/position is written by us.
 function irHoverPinOwnerForWrapper(wrapper){
   try{
-    if(!wrapper)return {controller:null,editor:null,editorDom:null};
+    if(!wrapper)return {controller:null,widget:null,editor:null,editorDom:null};
     if(wrapper.__irHoverPinController){
       return {
         controller:wrapper.__irHoverPinController,
+        widget:wrapper.__irHoverPinWidget||null,
         editor:wrapper.__irHoverPinEditor||null,
         editorDom:wrapper.__irHoverPinEditorDom||null
       };
@@ -4652,7 +5373,7 @@ function irHoverPinOwnerForWrapper(wrapper){
           ? ed.getContribution('editor.contrib.contentHover')
           : null;
         var editorDom=ed&&typeof ed.getDomNode==='function'?ed.getDomNode():null;
-        return {controller:controller||null,editor:ed,editorDom:editorDom};
+        return {controller:controller||null,widget:widget,editor:ed,editorDom:editorDom};
       }catch(_){return null}
     }
     var captured=window.__irCapturedHoverWidget;
@@ -4686,7 +5407,7 @@ function irHoverPinOwnerForWrapper(wrapper){
       }catch(_){}
     }
   }catch(_){}
-  return {controller:null,editor:null,editorDom:null};
+  return {controller:null,widget:null,editor:null,editorDom:null};
 }
 function irFocusClickPinnedHover(pin){
   try{
@@ -4720,6 +5441,7 @@ function irPinNativeHoverRoot(root,controllerOverride){
       root:root,
       wrapper:wrapper,
       controller:controller,
+      widget:owner.widget||null,
       editor:owner.editor||null,
       editorDom:owner.editorDom||null,
       previousKeepOpen:controller?!!controller.shouldKeepOpenOnEditorMouseMoveOrLeave:false,
@@ -4771,16 +5493,33 @@ function irClearClickPinnedHover(reason,requestHide){
 function irClickPinPointerDown(e){
   try{
     if(!IR_HOVER_NATIVE_ONLY||!e)return;
+    if(window.PointerEvent&&e.type==='mousedown')return;
     if(typeof e.button==='number'&&e.button!==0)return;
     var target=irEventElement(e.target);
+    var detached=irDetachedHoverStateFromElement(target);
+    if(detached){
+      irCancelHoverDragCandidate();
+      irBringDetachedHoverToFront(detached);
+      if(target&&target.closest&&target.closest('.ir-detached-hover-close')){
+        irRemoveDetachedHover(detached,'close-pointerdown');
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        return;
+      }
+      irArmDetachedHoverDrag(detached,e,target);
+      return;
+    }
     var current=window.__irClickPinnedHover;
     if(current){
       if(current.wrapper&&target&&current.wrapper.contains(target)){
         var liveRoot=current.wrapper.querySelector?current.wrapper.querySelector('.monaco-hover,.monaco-editor-hover'):current.root;
         if(liveRoot)current.root=liveRoot;
         irFocusClickPinnedHover(current);
+        irCancelHoverDragCandidate();
+        irArmPinnedHoverDrag(current,e,target);
         return;
       }
+      irCancelHoverDragCandidate();
       irClearClickPinnedHover('outside-pointerdown',true);
       return;
     }
@@ -4791,7 +5530,8 @@ function irClickPinPointerDown(e){
     var wrapper=target.closest('.monaco-resizable-hover');
     if(!root&&wrapper&&wrapper.querySelector)root=wrapper.querySelector('.monaco-hover,.monaco-editor-hover');
     if(!root||!wrapper)return;
-    irPinNativeHoverRoot(root,null);
+    var pin=irPinNativeHoverRoot(root,null);
+    if(pin){irCancelHoverDragCandidate();irArmPinnedHoverDrag(pin,e,target);}
   }catch(_){}
 }
 function irClickPinnedHoverLeaveGuard(e){
@@ -4815,12 +5555,24 @@ function irClickPinnedHoverSnapshot(){
       wrapperMarked:!!(pin.wrapper&&pin.wrapper.classList&&pin.wrapper.classList.contains('ir-click-pinned-hover')),
       rootMarked:!!(root&&root.classList&&root.classList.contains('ir-click-pinned-hover')),
       focused:!!(root&&(document.activeElement===root||(root.contains&&root.contains(document.activeElement)))),
-      controllerKeepOpen:!!(pin.controller&&pin.controller.shouldKeepOpenOnEditorMouseMoveOrLeave)
+      controllerKeepOpen:!!(pin.controller&&pin.controller.shouldKeepOpenOnEditorMouseMoveOrLeave),
+      detachedCount:(window.__irDetachedHovers||[]).length
     };
   }catch(_){return {pinned:false,error:true}}
 }
 track(window,'pointerdown',irClickPinPointerDown,true);
 track(window,'mousedown',irClickPinPointerDown,true);
+track(window,'pointermove',irHoverDragMove,true);
+track(window,'mousemove',irHoverDragMove,true);
+track(window,'pointerup',irHoverDragEnd,true);
+track(window,'mouseup',irHoverDragEnd,true);
+track(window,'pointercancel',irHoverDragEnd,true);
+// A capture-phase window blur listener also sees focus leaving the native
+// hover root. Detach deliberately blurs that root, so listen in the normal
+// phase and react only when the window itself loses focus.
+track(window,'blur',irHoverDragEnd,false);
+track(window,'click',irSuppressHoverDragClick,true);
+track(window,'resize',irClampAllDetachedHovers,true);
 track(window,'mouseleave',irClickPinnedHoverLeaveGuard,true);
 track(window,'pointerleave',irClickPinnedHoverLeaveGuard,true);
 
@@ -4828,6 +5580,9 @@ track(window,'pointerleave',irClickPinnedHoverLeaveGuard,true);
 // logic can't fire before our click handler — some hover widgets
 // dismiss on mousedown outside the editor.
 function irTypeLinkPointerDown(e){
+  // Detached hovers are immutable painted snapshots. Their cloned links must
+  // not schedule a drill action or reconnect the released native history.
+  if(irIsDetachedHoverElement(e&&e.target))return;
   // L94 (2026-05-31): native mode — a pointerdown on VS Code's native resize sash must NOT be
   // treated as an outside-click. The no-link branch below calls irDisposeActiveHoverForEditorTarget,
   // so grabbing the resize handle instantly dismissed the hover. Bow out so native resize runs.
@@ -4863,6 +5618,7 @@ track(document,'mousedown',irTypeLinkPointerDown,true);
 
 function irTypeLinkHoverIntent(e){
   try{
+    if(irIsDetachedHoverElement(e&&e.target))return;
     var directLink=irClosestTypeLink(e&&e.target);
     var wrappedLink=null;
     if(!directLink)wrappedLink=irWrapWordAtPoint(e);
@@ -5482,7 +6238,7 @@ function irHoverGuard(e){
     // interference, no lifecycle management. cf. project_native_hover_only_switch.
     try{
       if(e&&(e.type==='pointermove'||e.type==='mousemove'||e.type==='pointerover'||e.type==='mouseover')
-        &&irClosestHover(e.target)){
+        &&!irIsDetachedHoverElement(e.target)&&irClosestHover(e.target)){
         // L127 (2026-06-01): coalesce the on-demand wrap. pointermove+mousemove fire for the SAME
         // physical move (2x at identical coords) and reading-jitter fires many at ~one spot;
         // irWrapWordAtPoint does DOM range/word/validate work on each call (point-wrap fired 120x +
@@ -5958,11 +6714,11 @@ function irAuditHoverSize(hoverEl){
 }
 function irActiveHoverRoot(){
   var active=window.__irActiveHoverEl;
-  if(active&&document.body.contains(active))return active;
+  if(active&&document.body.contains(active)&&!irIsDetachedHoverRoot(active))return active;
   var roots=document.querySelectorAll('.monaco-hover, .monaco-editor-hover');
   var best=null,bestText=-1;
   for(var i=0;i<roots.length;i++){
-    if(!document.body.contains(roots[i]))continue;
+    if(!document.body.contains(roots[i])||irIsDetachedHoverRoot(roots[i]))continue;
     var len=String(roots[i].textContent||'').trim().length;
     if(len>=bestText){best=roots[i];bestText=len}
   }
@@ -6846,7 +7602,7 @@ function irIsSyntheticHoverRoot(root){
 }
 function irIsWorkbenchHoverRoot(root){
   try{
-    return !!(root&&root.classList&&root.classList.contains('workbench-hover'));
+    return !!(root&&((root.classList&&root.classList.contains('workbench-hover'))||irIsDetachedHoverRoot(root)));
   }catch(_){return false}
 }
 function irIsNativeHoverRoot(root){
@@ -7407,7 +8163,7 @@ function irIsTransientHoverText(text){
 }
 function irTouchHoverRootContent(root,reason,text){
   try{
-    if(!root)return;
+    if(!root||irIsDetachedHoverRoot(root))return;
     var now=Date.now();
     // L36: cheap signature pre-check. Mutation bursts call this dozens
     // of times per drill paint, and each call extracted root.textContent
@@ -7481,7 +8237,7 @@ function irTouchHoverRootContent(root,reason,text){
   }catch(_){}
 }
 function irActivateHoverRoot(root,reason){
-  if(!root||irIsStaleHoverRoot(root))return false;
+  if(!root||irIsStaleHoverRoot(root)||irIsDetachedHoverRoot(root))return false;
   if(irIsWorkbenchHoverRoot(root))return false;
   try{
     try{
@@ -7661,6 +8417,7 @@ function irShouldKeepRecentPendingHoverRoot(root,activeHover,pendingKeepRoot){
 function irShouldProcessHoverBlock(hoverHost,block){
   if(!hoverHost)return true;
   try{
+    if(irIsDetachedHoverRoot(hoverHost))return false;
     // L12+L17+L18: skip hovers we should not be scanning.
     // L18 (state-based, time-agnostic): non-renderable hovers that are
     // not the currently active hover can be skipped immediately. The
@@ -7980,6 +8737,7 @@ function irDisposeStaleHover(hoverEl,reason){
 }
 function irSetActiveHoverLayer(hoverEl){
   if(!hoverEl)return;
+  if(irIsDetachedHoverRoot(hoverEl))return;
   if(!irIsRenderableHoverRoot(hoverEl)){
     if(window.__irHiddenActiveHoverLogCount<80){
       window.__irHiddenActiveHoverLogCount++;
@@ -8496,6 +9254,7 @@ function irWrapTextNodeWord(node,info){
   return span;
 }
 function irWrapWordAtPoint(e){
+  if(irIsDetachedHoverElement(e&&e.target))return null;
   var hover=irClosestHover(e&&e.target);
   if(!hover){irSetPointActiveLink(null);irLogPointWrapReject(e,'no-hover','');return null}
   var directLink=irClosestTypeLink(e&&e.target);
@@ -9064,6 +9823,11 @@ function irApplyHoverSizeTier(hoverEl,fallbackTextLength,resetScroll){
 }
 
 function irTypeLinkClick(e){
+  if(irIsDetachedHoverElement(e&&e.target)){
+    var detachedLink=irClosestTypeLink(e&&e.target);
+    if(detachedLink)try{e.preventDefault();e.stopImmediatePropagation();}catch(_){ }
+    return;
+  }
   var directLink=irClosestTypeLink(e.target);
   var wrappedLink=null;
   if(!directLink)wrappedLink=irWrapWordAtPoint(e);
@@ -9096,6 +9860,11 @@ function irClosestBackControl(target){
 function irBackControlPointerDown(e){
   var back=irClosestBackControl(e.target);
   if(!back)return;
+  if(irIsDetachedHoverElement(back)){
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    return;
+  }
   irMarkHoverManaged(irClosestHover(back),true);
   e.preventDefault();
   e.stopImmediatePropagation();
@@ -9103,6 +9872,11 @@ function irBackControlPointerDown(e){
 function irBackControlClick(e){
   var back=irClosestBackControl(e.target);
   if(!back)return;
+  if(irIsDetachedHoverElement(back)){
+    e.preventDefault();
+    e.stopImmediatePropagation();
+    return;
+  }
   irMarkHoverManaged(irClosestHover(back),true);
   e.preventDefault();
   e.stopImmediatePropagation();
@@ -9189,6 +9963,10 @@ window.__irTestHooks={
   pinNativeHoverRoot:irPinNativeHoverRoot,
   clearClickPinnedHover:irClearClickPinnedHover,
   clickPinnedHoverSnapshot:irClickPinnedHoverSnapshot,
+  detachedHoverSnapshot:irDetachedHoverSnapshot,
+  hoverDragSnapshot:irHoverDragSnapshot,
+  clearDetachedHovers:irClearDetachedHovers,
+  removeDetachedHover:irRemoveDetachedHover,
   hoverBoxCornerSnapshot:irHoverBoxCornerSnapshot,
   disposeStaleHover:irDisposeStaleHover,
   removeInactiveHoverArtifacts:irRemoveInactiveHoverArtifacts,
@@ -9769,12 +10547,14 @@ window.irApplyPreview=function(typeName,md,fromBack,restoreScroll){
   irLog('renderer: irApplyPreview "'+typeName+'" md='+md.length+'B'+(fromBack?' [back]':''));
   var prePruneTarget=irNormalizePreviewTarget(window.__irLastPreviewTarget);
   var prePruneHover=prePruneTarget&&prePruneTarget.closest?prePruneTarget.closest('.monaco-hover, .monaco-editor-hover'):null;
+  if(prePruneHover&&irIsDetachedHoverRoot(prePruneHover)){prePruneTarget=null;prePruneHover=null;}
   if(prePruneHover&&document.body&&document.body.contains(prePruneHover)
     &&irHoverHasManagedContent(prePruneHover)&&!irIsRenderableHoverRoot(prePruneHover)){
     irForcePreviewHoverVisible(prePruneHover,'apply-pre-prune');
   }
   irPruneDetachedHoverState();
   var target=irNormalizePreviewTarget(window.__irLastPreviewTarget);
+  if(target&&irIsDetachedHoverElement(target))target=null;
   var src='stored';
   if((!target||!document.body.contains(target))&&prePruneTarget&&document.body&&document.body.contains(prePruneTarget)){
     target=prePruneTarget;
@@ -9796,6 +10576,7 @@ window.irApplyPreview=function(typeName,md,fromBack,restoreScroll){
     if(!target){
       var nodes=document.querySelectorAll('.monaco-hover .rendered-markdown.ir-applied, .monaco-editor-hover .rendered-markdown.ir-applied, .monaco-hover .rendered-markdown, .monaco-editor-hover .rendered-markdown');
       for(var i=nodes.length-1;i>=0;i--){
+        if(irIsDetachedHoverElement(nodes[i]))continue;
         if(nodes[i].offsetParent!==null){target=irNormalizePreviewTarget(nodes[i]);break}
       }
     }
@@ -10169,7 +10950,7 @@ window.irShowHoverFallback=function(identifier,md,opts){
     var existing=null;
     for(var i=0;i<roots.length;i++){
       var h=roots[i];
-      if(!h||!document.body.contains(h)||irIsStaleHoverRoot(h))continue;
+      if(!h||!document.body.contains(h)||irIsStaleHoverRoot(h)||irIsDetachedHoverRoot(h))continue;
       var visibility=irHoverRootVisibility(h);
       var hText=String(h.textContent||'');
       if(visibility&&visibility.visible&&hText.indexOf(identifier)>=0&&hText.length>40){
@@ -10220,7 +11001,7 @@ window.irShowHoverFallback=function(identifier,md,opts){
     try{ window.__irNativeHoverRefireUntil=Date.now()+1800; }catch(_){}
     for(var ri=0;ri<roots.length;ri++){
       var rootOld=roots[ri];
-      if(!rootOld||!document.body.contains(rootOld))continue;
+      if(!rootOld||!document.body.contains(rootOld)||irIsDetachedHoverRoot(rootOld))continue;
       try{
         if(rootOld.getAttribute&&rootOld.getAttribute('data-ir-forced-hover')==='1'){
           if(rootOld.parentNode)rootOld.parentNode.removeChild(rootOld);
@@ -10509,7 +11290,7 @@ function irDiagnoseUnwrappedHovers(){
     var hovers=document.querySelectorAll('.monaco-hover, .monaco-editor-hover');
     for(var i=0;i<hovers.length;i++){
       var h=hovers[i];
-      if(!h||!document.body.contains(h))continue;
+      if(!h||!document.body.contains(h)||irIsDetachedHoverRoot(h))continue;
       var text=String(h.textContent||'').replace(/\s+/g,' ').trim();
       if(text.length<10)continue;
       var hasWrap=!!(h.closest&&h.closest('.monaco-resizable-hover'));
@@ -10670,6 +11451,7 @@ function irRenderVtailWindowed(block,tailText,id){
     var lh=18;try{var h=win.getBoundingClientRect().height;if(h>0)lh=h/probeN;}catch(_){}
     if(!(lh>=6&&lh<=60))lh=18;
     var BUFFER=12;var lastS=-1,lastE=-1;
+    wrap.__irVtailSnapshot={id:id,lines:lines,total:total,lh:lh};
     function render(){
       try{
         if(!document.body.contains(wrap))return;
@@ -10734,6 +11516,7 @@ function irScanRenderedMarkdown(){
       var preBlock=containers[pre];
       if(!document.body.contains(preBlock))continue;
       var preHost=preBlock.closest('.monaco-hover, .monaco-editor-hover');
+      if(preHost&&irIsDetachedHoverRoot(preHost))continue;
       // L32 viewport gate before the expensive textContent read.
       if(preHost&&!irIsBlockVisibleInHover(preBlock,preHost))continue;
       var preText=preBlock.textContent||'';
@@ -10748,6 +11531,7 @@ function irScanRenderedMarkdown(){
   for(var j=0;j<containers.length;j++){var block=containers[j];
     if(!document.body.contains(block))continue;
     var hoverHost=block.closest('.monaco-hover, .monaco-editor-hover');
+    if(hoverHost&&irIsDetachedHoverRoot(hoverHost))continue;
     if(!irShouldProcessHoverBlock(hoverHost,block))continue;
     // L32 viewport gate: skip offscreen blocks BEFORE the expensive
     // textContent read. Always allow blocks without an enclosing hover
@@ -11098,7 +11882,7 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
   var seenHovers=null;
   var seenScan=false;
   function touchOnce(hover,reason,el){
-    if(!hover)return;
+    if(!hover||irIsDetachedHoverRoot(hover))return;
     if(!seenHovers)seenHovers=new Set?new Set():null;
     if(seenHovers&&seenHovers.has(hover))return;
     if(seenHovers)seenHovers.add(hover);
@@ -11132,10 +11916,13 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
     var target=mut.target;
     var targetEl=target&&(target.nodeType===1?target:target.parentElement);
     if(targetEl&&targetEl.closest&&targetEl.closest('.rendered-markdown,.monaco-hover,.monaco-editor-hover,.ij-find-hover-tooltip')){
+      var targetDetached=false;
       try{
         var targetHover=targetEl.closest('.monaco-hover,.monaco-editor-hover');
-        touchOnce(targetHover,'mutation-'+(mut.type||'target'),targetEl);
+        targetDetached=!!(targetHover&&irIsDetachedHoverRoot(targetHover));
+        if(!targetDetached)touchOnce(targetHover,'mutation-'+(mut.type||'target'),targetEl);
       }catch(_){}
+      if(targetDetached)continue;
       seenScan=true;
       continue;
     }
@@ -11147,6 +11934,7 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
         try{
           var nodeHover=n.closest?n.closest('.monaco-hover,.monaco-editor-hover'):null;
           if(!nodeHover&&n.querySelector)nodeHover=n.querySelector('.monaco-hover,.monaco-editor-hover');
+          if(nodeHover&&irIsDetachedHoverRoot(nodeHover))continue;
           touchOnce(nodeHover,'mutation-query',n);
         }catch(_){}
         seenScan=true;

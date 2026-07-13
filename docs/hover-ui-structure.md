@@ -145,6 +145,24 @@ Stable native dismissal, active-wrapper replacement, and patch cleanup also
 clear stale pin state so the shared hover widget cannot carry a pin into a new
 session.
 
+Once pointer movement crosses the 5 px drag threshold, the visible hover is
+promoted to an independent `.ir-detached-hover` snapshot. Its viewport
+position, size, rendered content, and scroll offset are copied before the
+native pin is cleared. The owning controller is then hidden directly (with the
+normal `editor.action.hideHover` request as fallback), returning VS Code's
+single reusable hover widget for the next symbol. This is the transition that
+allows multiple moved hover windows to coexist.
+
+Detached windows are isolated from native-hover activation, markdown rescans,
+history, and wrapper-layout observers. They can be dragged again, are clamped
+to an 8 px viewport gutter, and remain until their `×` control closes them or
+the renderer patch is cleaned up. At most 12 detached windows are retained;
+creating another closes the oldest snapshot to bound large-hover DOM memory.
+They are intentionally read-only: cloned links, copy actions, and form controls
+are disabled, while scrolling, window dragging, and the `×` control remain
+active. Large virtualized hover tails get their own scroll renderer so moving a
+window does not freeze it at the lines that happened to be visible at detach.
+
 ## Box-corner contract (what the golden E2E checks)
 
 For each captured hover sample we check:

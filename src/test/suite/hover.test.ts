@@ -4902,7 +4902,7 @@ suite('Hover Symbol Coverage E2E', () => {
 suite('Hover Renderer E2E', () => {
   const lang = getFixtureLang();
 
-  test(`[${lang}] hover click pin persists until an outside click`, async function () {
+  test(`[${lang}] hover click pin supports draggable multiple windows`, async function () {
     if (lang !== 'python') { this.skip(); return; }
     this.timeout(120000);
     await ensureExtensionCommandsReady('intellisenseRecursion.runHoverRendererHarnessForTests');
@@ -4941,6 +4941,105 @@ suite('Hover Renderer E2E', () => {
       `Outside click should remove the hover-root pin marker. ${JSON.stringify(pin)}`);
     assert.ok((pin.afterOutside.hidePayloads || []).some((payload: string) => payload.startsWith('HIDE_HOVER:click-pin-')),
       `Outside click should request the normal native hide path. ${JSON.stringify(pin)}`);
+
+    const drag = result?.detachedHoverDrag;
+    assert.strictEqual(drag?.ok, true,
+      `Detached-hover drag probe should complete. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.belowThreshold?.pin?.pinned, true,
+      `Movement below the drag threshold should keep the native click pin. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.belowThreshold?.detached?.count, 0,
+      `Movement below the threshold must not create a detached window. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.belowThreshold?.controllerValue, true,
+      `The native keep-open flag should remain enabled below threshold. ${JSON.stringify(drag)}`);
+
+    assert.strictEqual(drag.afterFirstDrag?.count, 1,
+      `Crossing the threshold should create one detached hover window. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterFirstDrag?.nativePin?.pinned, false,
+      `Drag start should release the singleton native hover pin immediately. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterFirstDrag?.controllerValue, false,
+      `Drag start should restore VS Code's native keep-open flag. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterFirstDrag?.directHideCalls, 1,
+      `The preferred controller hideContentHover path should release the first native hover exactly once. ${JSON.stringify(drag)}`);
+    assert.deepStrictEqual(drag.afterFirstDrag?.hidePayloads, [],
+      `A successful direct controller release must not emit the HIDE_HOVER fallback. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterFirstDrag?.sourceMarked, false,
+      `The released native wrapper must lose its pin marker. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterFirstDrag?.rootMarked, false,
+      `The released native hover root must lose its pin marker. ${JSON.stringify(drag)}`);
+    const firstDetached = drag.afterFirstDrag?.windows?.[0];
+    assert.ok(firstDetached?.connected && firstDetached?.text?.includes('DragFirstModel'),
+      `The detached window should retain the first hover's painted content. ${JSON.stringify(drag)}`);
+    assert.ok((firstDetached?.rect?.left || 0) >= (drag.belowThreshold?.sourceRect?.left || 0) + 35
+      && (firstDetached?.rect?.top || 0) >= (drag.belowThreshold?.sourceRect?.top || 0) + 24,
+    `The detached window should follow the pointer delta. ${JSON.stringify(drag)}`);
+    assert.ok((drag.belowThreshold?.sourceScroll?.top || 0) >= 30
+      && Math.abs((firstDetached?.scrollTop || 0) - drag.belowThreshold.sourceScroll.top) <= 1,
+      `Detaching should preserve the native hover's scroll position. ${JSON.stringify(drag)}`);
+    const stopped = drag.afterPointerUpMove?.windows?.find((row: any) => row.id === firstDetached?.id);
+    assert.ok(stopped?.rect && drag.firstStableRect
+      && Math.abs(stopped.rect.left - drag.firstStableRect.left) <= 1
+      && Math.abs(stopped.rect.top - drag.firstStableRect.top) <= 1,
+    `Pointer movement after pointerup must not keep moving the window. ${JSON.stringify(drag)}`);
+
+    assert.strictEqual(drag.secondPin?.pinned, true,
+      `Once the first drag starts, a second native hover must be pinnable. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.sameNativeWrapperReused, true,
+      `The first snapshot must survive repainting and reusing the same native hover widget for a second symbol. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.secondPin?.detachedCount, 1,
+      `Pinning the second native hover must retain the first detached window. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.secondPin?.controllerValue, true,
+      `The second native hover should own an independent keep-open episode. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterSecondDrag?.count, 2,
+      `Dragging a second hover should leave two simultaneous windows. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterSecondDrag?.nativePin?.pinned, false,
+      `The native hover slot should be free again after the second drag starts. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterSecondDrag?.controllerValue, false,
+      `The second keep-open flag should be restored after detaching. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterSecondDrag?.directHideCalls, 0,
+      `The fallback-only controller must not report a direct hide call. ${JSON.stringify(drag)}`);
+    assert.deepStrictEqual(drag.afterSecondDrag?.hidePayloads, ['HIDE_HOVER:click-pin-drag-detach'],
+      `The controller without hideContentHover should release through exactly one fallback request. ${JSON.stringify(drag)}`);
+    const simultaneousTexts = (drag.afterSecondDrag?.windows || []).map((row: any) => row.text || '');
+    assert.ok(simultaneousTexts.some((text: string) => text.includes('DragFirstModel'))
+      && simultaneousTexts.some((text: string) => text.includes('DragSecondModel')),
+    `Both independently painted hover contents should remain visible. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.duringLostButtonsDrag?.dragState?.candidate, true,
+      `Crossing the threshold should leave a live drag candidate until button loss is observed. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.duringLostButtonsDrag?.dragState?.active, true,
+      `Crossing the threshold should mark the detached drag active. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.duringLostButtonsDrag?.dragState?.draggingCount, 1,
+      `The active detached window should carry the dragging marker. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterLostButtonsMove?.dragState?.candidate, false,
+      `A move with buttons=0 must recover from a missed pointerup and clear the candidate. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterLostButtonsMove?.dragState?.active, false,
+      `A move with buttons=0 must clear the active drag. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterLostButtonsMove?.dragState?.draggingCount, 0,
+      `A move with buttons=0 must remove the dragging marker. ${JSON.stringify(drag)}`);
+    const firstAfterLostButtons = drag.afterLostButtonsMove?.windows?.find((row: any) => row.id === firstDetached?.id);
+    assert.ok(drag.redraggedFirst?.rect && firstAfterLostButtons?.rect
+      && drag.redraggedFirst.rect.left >= firstAfterLostButtons.rect.left + 24
+      && drag.redraggedFirst.rect.top >= firstAfterLostButtons.rect.top + 20,
+    `A detached hover should be draggable again after missed-pointerup recovery. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterRedrag?.dragState?.candidate, false,
+      `The recovery re-drag should finish without a stale candidate. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterRedrag?.dragState?.active, false,
+      `The recovery re-drag should finish without stale active state. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.afterClose?.count, 1,
+      `The close control should remove only its own detached window. ${JSON.stringify(drag)}`);
+    assert.ok(drag.afterClose?.windows?.[0]?.text?.includes('DragFirstModel'),
+      `Closing the second window should leave the first one intact. ${JSON.stringify(drag)}`);
+    assert.deepStrictEqual(drag.hidePayloads, ['HIDE_HOVER:click-pin-drag-detach'],
+      `Only the controller without hideContentHover should use the native-hide fallback. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.cleanupState?.candidate, false,
+      `clearDetachedHovers should clear any drag candidate. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.cleanupState?.active, false,
+      `clearDetachedHovers should clear active drag state. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.cleanupState?.clickSuppress, false,
+      `clearDetachedHovers should clear the delayed drag-click suppressor. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.cleanupState?.draggingCount, 0,
+      `clearDetachedHovers should leave no dragging markers. ${JSON.stringify(drag)}`);
+    assert.strictEqual(drag.cleanupState?.detached?.count, 0,
+      `clearDetachedHovers should remove every detached window. ${JSON.stringify(drag)}`);
   });
 
   test(`[${lang}] native sash enables viewport-safe flexible hover resizing`, async function () {

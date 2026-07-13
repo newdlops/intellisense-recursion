@@ -3736,6 +3736,11 @@ async function cleanupRendererTestArtifactsAcrossWindowsForTests(): Promise<void
   }
   const cleanupRendererExpr = `
     (function(){
+      try {
+        if (window.__irTestHooks && typeof window.__irTestHooks.clearDetachedHovers === 'function') {
+          window.__irTestHooks.clearDetachedHovers('test-artifact-cleanup');
+        }
+      } catch (_) {}
       var selectors=[
         '.ir-test-seeded-hover',
         '.ir-e2e-hover',
@@ -3751,6 +3756,9 @@ async function cleanupRendererTestArtifactsAcrossWindowsForTests(): Promise<void
         '.ir-e2e-dedupe-hover',
         '.ir-e2e-dedupe-sentinel',
         '.ir-e2e-sticky-far-target',
+        '.ir-e2e-hover-drag-source',
+        '.ir-detached-hover',
+        '.ir-detached-hover-layer',
         '[data-ir-e2e-artifact="1"]'
       ];
       var nodes=document.querySelectorAll(selectors.join(','));
@@ -4251,6 +4259,217 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
         try { outside.parentNode && outside.parentNode.removeChild(outside); } catch (_) {}
         return { afterPin: afterPin, afterMove: afterMove, afterOutside: afterOutside };
       }
+      function detachedHoverDragProbe() {
+        try { if (hooks.clearDetachedHovers) hooks.clearDetachedHovers('e2e-start'); } catch (_) {}
+        function dragStateSnapshot() {
+          return {
+            candidate: !!window.__irHoverDragCandidate,
+            active: !!window.__irHoverDragActive,
+            clickSuppress: !!window.__irHoverDragClickSuppress,
+            draggingCount: document.querySelectorAll('.ir-detached-hover-dragging').length
+          };
+        }
+        function makeController(wrapper, directHide) {
+          var controller = {
+            shouldKeepOpenOnEditorMouseMoveOrLeave: false,
+            directHideCalls: 0
+          };
+          if (directHide) {
+            controller.hideContentHover = function() {
+              controller.directHideCalls++;
+              wrapper.style.setProperty('display', 'none', 'important');
+            };
+          }
+          wrapper.__irHoverPinController = controller;
+          return controller;
+        }
+        function makePinnedSource(label, left, top, directHide) {
+          var wrapper = document.createElement('div');
+          wrapper.className = 'monaco-resizable-hover ir-e2e-hover-drag-source';
+          wrapper.style.cssText = 'position:fixed;left:' + left + 'px;top:' + top + 'px;width:340px;height:180px;display:block;visibility:visible;';
+          var hover = document.createElement('div');
+          hover.className = 'monaco-hover ir-scrollable';
+          hover.style.cssText = 'display:flex;flex-direction:column;width:100%;height:100%;visibility:visible;';
+          var scroller = document.createElement('div');
+          scroller.className = 'monaco-scrollable-element';
+          scroller.style.setProperty('overflow', 'auto', 'important');
+          scroller.style.setProperty('height', '160px', 'important');
+          scroller.style.setProperty('max-height', '160px', 'important');
+          scroller.style.setProperty('flex', '0 0 160px', 'important');
+          var content = document.createElement('div');
+          content.className = 'monaco-hover-content';
+          content.style.cssText = 'padding:8px;';
+          content.style.setProperty('height', '620px', 'important');
+          content.style.setProperty('min-height', '620px', 'important');
+          content.textContent = label + ' field: str\\n' + new Array(32).fill(label + ' detail row').join(String.fromCharCode(10));
+          scroller.appendChild(content);
+          hover.appendChild(scroller);
+          wrapper.appendChild(hover);
+          var controller = makeController(wrapper, directHide);
+          document.body.appendChild(wrapper);
+          void scroller.scrollHeight;
+          scroller.scrollTop = 37;
+          return { wrapper: wrapper, hover: hover, scroller: scroller, content: content, controller: controller };
+        }
+        function repaintPinnedSource(source, label, left, top, directHide) {
+          source.wrapper.style.setProperty('left', left + 'px');
+          source.wrapper.style.setProperty('top', top + 'px');
+          source.wrapper.style.setProperty('display', 'block', 'important');
+          source.content.textContent = label + ' field: str\\n' + new Array(32).fill(label + ' detail row').join(String.fromCharCode(10));
+          source.controller = makeController(source.wrapper, directHide);
+          void source.scroller.scrollHeight;
+          source.scroller.scrollTop = 29;
+          return source;
+        }
+        function fire(el, type, x, y, buttons, pointerId) {
+          var Ctor = type.indexOf('pointer') === 0 && window.PointerEvent ? window.PointerEvent : window.MouseEvent;
+          return el.dispatchEvent(new Ctor(type, {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            view: window,
+            button: 0,
+            buttons: buttons,
+            pointerId: pointerId || 1,
+            pointerType: 'mouse',
+            clientX: x,
+            clientY: y,
+            screenX: x,
+            screenY: y
+          }));
+        }
+        var downType = window.PointerEvent ? 'pointerdown' : 'mousedown';
+        var moveType = window.PointerEvent ? 'pointermove' : 'mousemove';
+        var upType = window.PointerEvent ? 'pointerup' : 'mouseup';
+        var sources = [];
+        var hidePayloads = [];
+        var fallbackSource = null;
+        var originalGoToType = window.irGoToType;
+        var result = { ok: false };
+        try {
+          window.irGoToType = function(payload) {
+            var value = String(payload);
+            if (value.indexOf('HIDE_HOVER:') === 0) {
+              hidePayloads.push(value);
+              if (fallbackSource && fallbackSource.wrapper) fallbackSource.wrapper.style.setProperty('display', 'none', 'important');
+            }
+          };
+          var first = makePinnedSource('DragFirstModel', 60, 70, true);
+          sources.push(first);
+          var firstRect = first.wrapper.getBoundingClientRect();
+          var firstX = firstRect.left + 46;
+          var firstY = firstRect.top + 34;
+          fire(first.content, downType, firstX, firstY, 1, 11);
+          fire(first.content, moveType, firstX + 2, firstY + 2, 1, 11);
+          var liveFirstScroller = hooks.primaryHoverScroller(first.hover) || first.scroller;
+          liveFirstScroller.scrollTop = 37;
+          var belowThreshold = {
+            pin: hooks.clickPinnedHoverSnapshot(),
+            detached: hooks.detachedHoverSnapshot(),
+            sourceRect: rectObj(first.wrapper.getBoundingClientRect()),
+            controllerValue: first.controller.shouldKeepOpenOnEditorMouseMoveOrLeave,
+            sourceScroll: {
+              top: liveFirstScroller.scrollTop || 0,
+              scrollHeight: liveFirstScroller.scrollHeight || 0,
+              clientHeight: liveFirstScroller.clientHeight || 0
+            }
+          };
+          fire(first.content, moveType, firstX + 42, firstY + 31, 1, 11);
+          fire(first.content, upType, firstX + 42, firstY + 31, 0, 11);
+          var afterFirstDrag = hooks.detachedHoverSnapshot();
+          afterFirstDrag.nativePin = hooks.clickPinnedHoverSnapshot();
+          afterFirstDrag.controllerValue = first.controller.shouldKeepOpenOnEditorMouseMoveOrLeave;
+          afterFirstDrag.directHideCalls = first.controller.directHideCalls;
+          afterFirstDrag.hidePayloads = hidePayloads.slice();
+          afterFirstDrag.sourceMarked = first.wrapper.classList.contains('ir-click-pinned-hover');
+          afterFirstDrag.rootMarked = first.hover.classList.contains('ir-click-pinned-hover');
+          var firstDetached = afterFirstDrag.windows && afterFirstDrag.windows[0];
+          var firstStableRect = firstDetached && firstDetached.rect;
+          fire(document.body, moveType, firstX + 110, firstY + 90, 0, 11);
+          var afterPointerUpMove = hooks.detachedHoverSnapshot();
+
+          var secondLeft = Math.max(420, Math.min((window.innerWidth || 1200) - 380, 560));
+          var second = repaintPinnedSource(first, 'DragSecondModel', secondLeft, 90, false);
+          fallbackSource = second;
+          var sameNativeWrapperReused = second.wrapper === first.wrapper && second.hover === first.hover;
+          var secondRect = second.wrapper.getBoundingClientRect();
+          var secondX = secondRect.left + 52;
+          var secondY = secondRect.top + 38;
+          fire(second.content, downType, secondX, secondY, 1, 22);
+          var secondPin = hooks.clickPinnedHoverSnapshot();
+          secondPin.controllerValue = second.controller.shouldKeepOpenOnEditorMouseMoveOrLeave;
+          fire(second.content, moveType, secondX + 48, secondY + 44, 1, 22);
+          fire(second.content, upType, secondX + 48, secondY + 44, 0, 22);
+          var afterSecondDrag = hooks.detachedHoverSnapshot();
+          afterSecondDrag.nativePin = hooks.clickPinnedHoverSnapshot();
+          afterSecondDrag.controllerValue = second.controller.shouldKeepOpenOnEditorMouseMoveOrLeave;
+          afterSecondDrag.directHideCalls = second.controller.directHideCalls;
+          afterSecondDrag.hidePayloads = hidePayloads.slice();
+
+          var firstWindow = afterSecondDrag.windows && afterSecondDrag.windows.find(function(row) { return row.id === firstDetached.id; });
+          var firstEl = firstWindow && document.querySelector('.ir-detached-hover[data-ir-detached-hover-id="' + firstWindow.id + '"]');
+          var duringLostButtonsDrag = null;
+          var afterLostButtonsMove = null;
+          if (firstEl) {
+            var movableTarget = firstEl.querySelector('.monaco-hover') || firstEl;
+            var moveRect = firstEl.getBoundingClientRect();
+            var moveX = moveRect.left + 30;
+            var moveY = moveRect.top + 42;
+            fire(movableTarget, downType, moveX, moveY, 1, 33);
+            fire(movableTarget, moveType, moveX + 28, moveY + 24, 1, 33);
+            duringLostButtonsDrag = hooks.detachedHoverSnapshot();
+            duringLostButtonsDrag.dragState = dragStateSnapshot();
+            fire(document.body, moveType, moveX + 32, moveY + 27, 0, 33);
+            afterLostButtonsMove = hooks.detachedHoverSnapshot();
+            afterLostButtonsMove.dragState = dragStateSnapshot();
+
+            var recoveryRect = firstEl.getBoundingClientRect();
+            var recoveryX = recoveryRect.left + 30;
+            var recoveryY = recoveryRect.top + 42;
+            fire(movableTarget, downType, recoveryX, recoveryY, 1, 34);
+            fire(movableTarget, moveType, recoveryX + 28, recoveryY + 24, 1, 34);
+            fire(movableTarget, upType, recoveryX + 28, recoveryY + 24, 0, 34);
+          }
+          var afterRedrag = hooks.detachedHoverSnapshot();
+          afterRedrag.dragState = dragStateSnapshot();
+          var redraggedFirst = afterRedrag.windows && afterRedrag.windows.find(function(row) { return row.id === firstDetached.id; });
+          var secondDetached = afterSecondDrag.windows && afterSecondDrag.windows.find(function(row) { return row.id !== firstDetached.id; });
+          var secondEl = secondDetached && document.querySelector('.ir-detached-hover[data-ir-detached-hover-id="' + secondDetached.id + '"]');
+          var close = secondEl && secondEl.querySelector('.ir-detached-hover-close');
+          if (close) fire(close, downType, secondDetached.rect.right - 12, secondDetached.rect.top + 12, 1, 44);
+          var afterClose = hooks.detachedHoverSnapshot();
+          result = {
+            ok: true,
+            belowThreshold: belowThreshold,
+            afterFirstDrag: afterFirstDrag,
+            afterPointerUpMove: afterPointerUpMove,
+            secondPin: secondPin,
+            afterSecondDrag: afterSecondDrag,
+            duringLostButtonsDrag: duringLostButtonsDrag,
+            afterLostButtonsMove: afterLostButtonsMove,
+            afterRedrag: afterRedrag,
+            afterClose: afterClose,
+            sameNativeWrapperReused: sameNativeWrapperReused,
+            firstStableRect: firstStableRect,
+            redraggedFirst: redraggedFirst,
+            hidePayloads: hidePayloads.slice()
+          };
+        } catch (error) {
+          result = { ok: false, error: String(error && error.message || error), hidePayloads: hidePayloads.slice() };
+        } finally {
+          window.irGoToType = originalGoToType;
+          try { if (hooks.clearClickPinnedHover) hooks.clearClickPinnedHover('e2e-drag-cleanup', false); } catch (_) {}
+          try { if (hooks.clearDetachedHovers) hooks.clearDetachedHovers('e2e-drag-cleanup'); } catch (_) {}
+          try {
+            result.cleanupState = dragStateSnapshot();
+            result.cleanupState.detached = hooks.detachedHoverSnapshot();
+          } catch (_) {}
+          for (var si = 0; si < sources.length; si++) {
+            try { if (sources[si].wrapper.parentNode) sources[si].wrapper.parentNode.removeChild(sources[si].wrapper); } catch (_) {}
+          }
+        }
+        return result;
+      }
       function makeDuplicateDedupeHover() {
         var hover = document.createElement('div');
         hover.className = 'monaco-hover ir-e2e-hover ir-e2e-dedupe-hover';
@@ -4607,6 +4826,7 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
       Array.prototype.slice.call(document.querySelectorAll('.monaco-hover,.monaco-editor-hover')).forEach(function(el) {
         try { el.parentNode && el.parentNode.removeChild(el); } catch (_) {}
       });
+      try { if (hooks.clearDetachedHovers) hooks.clearDetachedHovers('harness-start'); } catch (_) {}
       window.__irActiveHoverEl = null;
       Array.prototype.slice.call(document.querySelectorAll('.ir-e2e-hover')).forEach(function(el) {
         try { el.parentNode && el.parentNode.removeChild(el); } catch (_) {}
@@ -4623,6 +4843,8 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
       harnessMark('after-flexible-resize-probe');
       var clickPin = clickPinProbe();
       harnessMark('after-click-pin-probe');
+      var detachedHoverDrag = detachedHoverDragProbe();
+      harnessMark('after-detached-hover-drag-probe');
       var stickyFarProbe = stickyFarEventProbe(3);
       harnessMark('after-sticky-far-probe');
       var nativePopupNearProbe = nativePopupNearHoverProbe();
@@ -4945,6 +5167,7 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
         viewport: { width: window.innerWidth || 0, height: window.innerHeight || 0 },
         flexibleResize: flexibleResize,
         clickPin: clickPin,
+        detachedHoverDrag: detachedHoverDrag,
         largeBefore: largeBefore,
         largeAfterWheel: largeAfterWheel,
         hugeBefore: hugeBefore,
