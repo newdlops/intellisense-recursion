@@ -4096,6 +4096,161 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
         document.body.appendChild(hover);
         return hover;
       }
+      function flexibleResizeProbe() {
+        var wrapper = document.createElement('div');
+        wrapper.className = 'monaco-resizable-hover ir-e2e-flexible-resize';
+        wrapper.style.cssText = 'position:fixed;left:24px;top:24px;width:320px;height:160px;display:block;visibility:visible;';
+        var hover = document.createElement('div');
+        hover.className = 'monaco-hover ir-scrollable';
+        var scroller = document.createElement('div');
+        scroller.className = 'monaco-scrollable-element';
+        var content = document.createElement('div');
+        content.className = 'monaco-hover-content';
+        content.textContent = new Array(80).fill('FlexibleResizeModel field: str').join(String.fromCharCode(10));
+        scroller.appendChild(content);
+        hover.appendChild(scroller);
+        var vertical = document.createElement('div');
+        vertical.className = 'monaco-sash vertical';
+        vertical.style.cssText = 'position:absolute;right:0;top:0;width:8px;height:100%;';
+        var horizontal = document.createElement('div');
+        horizontal.className = 'monaco-sash horizontal';
+        horizontal.style.cssText = 'position:absolute;left:0;bottom:0;width:100%;height:8px;';
+        wrapper.appendChild(hover);
+        wrapper.appendChild(vertical);
+        wrapper.appendChild(horizontal);
+        document.body.appendChild(wrapper);
+
+        var unrelated = document.createElement('div');
+        unrelated.className = 'monaco-sash vertical ir-e2e-unrelated-sash';
+        document.body.appendChild(unrelated);
+        var beforeStyle = window.getComputedStyle(wrapper);
+        var before = {
+          maxWidth: parseFloat(beforeStyle.maxWidth) || 0,
+          maxHeight: parseFloat(beforeStyle.maxHeight) || 0,
+          rect: rectObj(wrapper.getBoundingClientRect())
+        };
+        function dispatchSashDown(target) {
+          var EventCtor = window.PointerEvent || window.MouseEvent;
+          return target.dispatchEvent(new EventCtor(window.PointerEvent ? 'pointerdown' : 'mousedown', {
+            bubbles: true,
+            cancelable: true,
+            composed: true,
+            view: window,
+            button: 0,
+            buttons: 1,
+            pointerType: 'mouse'
+          }));
+        }
+        var unrelatedAllowed = dispatchSashDown(unrelated);
+        var unrelatedIgnored = !wrapper.classList.contains('ir-flexible-hover-size');
+        var widthAllowed = dispatchSashDown(vertical);
+        var widthResult = wrapper.classList.contains('ir-flexible-hover-size');
+        var widthCap = parseFloat(wrapper.style.getPropertyValue('--ir-flex-hover-max-width')) || 0;
+        var heightCapBefore = parseFloat(wrapper.style.getPropertyValue('--ir-flex-hover-max-height')) || 0;
+        var heightAllowed = dispatchSashDown(horizontal);
+        var heightResult = !!wrapper.style.getPropertyValue('--ir-flex-hover-max-height');
+        var heightCap = parseFloat(wrapper.style.getPropertyValue('--ir-flex-hover-max-height')) || 0;
+        var requestedWidth = Math.min(widthCap, Math.max(720, before.rect.width + 120));
+        var requestedHeight = Math.min(heightCap, Math.max(before.maxHeight + 40, before.rect.height + 80));
+        wrapper.style.width = Math.floor(requestedWidth) + 'px';
+        wrapper.style.height = Math.floor(requestedHeight) + 'px';
+        var expandedRect = wrapper.getBoundingClientRect();
+        var hoverRect = hover.getBoundingClientRect();
+        var scrollerRect = scroller.getBoundingClientRect();
+        var after = {
+          classEnabled: wrapper.classList.contains('ir-flexible-hover-size'),
+          widthResult: widthResult,
+          heightResult: heightResult,
+          nativeEventsAllowed: unrelatedAllowed && widthAllowed && heightAllowed,
+          unrelatedIgnored: unrelatedIgnored,
+          widthCap: widthCap,
+          heightCapBefore: heightCapBefore,
+          heightCap: heightCap,
+          rect: rectObj(expandedRect),
+          hoverRect: rectObj(hoverRect),
+          scrollerRect: rectObj(scrollerRect),
+          maxRight: (window.innerWidth || 0) - 8,
+          maxBottom: (window.innerHeight || 0) - 8
+        };
+        hooks.resetFlexibleHoverResize(wrapper, true);
+        var reset = {
+          classEnabled: wrapper.classList.contains('ir-flexible-hover-size'),
+          widthVariable: wrapper.style.getPropertyValue('--ir-flex-hover-max-width'),
+          heightVariable: wrapper.style.getPropertyValue('--ir-flex-hover-max-height'),
+          inlineWidth: wrapper.style.width,
+          inlineHeight: wrapper.style.height
+        };
+        try { wrapper.parentNode && wrapper.parentNode.removeChild(wrapper); } catch (_) {}
+        try { unrelated.parentNode && unrelated.parentNode.removeChild(unrelated); } catch (_) {}
+        return { before: before, after: after, reset: reset };
+      }
+      function clickPinProbe() {
+        var wrapper = document.createElement('div');
+        wrapper.className = 'monaco-resizable-hover ir-e2e-click-pin';
+        wrapper.style.cssText = 'position:fixed;left:36px;top:36px;width:360px;height:180px;display:block;visibility:visible;';
+        var hover = document.createElement('div');
+        hover.className = 'monaco-hover';
+        hover.style.cssText = 'display:block;width:100%;height:100%;visibility:visible;';
+        var target = document.createElement('div');
+        target.className = 'ir-e2e-click-pin-target';
+        target.textContent = 'ClickPinModel field: str';
+        target.style.cssText = 'width:240px;height:40px;padding:8px;';
+        hover.appendChild(target);
+        wrapper.appendChild(hover);
+        var controller = { shouldKeepOpenOnEditorMouseMoveOrLeave: false };
+        wrapper.__irHoverPinController = controller;
+        document.body.appendChild(wrapper);
+
+        var outside = document.createElement('button');
+        outside.className = 'ir-e2e-click-pin-outside';
+        outside.textContent = 'outside click target';
+        outside.style.cssText = 'position:fixed;right:20px;bottom:20px;width:160px;height:32px;';
+        document.body.appendChild(outside);
+        function fire(el, type, buttons) {
+          var Ctor = type.indexOf('pointer') === 0 && window.PointerEvent ? window.PointerEvent : window.MouseEvent;
+          return el.dispatchEvent(new Ctor(type, {
+            bubbles: type !== 'mouseleave' && type !== 'pointerleave',
+            cancelable: true,
+            composed: true,
+            view: window,
+            button: 0,
+            buttons: buttons || 0,
+            pointerType: 'mouse'
+          }));
+        }
+        var pointerDownAllowed = fire(target, window.PointerEvent ? 'pointerdown' : 'mousedown', 1);
+        var afterPin = hooks.clickPinnedHoverSnapshot();
+        afterPin.controllerValue = controller.shouldKeepOpenOnEditorMouseMoveOrLeave;
+        afterPin.pointerDownAllowed = pointerDownAllowed;
+        afterPin.wrapperAttribute = wrapper.getAttribute('data-ir-click-pinned-hover');
+        var wrapperLeaveReached = false;
+        wrapper.addEventListener('mouseleave', function(){ wrapperLeaveReached = true; });
+        fire(wrapper, 'mouseleave', 0);
+        fire(outside, window.PointerEvent ? 'pointermove' : 'mousemove', 0);
+        var afterMove = hooks.clickPinnedHoverSnapshot();
+        afterMove.wrapperLeaveReached = wrapperLeaveReached;
+
+        var hidePayloads = [];
+        var originalGoToType = window.irGoToType;
+        var outsideAllowed = true;
+        try {
+          window.irGoToType = function(payload) { hidePayloads.push(String(payload)); };
+          outsideAllowed = fire(outside, window.PointerEvent ? 'pointerdown' : 'mousedown', 1);
+        } finally {
+          window.irGoToType = originalGoToType;
+        }
+        var afterOutside = hooks.clickPinnedHoverSnapshot();
+        afterOutside.controllerValue = controller.shouldKeepOpenOnEditorMouseMoveOrLeave;
+        afterOutside.outsideAllowed = outsideAllowed;
+        afterOutside.wrapperMarked = wrapper.classList.contains('ir-click-pinned-hover');
+        afterOutside.rootMarked = hover.classList.contains('ir-click-pinned-hover');
+        afterOutside.wrapperAttribute = wrapper.getAttribute('data-ir-click-pinned-hover');
+        afterOutside.hidePayloads = hidePayloads;
+        try { hooks.clearClickPinnedHover('e2e-cleanup', false); } catch (_) {}
+        try { wrapper.parentNode && wrapper.parentNode.removeChild(wrapper); } catch (_) {}
+        try { outside.parentNode && outside.parentNode.removeChild(outside); } catch (_) {}
+        return { afterPin: afterPin, afterMove: afterMove, afterOutside: afterOutside };
+      }
       function makeDuplicateDedupeHover() {
         var hover = document.createElement('div');
         hover.className = 'monaco-hover ir-e2e-hover ir-e2e-dedupe-hover';
@@ -4464,6 +4619,10 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
       });
 
       harnessMark('start');
+      var flexibleResize = flexibleResizeProbe();
+      harnessMark('after-flexible-resize-probe');
+      var clickPin = clickPinProbe();
+      harnessMark('after-click-pin-probe');
       var stickyFarProbe = stickyFarEventProbe(3);
       harnessMark('after-sticky-far-probe');
       var nativePopupNearProbe = nativePopupNearHoverProbe();
@@ -4784,6 +4943,8 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
         columnGate: columnGateResult,
         patchVersion: Number(window.__irPatchVersion) || 0,
         viewport: { width: window.innerWidth || 0, height: window.innerHeight || 0 },
+        flexibleResize: flexibleResize,
+        clickPin: clickPin,
         largeBefore: largeBefore,
         largeAfterWheel: largeAfterWheel,
         hugeBefore: hugeBefore,

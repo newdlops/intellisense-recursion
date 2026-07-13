@@ -15,9 +15,13 @@ positioning, theming. Our only DOM responsibilities are:
   top of the markdown when there's drill-down history.
 - Keep VS Code's two hover containers (`.monaco-resizable-hover` wrapper and
   `.monaco-hover` child) geometrically aligned (see "JS aligner" below).
+- Keep automatic hovers inside a compact `680px × 48vh` envelope, while
+  allowing an explicit native-sash drag to expand toward the viewport edge.
+- Pin a native hover after a primary click inside it, keeping it open across
+  pointer movement until the next primary click outside the wrapper.
 
-We do NOT enforce width/height, position, padding, or background on our own.
-The hover paints with the dimensions VS Code chose for it, and we ride along.
+VS Code still chooses width/height and owns all positioning. Our size rules
+only provide the automatic and user-resize upper bounds described below.
 
 ## DOM hierarchy
 
@@ -70,7 +74,7 @@ beaten by VS Code's inline writes at the same priority).
 
 ## What we enforce
 
-Implementation lives in `src/extension.ts`. Search for these symbols:
+Implementation lives primarily in `src/renderer-patch.ts`. Search for these symbols:
 
 | Concern                | Implementation                                     |
 |------------------------|----------------------------------------------------|
@@ -79,6 +83,8 @@ Implementation lives in `src/extension.ts`. Search for these symbols:
 | Link wrapping          | `irScanRenderedMarkdown` walks rendered-markdown nodes and wraps type identifiers with `.ir-type-link` |
 | Back-button click      | `irBackControlClick` (capture-phase listener)      |
 | Wrapper↔child alignment| `irAlignResizableHoverToChild` (currently no-op)   |
+| Flexible native resize | `irEnableFlexibleHoverResize` + `.ir-flexible-hover-size` |
+| Click-to-pin lifecycle | `irPinNativeHoverRoot` + `irClearClickPinnedHover` |
 
 Both directions of forced alignment broke real interactive positioning:
 - "wrapper follows child" pinned wrapper to stale child coords.
@@ -91,12 +97,53 @@ child until we land on a position model that doesn't fight VS Code.
 
 We deliberately do NOT set:
 
-- `width`, `height`, `min-*`, `max-*` (except a `max-height: 48vh` ergonomic
-  cap on the wrapper so a giant hover doesn't dominate the monitor)
 - `position`, `top`, `left`, `transform`, `margin-*` on `.monaco-hover`
 - Background or border colors
 
-VS Code's defaults handle all of that.
+We do set upper bounds on the wrapper/host/scroller chain: automatic hovers
+use `max-width: 680px` and `max-height: 48vh`. These caps prevent injected or
+transient content from briefly expanding to the whole viewport and preserve
+the inner scrolling contract.
+
+## Dual size envelope
+
+The compact cap is an automatic-layout safety boundary, not a permanent user
+resize limit. When the user grabs a sash that is actually contained by a
+`.monaco-resizable-hover`, `irEnableFlexibleHoverResize`:
+
+1. snapshots the currently painted width/height, preventing stale transient
+   inline geometry from flashing when the compact cap is relaxed;
+2. unlocks only the grabbed axis toward the corresponding viewport edge,
+   retaining an 8px gutter; and
+3. leaves VS Code in sole control of the drag, width/height writes, and
+   placement.
+
+The host then fills the resized wrapper and the flex scroller keeps
+`min-height: 0` plus `overflow: auto`, so larger content remains contained and
+scrollable. Sashes outside a hover wrapper (workbench splitters and unrelated
+overlays) are ignored. Once VS Code has stably dismissed the hover, the opt-in
+class, bounds, and size snapshot are cleared before the shared wrapper is
+reused; transient 0×0 resize frames do not trigger that reset.
+
+## Click-to-pin lifecycle
+
+A primary pointer-down inside a real `.monaco-resizable-hover` pins that hover.
+The pin uses VS Code's own lifecycle rather than the legacy `ir-sticky` overlay
+management:
+
+- the native `.monaco-hover` receives focus;
+- the owning `ContentHoverController.shouldKeepOpenOnEditorMouseMoveOrLeave`
+  value is saved and temporarily enabled; and
+- only the pinned wrapper's direct `mouseleave` event is intercepted, because
+  VS Code's wrapper listener otherwise hides even a focused hover.
+
+All ordinary move/over/out events continue untouched. A primary pointer-down
+outside the wrapper first restores the controller's previous flag, removes the
+pin markers, and requests `editor.action.hideHover`; it never prevents or stops
+the destination click. Right-click and an initial resize-sash grab do not pin.
+Stable native dismissal, active-wrapper replacement, and patch cleanup also
+clear stale pin state so the shared hover widget cannot carry a pin into a new
+session.
 
 ## Box-corner contract (what the golden E2E checks)
 
@@ -255,7 +302,7 @@ restores natural sizing and visibility. Reasoning:
   wrapper, `.monaco-hover`, and `.monaco-scrollable-element` so the
   drilled hover stays in the same screen footprint as the initial
   hover. Overflow scrolls internally via the scroller's existing
-  `overflow:auto`. See the rules block in `src/extension.ts` (search
+  `overflow:auto`. See the rules block in `src/renderer-patch.ts` (search
   for `previewBack`).
 
   Why CSS-only and not a JS hook: every JS-side attempt to influence

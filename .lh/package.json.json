@@ -3,7 +3,7 @@
     "activeCommit": 0,
     "commits": [
         {
-            "activePatchIndex": 18,
+            "activePatchIndex": 20,
             "patches": [
                 {
                     "date": 1776576981553,
@@ -80,6 +80,14 @@
                 {
                     "date": 1783841118633,
                     "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellisense-recursion\",\n   \"displayName\": \"IntelliSense Recursion\",\n   \"description\": \"Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA\",\n-  \"version\": \"0.2.6027\",\n+  \"version\": \"0.2.6028\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n"
+                },
+                {
+                    "date": 1783903202407,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellisense-recursion\",\n   \"displayName\": \"IntelliSense Recursion\",\n   \"description\": \"Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA\",\n-  \"version\": \"0.2.6028\",\n+  \"version\": \"0.2.6029\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n"
+                },
+                {
+                    "date": 1783905781643,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n@@ -1,9 +1,9 @@\n {\n   \"name\": \"intellisense-recursion\",\n   \"displayName\": \"IntelliSense Recursion\",\n   \"description\": \"Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA\",\n-  \"version\": \"0.2.6029\",\n+  \"version\": \"0.2.6030\",\n   \"publisher\": \"newdlops\",\n   \"license\": \"MIT\",\n   \"repository\": {\n     \"type\": \"git\",\n"
                 }
             ],
             "date": 1776576981553,

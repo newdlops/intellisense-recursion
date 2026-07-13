@@ -92,8 +92,16 @@
 //   existing .ij-find-overlay / __ijFindPointerInside guards). Now gated on
 //   recent wheel activity (window.__irLastWheelAt, 160ms window); precache
 //   resumes the instant scrolling stops. Trace-validated: skips 68/80 scans.
+// v309 (L137, 2026-07-13): keep the proven 680px/48vh automatic hover envelope,
+//   but lift it to the viewport-safe envelope after the user grabs VS Code's
+//   native resize sash. This makes large hovers manually expandable without
+//   returning to the content-driven viewport balloon/flicker regressions.
+// v310 (L138, 2026-07-13): clicking a native hover pins it until the next
+//   outside click. We use ContentHoverController's native
+//   shouldKeepOpenOnEditorMouseMoveOrLeave flag plus real hover focus, and
+//   restore the controller flag before requesting the normal native dismiss.
 // If the running window still logs v<300, the new build is NOT loaded yet.
-export const RENDERER_PATCH_VERSION = 308;
+export const RENDERER_PATCH_VERSION = 310;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -248,6 +256,16 @@ function irPruneDetachedHoverState(){
     if(pruneNow-lastPruneAt<250)return;
     window.__irLastPruneAt=pruneNow;
     var body=document.body;
+    try{
+      var clickPin=window.__irClickPinnedHover;
+      if(clickPin){
+        var pinWrapper=clickPin.wrapper;
+        var pinRoot=pinWrapper&&pinWrapper.querySelector?pinWrapper.querySelector('.monaco-hover,.monaco-editor-hover'):clickPin.root;
+        if(!pinWrapper||!body.contains(pinWrapper)||(pinRoot&&irHoverRootStablyDismissed(pinRoot))){
+          irClearClickPinnedHover('prune-dismissed',false);
+        }
+      }
+    }catch(_){}
     // L134 (2026-06-01): release drill history once the hover that owns it is dismissed.
     // Detach is the old signal, but VS Code REUSES one hidden wrapper on dismiss (never
     // detaches it), so the detach-only test missed every native dismiss and the history
@@ -277,6 +295,11 @@ function irPruneDetachedHoverState(){
 }
 window.__irCleanup=function(reason){
   try{
+    try{irClearClickPinnedHover('patch-cleanup',false);}catch(_){}
+    try{
+      var flexibleWrappers=document.querySelectorAll('.monaco-resizable-hover.ir-flexible-hover-size');
+      for(var fi=0;fi<flexibleWrappers.length;fi++)irResetFlexibleHoverResize(flexibleWrappers[fi],false);
+    }catch(_){}
     if(window.__irListeners){
       for(var i=0;i<window.__irListeners.length;i++){
         var L=window.__irListeners[i];
@@ -321,6 +344,8 @@ window.__irCleanup=function(reason){
     window.__irLastPreviewTarget=null;
     window.__irPendingLinkPointerDown=null;
     window.__irActiveHoverEl=null;
+    window.__irFlexibleResizeActiveWrapper=null;
+    window.__irClickPinnedHover=null;
     window.__irInactiveScanSkipLogCount=0;
     window.__irMonacoCaps=null;
     window.__irMdRenderer=null;
@@ -546,6 +571,15 @@ style.textContent=[
   // L119: rolled back to A — drill host fills the wrapper, scroller uncapped (flex-fills).
   '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-hover,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-hover{max-height:100% !important}',
   '.monaco-resizable-hover:has(a[href*="previewBack"]) .monaco-scrollable-element,.monaco-resizable-hover:has(a[data-href*="previewBack"]) .monaco-scrollable-element{max-height:none !important}',
+  // L137: the compact 680px/48vh cap remains the default stability envelope.
+  // Only an explicit grab of VS Code's own resize sash adds
+  // .ir-flexible-hover-size (see irEnableFlexibleHoverResize). At that point
+  // the user, rather than injected content, controls growth. Keep an 8px
+  // viewport gutter so even a maximally expanded hover retains a reachable
+  // edge; the native widget continues to own actual width/height/placement.
+  '.monaco-resizable-hover.ir-flexible-hover-size.ir-flexible-hover-size{--ir-flex-hover-max-width:680px;--ir-flex-hover-max-height:48vh;max-width:min(var(--ir-flex-hover-max-width),calc(100vw - 16px)) !important;max-height:min(var(--ir-flex-hover-max-height),calc(100vh - 16px)) !important}',
+  '.monaco-resizable-hover.ir-flexible-hover-size .monaco-hover,.monaco-resizable-hover.ir-flexible-hover-size .monaco-editor-hover,.monaco-resizable-hover.ir-flexible-hover-size .monaco-hover.ir-scrollable,.monaco-resizable-hover.ir-flexible-hover-size .monaco-editor-hover.ir-scrollable{width:100% !important;height:100% !important;max-width:100% !important;max-height:100% !important}',
+  '.monaco-resizable-hover.ir-flexible-hover-size .monaco-hover.ir-scrollable > .monaco-scrollable-element,.monaco-resizable-hover.ir-flexible-hover-size .monaco-editor-hover.ir-scrollable > .monaco-scrollable-element{max-width:calc(100% - 2px) !important;max-height:calc(100% - 2px) !important}',
   // L47: native virtual list for large hover bodies. content-visibility:
   // auto makes the brower skip layout+paint for off-screen .rendered-
   // markdown blocks (and their descendants) — turning a 57K-char drill
@@ -4506,6 +4540,290 @@ function irLogPointerActionTrace(e,stage,link,resolution){
   }catch(_){}
 }
 
+// L137: preserve the compact automatic cap, but let an explicit native-sash
+// gesture opt this widget into the viewport-safe cap. We only snapshot the
+// currently painted size and publish upper bounds; VS Code remains the sole
+// writer of width, height, and position during the drag, so its proven resize
+// lifecycle is undisturbed.
+function irEnableFlexibleHoverResize(target){
+  if(!IR_HOVER_NATIVE_ONLY)return null;
+  try{
+    var el=target&&(target.nodeType===1?target:target.parentElement);
+    if(!el||!el.closest)return null;
+    var sash=el.closest('.monaco-sash,[class*="sash"]');
+    if(!sash)return null;
+    var wrapper=sash.closest?sash.closest('.monaco-resizable-hover'):null;
+    if(!wrapper||!wrapper.classList||!wrapper.querySelector('.monaco-hover,.monaco-editor-hover'))return null;
+    var wr=wrapper.getBoundingClientRect();
+    if(!wr||wr.width<60||wr.height<20)return null;
+    var sr=sash.getBoundingClientRect?sash.getBoundingClientRect():null;
+    var sashClass=String(sash.className||'').toLowerCase();
+    var isCorner=sashClass.indexOf('corner')>=0||(sr&&sr.width>=6&&sr.height>=6&&sr.width<40&&sr.height<40);
+    var changesWidth=isCorner||sashClass.indexOf('vertical')>=0||(sr&&sr.height>sr.width*2);
+    var changesHeight=isCorner||sashClass.indexOf('horizontal')>=0||(sr&&sr.width>sr.height*2);
+    if(!changesWidth&&!changesHeight){changesWidth=true;changesHeight=true;}
+    // VS Code can leave a transient content-swap width/height (for example
+    // 1800x1069) in inline style while our compact cap hides it. Snapshot the
+    // live computed box before relaxing the cap, otherwise that stale value
+    // flashes for one frame as soon as the class lands.
+    wrapper.style.setProperty('width',Math.round(wr.width)+'px');
+    wrapper.style.setProperty('height',Math.round(wr.height)+'px');
+    var margin=8;
+    var viewportW=window.innerWidth||document.documentElement.clientWidth||1200;
+    var viewportH=window.innerHeight||document.documentElement.clientHeight||900;
+    if(changesWidth){
+      var growsLeft=!!(sr&&((sr.left+sr.right)/2)<((wr.left+wr.right)/2));
+      wrapper.__irFlexibleWidthEdge=growsLeft?'left':'right';
+      var maxW=growsLeft?wr.right-margin:viewportW-wr.left-margin;
+      wrapper.style.setProperty('--ir-flex-hover-max-width',Math.max(Math.ceil(wr.width),Math.floor(maxW))+'px');
+    }
+    if(changesHeight){
+      var growsUp=!!(sr&&((sr.top+sr.bottom)/2)<((wr.top+wr.bottom)/2));
+      wrapper.__irFlexibleHeightEdge=growsUp?'top':'bottom';
+      var maxH=growsUp?wr.bottom-margin:viewportH-wr.top-margin;
+      wrapper.style.setProperty('--ir-flex-hover-max-height',Math.max(Math.ceil(wr.height),Math.floor(maxH))+'px');
+    }
+    if(!wrapper.classList.contains('ir-flexible-hover-size')){
+      wrapper.classList.add('ir-flexible-hover-size');
+      wrapper.__irFlexibleHoverSizeAt=Date.now();
+      irHERecord('hover-flexible-size-enabled',{});
+    }
+    window.__irFlexibleResizeActiveWrapper=wrapper;
+    return wrapper;
+  }catch(_){return null}
+}
+function irResetFlexibleHoverResize(wrapper,clearSize){
+  try{
+    if(!wrapper||!wrapper.classList)return;
+    wrapper.classList.remove('ir-flexible-hover-size');
+    wrapper.style.removeProperty('--ir-flex-hover-max-width');
+    wrapper.style.removeProperty('--ir-flex-hover-max-height');
+    if(clearSize){
+      wrapper.style.removeProperty('width');
+      wrapper.style.removeProperty('height');
+    }
+    wrapper.__irFlexibleHoverSizeAt=0;
+    wrapper.__irFlexibleWidthEdge=null;
+    wrapper.__irFlexibleHeightEdge=null;
+    if(window.__irFlexibleResizeActiveWrapper===wrapper)window.__irFlexibleResizeActiveWrapper=null;
+  }catch(_){}
+}
+function irFinishFlexibleHoverResize(){
+  try{
+    var wrapper=window.__irFlexibleResizeActiveWrapper;
+    window.__irFlexibleResizeActiveWrapper=null;
+    if(wrapper){
+      irSetTimer(function(){
+        try{
+          var root=wrapper.querySelector?wrapper.querySelector('.monaco-hover,.monaco-editor-hover'):null;
+          if(root&&irHoverRootStablyDismissed(root))irResetFlexibleHoverResize(wrapper,true);
+        }catch(_){}
+      },350);
+    }
+  }catch(_){}
+}
+track(window,'pointerup',irFinishFlexibleHoverResize,true);
+track(window,'pointercancel',irFinishFlexibleHoverResize,true);
+track(window,'mouseup',irFinishFlexibleHoverResize,true);
+track(window,'blur',irFinishFlexibleHoverResize,true);
+
+// L138: click-to-pin stays entirely on VS Code's native hover path. The
+// focused HoverWidget is already kept by ContentHoverController on editor
+// mousemove; its public shouldKeepOpenOnEditorMouseMoveOrLeave flag covers the
+// editor-leave path. ContentHoverWidgetWrapper also owns one direct
+// mouseleave listener on the resizable wrapper, so a narrow capture guard
+// suppresses only that exact event while pinned. No move/over/out stream is
+// swallowed and no visibility/position is written by us.
+function irHoverPinOwnerForWrapper(wrapper){
+  try{
+    if(!wrapper)return {controller:null,editor:null,editorDom:null};
+    if(wrapper.__irHoverPinController){
+      return {
+        controller:wrapper.__irHoverPinController,
+        editor:wrapper.__irHoverPinEditor||null,
+        editorDom:wrapper.__irHoverPinEditorDom||null
+      };
+    }
+    function fromWidget(widget,editor){
+      try{
+        if(!widget||!widget._resizableNode||widget._resizableNode.domNode!==wrapper)return null;
+        var ed=editor||widget._editor||null;
+        var controller=ed&&typeof ed.getContribution==='function'
+          ? ed.getContribution('editor.contrib.contentHover')
+          : null;
+        var editorDom=ed&&typeof ed.getDomNode==='function'?ed.getDomNode():null;
+        return {controller:controller||null,editor:ed,editorDom:editorDom};
+      }catch(_){return null}
+    }
+    var captured=window.__irCapturedHoverWidget;
+    var capturedOwner=fromWidget(captured,captured&&captured._editor);
+    if(capturedOwner)return capturedOwner;
+    var naturalEditor=window.__irHoverNaturalEditor||null;
+    if(naturalEditor){
+      try{
+        var naturalWidgets=naturalEditor._contentWidgets||null;
+        var naturalKeys=naturalWidgets?Object.keys(naturalWidgets):[];
+        for(var nk=0;nk<naturalKeys.length;nk++){
+          var naturalEntry=naturalWidgets[naturalKeys[nk]];
+          var naturalWidget=naturalEntry&&naturalEntry.widget?naturalEntry.widget:naturalEntry;
+          var naturalOwner=fromWidget(naturalWidget,naturalEditor);
+          if(naturalOwner)return naturalOwner;
+        }
+      }catch(_){}
+    }
+    var editors=irListAllCodeEditors();
+    for(var ei=0;ei<editors.length;ei++){
+      var ed=editors[ei];
+      try{
+        var contentWidgets=ed&&ed._contentWidgets;
+        var keys=contentWidgets?Object.keys(contentWidgets):[];
+        for(var ki=0;ki<keys.length;ki++){
+          var entry=contentWidgets[keys[ki]];
+          var widget=entry&&entry.widget?entry.widget:entry;
+          var owner=fromWidget(widget,ed);
+          if(owner)return owner;
+        }
+      }catch(_){}
+    }
+  }catch(_){}
+  return {controller:null,editor:null,editorDom:null};
+}
+function irFocusClickPinnedHover(pin){
+  try{
+    if(!pin||!pin.root||typeof pin.root.focus!=='function')return false;
+    if(!pin.root.hasAttribute('tabindex')){
+      pin.root.setAttribute('tabindex','-1');
+      pin.addedTabIndex=true;
+    }
+    try{pin.root.focus({preventScroll:true});}catch(_){pin.root.focus();}
+    return document.activeElement===pin.root||!!(pin.root.contains&&pin.root.contains(document.activeElement));
+  }catch(_){return false}
+}
+function irPinNativeHoverRoot(root,controllerOverride){
+  try{
+    if(!root||!root.classList||!root.closest)return null;
+    var wrapper=root.closest('.monaco-resizable-hover');
+    if(!wrapper||!document.body||!document.body.contains(wrapper))return null;
+    var rect=wrapper.getBoundingClientRect?wrapper.getBoundingClientRect():null;
+    if(!rect||rect.width<60||rect.height<20||!String(root.textContent||'').trim())return null;
+    var current=window.__irClickPinnedHover;
+    if(current&&current.wrapper!==wrapper)irClearClickPinnedHover('pin-switch',false);
+    current=window.__irClickPinnedHover;
+    if(current&&current.wrapper===wrapper){
+      current.root=root;
+      irFocusClickPinnedHover(current);
+      return current;
+    }
+    var owner=irHoverPinOwnerForWrapper(wrapper);
+    var controller=controllerOverride||owner.controller||null;
+    var pin={
+      root:root,
+      wrapper:wrapper,
+      controller:controller,
+      editor:owner.editor||null,
+      editorDom:owner.editorDom||null,
+      previousKeepOpen:controller?!!controller.shouldKeepOpenOnEditorMouseMoveOrLeave:false,
+      addedTabIndex:false,
+      pinnedAt:Date.now()
+    };
+    if(controller)controller.shouldKeepOpenOnEditorMouseMoveOrLeave=true;
+    wrapper.classList.add('ir-click-pinned-hover');
+    root.classList.add('ir-click-pinned-hover');
+    wrapper.setAttribute('data-ir-click-pinned-hover','1');
+    root.setAttribute('data-ir-click-pinned-hover','1');
+    window.__irClickPinnedHover=pin;
+    var focused=irFocusClickPinnedHover(pin);
+    irHERecord('hover-click-pinned',{focused:focused,hasController:!!controller});
+    return pin;
+  }catch(_){return null}
+}
+function irClearClickPinnedHover(reason,requestHide){
+  try{
+    var pin=window.__irClickPinnedHover;
+    if(!pin)return false;
+    window.__irClickPinnedHover=null;
+    try{
+      if(pin.controller){
+        pin.controller.shouldKeepOpenOnEditorMouseMoveOrLeave=!!pin.previousKeepOpen;
+      }
+    }catch(_){}
+    var roots=[];
+    if(pin.root)roots.push(pin.root);
+    try{
+      var liveRoot=pin.wrapper&&pin.wrapper.querySelector?pin.wrapper.querySelector('.monaco-hover,.monaco-editor-hover'):null;
+      if(liveRoot&&roots.indexOf(liveRoot)<0)roots.push(liveRoot);
+    }catch(_){}
+    try{
+      if(pin.wrapper&&pin.wrapper.classList)pin.wrapper.classList.remove('ir-click-pinned-hover');
+      if(pin.wrapper&&pin.wrapper.removeAttribute)pin.wrapper.removeAttribute('data-ir-click-pinned-hover');
+    }catch(_){}
+    for(var ri=0;ri<roots.length;ri++){
+      var root=roots[ri];
+      try{if(root.classList)root.classList.remove('ir-click-pinned-hover');}catch(_){}
+      try{if(root.removeAttribute)root.removeAttribute('data-ir-click-pinned-hover');}catch(_){}
+      try{if(pin.addedTabIndex&&root===pin.root)root.removeAttribute('tabindex');}catch(_){}
+    }
+    irHERecord('hover-click-pin-cleared',{reason:String(reason||''),hide:!!requestHide});
+    if(requestHide)irRequestNativeHideHover('click-pin-'+(reason||'outside'));
+    return true;
+  }catch(_){return false}
+}
+function irClickPinPointerDown(e){
+  try{
+    if(!IR_HOVER_NATIVE_ONLY||!e)return;
+    if(typeof e.button==='number'&&e.button!==0)return;
+    var target=irEventElement(e.target);
+    var current=window.__irClickPinnedHover;
+    if(current){
+      if(current.wrapper&&target&&current.wrapper.contains(target)){
+        var liveRoot=current.wrapper.querySelector?current.wrapper.querySelector('.monaco-hover,.monaco-editor-hover'):current.root;
+        if(liveRoot)current.root=liveRoot;
+        irFocusClickPinnedHover(current);
+        return;
+      }
+      irClearClickPinnedHover('outside-pointerdown',true);
+      return;
+    }
+    if(!target||!target.closest)return;
+    if(target.closest('.monaco-sash,[class*="sash"]'))return;
+    if(target.closest('.ij-find-overlay,.workbench-hover'))return;
+    var root=target.closest('.monaco-hover,.monaco-editor-hover');
+    var wrapper=target.closest('.monaco-resizable-hover');
+    if(!root&&wrapper&&wrapper.querySelector)root=wrapper.querySelector('.monaco-hover,.monaco-editor-hover');
+    if(!root||!wrapper)return;
+    irPinNativeHoverRoot(root,null);
+  }catch(_){}
+}
+function irClickPinnedHoverLeaveGuard(e){
+  try{
+    var pin=window.__irClickPinnedHover;
+    if(!pin||!e)return;
+    if((e.type==='mouseleave'||e.type==='pointerleave')&&e.target===pin.wrapper){
+      e.stopImmediatePropagation();
+    }
+  }catch(_){}
+}
+function irClickPinnedHoverSnapshot(){
+  try{
+    var pin=window.__irClickPinnedHover;
+    if(!pin)return {pinned:false};
+    var root=pin.wrapper&&pin.wrapper.querySelector?pin.wrapper.querySelector('.monaco-hover,.monaco-editor-hover'):pin.root;
+    return {
+      pinned:true,
+      wrapperConnected:!!(pin.wrapper&&document.body&&document.body.contains(pin.wrapper)),
+      rootConnected:!!(root&&document.body&&document.body.contains(root)),
+      wrapperMarked:!!(pin.wrapper&&pin.wrapper.classList&&pin.wrapper.classList.contains('ir-click-pinned-hover')),
+      rootMarked:!!(root&&root.classList&&root.classList.contains('ir-click-pinned-hover')),
+      focused:!!(root&&(document.activeElement===root||(root.contains&&root.contains(document.activeElement)))),
+      controllerKeepOpen:!!(pin.controller&&pin.controller.shouldKeepOpenOnEditorMouseMoveOrLeave)
+    };
+  }catch(_){return {pinned:false,error:true}}
+}
+track(window,'pointerdown',irClickPinPointerDown,true);
+track(window,'mousedown',irClickPinPointerDown,true);
+track(window,'mouseleave',irClickPinnedHoverLeaveGuard,true);
+track(window,'pointerleave',irClickPinnedHoverLeaveGuard,true);
+
 // Eat mousedown on type-links so VS Code's selection / focus-change
 // logic can't fire before our click handler — some hover widgets
 // dismiss on mousedown outside the editor.
@@ -4513,7 +4831,7 @@ function irTypeLinkPointerDown(e){
   // L94 (2026-05-31): native mode — a pointerdown on VS Code's native resize sash must NOT be
   // treated as an outside-click. The no-link branch below calls irDisposeActiveHoverForEditorTarget,
   // so grabbing the resize handle instantly dismissed the hover. Bow out so native resize runs.
-  if(IR_HOVER_NATIVE_ONLY){try{var __sashT=e&&e.target;if(__sashT&&__sashT.closest&&__sashT.closest('.monaco-sash,[class*="sash"]'))return;}catch(_){}}
+  if(IR_HOVER_NATIVE_ONLY){try{var __sashT=e&&e.target;if(__sashT&&__sashT.closest&&__sashT.closest('.monaco-sash,[class*="sash"]')){irEnableFlexibleHoverResize(__sashT);return;}}catch(_){}}
   var directLink=irClosestTypeLink(e.target);
   var wrappedLink=null;
   if(!directLink)wrappedLink=irWrapWordAtPoint(e);
@@ -6894,10 +7212,23 @@ function irNativeReleaseDismissedHoverBookkeeping(root){
       try{__b.__irLastScanText=null;__b.__irLastScanSig=null;__b.__irViewportWrap=false;__b.__irHoverLinkCandidates=null;}catch(_){}
     }
   }catch(_){}
+  // L137: a resized wrapper is reused by VS Code. Reset our opt-in only after
+  // the stable-dismiss predicate passes; doing it on a resize-time 0x0
+  // transient would snap the box back to the compact cap mid-drag.
+  var stablyDismissed=false;
+  try{
+    stablyDismissed=irHoverRootStablyDismissed(root);
+    if(stablyDismissed){
+      var flexibleWrapper=root&&root.closest?root.closest('.monaco-resizable-hover'):null;
+      var clickPin=window.__irClickPinnedHover;
+      if(clickPin&&(!flexibleWrapper||clickPin.wrapper===flexibleWrapper))irClearClickPinnedHover('native-dismiss',false);
+      if(flexibleWrapper&&window.__irFlexibleResizeActiveWrapper!==flexibleWrapper)irResetFlexibleHoverResize(flexibleWrapper,true);
+    }
+  }catch(_){}
   // L134 (2026-06-01): VS Code dismissed this hover — also release the drill history/snapshot
   // it owned (the retained md-string array + element refs). Only when SETTLED so a mid-drill
   // content-swap transient doesn't wipe live history. cf. irReleaseDrillHistoryForRoot.
-  try{if(irHoverRootStablyDismissed(root))irReleaseDrillHistoryForRoot(root,'native-dismiss');}catch(_){}
+  try{if(stablyDismissed)irReleaseDrillHistoryForRoot(root,'native-dismiss');}catch(_){}
 }
 function irReleaseNativeHiddenHover(root,reason,visibilityReason){
   // L95 (2026-05-31) DEPRECATED in native mode: VS Code owns dismiss/release. Our release on 0x0
@@ -7658,6 +7989,11 @@ function irSetActiveHoverLayer(hoverEl){
   }
   irRememberVisibleHoverRect(hoverEl,'set-active');
   var prev=window.__irActiveHoverEl;
+  try{
+    var activePin=window.__irClickPinnedHover;
+    var nextWrapper=hoverEl&&hoverEl.closest?hoverEl.closest('.monaco-resizable-hover'):null;
+    if(activePin&&nextWrapper&&activePin.wrapper!==nextWrapper)irClearClickPinnedHover('active-hover-switch',false);
+  }catch(_){}
   if(window.__irActiveHoverEl!==hoverEl)irStopActiveHoverHandleObserver();
   window.__irActiveHoverEl=hoverEl;
   try{hoverEl.__irActivatedAt=Date.now()}catch(_){}
@@ -8848,6 +9184,11 @@ window.__irTestHooks={
   activateHoverRoot:irActivateHoverRoot,
   refreshEmptyHoverRootState:irRefreshEmptyHoverRootState,
   applyHoverSizeTier:irApplyHoverSizeTier,
+  enableFlexibleHoverResize:irEnableFlexibleHoverResize,
+  resetFlexibleHoverResize:irResetFlexibleHoverResize,
+  pinNativeHoverRoot:irPinNativeHoverRoot,
+  clearClickPinnedHover:irClearClickPinnedHover,
+  clickPinnedHoverSnapshot:irClickPinnedHoverSnapshot,
   hoverBoxCornerSnapshot:irHoverBoxCornerSnapshot,
   disposeStaleHover:irDisposeStaleHover,
   removeInactiveHoverArtifacts:irRemoveInactiveHoverArtifacts,

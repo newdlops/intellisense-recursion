@@ -4902,6 +4902,96 @@ suite('Hover Symbol Coverage E2E', () => {
 suite('Hover Renderer E2E', () => {
   const lang = getFixtureLang();
 
+  test(`[${lang}] hover click pin persists until an outside click`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(120000);
+    await ensureExtensionCommandsReady('intellisenseRecursion.runHoverRendererHarnessForTests');
+    const rows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverRendererHarnessForTests',
+    );
+    const result = (rows || []).map(row => row?.value).find(value => value?.ok);
+    const pin = result?.clickPin;
+    assert.ok(pin?.afterPin && pin?.afterMove && pin?.afterOutside,
+      `Click-pin probe should run in the native renderer. Rows=${JSON.stringify(rows)}`);
+    assert.strictEqual(pin.afterPin.pinned, true,
+      `Primary click inside a hover should pin it. ${JSON.stringify(pin)}`);
+    assert.strictEqual(pin.afterPin.wrapperMarked, true,
+      `Pinned state should belong to the native resizable wrapper. ${JSON.stringify(pin)}`);
+    assert.strictEqual(pin.afterPin.rootMarked, true,
+      `Pinned state should mark the visible native hover root. ${JSON.stringify(pin)}`);
+    assert.strictEqual(pin.afterPin.controllerValue, true,
+      `Pinning should enable VS Code's native keep-open flag. ${JSON.stringify(pin)}`);
+    assert.strictEqual(pin.afterPin.focused, true,
+      `Pinning should focus the native hover widget. ${JSON.stringify(pin)}`);
+    assert.strictEqual(pin.afterPin.pointerDownAllowed, true,
+      `Pinning must not consume the original click. ${JSON.stringify(pin)}`);
+    assert.strictEqual(pin.afterMove.pinned, true,
+      `Moving away must not clear a click-pinned hover. ${JSON.stringify(pin)}`);
+    assert.strictEqual(pin.afterMove.wrapperLeaveReached, false,
+      `Only the pinned wrapper's native mouseleave dismiss listener should be intercepted. ${JSON.stringify(pin)}`);
+    assert.strictEqual(pin.afterOutside.pinned, false,
+      `The next outside primary click should clear the pin. ${JSON.stringify(pin)}`);
+    assert.strictEqual(pin.afterOutside.controllerValue, false,
+      `Outside click should restore the native controller keep-open flag. ${JSON.stringify(pin)}`);
+    assert.strictEqual(pin.afterOutside.outsideAllowed, true,
+      `Outside dismiss must not consume the user's destination click. ${JSON.stringify(pin)}`);
+    assert.strictEqual(pin.afterOutside.wrapperMarked, false,
+      `Outside click should remove the wrapper pin marker. ${JSON.stringify(pin)}`);
+    assert.strictEqual(pin.afterOutside.rootMarked, false,
+      `Outside click should remove the hover-root pin marker. ${JSON.stringify(pin)}`);
+    assert.ok((pin.afterOutside.hidePayloads || []).some((payload: string) => payload.startsWith('HIDE_HOVER:click-pin-')),
+      `Outside click should request the normal native hide path. ${JSON.stringify(pin)}`);
+  });
+
+  test(`[${lang}] native sash enables viewport-safe flexible hover resizing`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(120000);
+    await ensureExtensionCommandsReady('intellisenseRecursion.runHoverRendererHarnessForTests');
+    const rows = await vscode.commands.executeCommand<any[]>(
+      'intellisenseRecursion.runHoverRendererHarnessForTests',
+    );
+    const result = (rows || []).map(row => row?.value).find(value => value?.ok);
+    const flexible = result?.flexibleResize;
+    assert.ok(flexible?.before && flexible?.after && flexible?.reset,
+      `Flexible resize probe should run in the native renderer. Rows=${JSON.stringify(rows)}`);
+    assert.ok((flexible.before.maxWidth || 0) <= 681
+      && (flexible.before.maxHeight || 0) <= Math.ceil((result.viewport?.height || 0) * 0.48) + 1,
+    `Automatic sizing should retain the stable 680px/48vh envelope. ${JSON.stringify(flexible)}`);
+    assert.strictEqual(flexible.after.classEnabled, true,
+      `A native hover sash grab should enable flexible sizing. ${JSON.stringify(flexible)}`);
+    assert.strictEqual(flexible.after.nativeEventsAllowed, true,
+      `The resize pointerdown must remain unconsumed for VS Code's native drag handler. ${JSON.stringify(flexible)}`);
+    assert.strictEqual(flexible.after.unrelatedIgnored, true,
+      `A sash outside a hover wrapper must be ignored. ${JSON.stringify(flexible)}`);
+    assert.ok((flexible.after.widthCap || 0) > (flexible.before.rect?.width || 0)
+      && (flexible.after.heightCap || 0) > (flexible.before.rect?.height || 0),
+    `Explicit resize should unlock both axes beyond the compact box. ${JSON.stringify(flexible)}`);
+    assert.ok((flexible.after.rect?.right || Infinity) <= (flexible.after.maxRight || 0) + 1
+      && (flexible.after.rect?.bottom || Infinity) <= (flexible.after.maxBottom || 0) + 1,
+    `Explicit resize must retain the viewport gutter. ${JSON.stringify(flexible)}`);
+    assert.ok(Math.abs((flexible.after.hoverRect?.width || 0) - (flexible.after.rect?.width || 0)) <= 2
+      && Math.abs((flexible.after.hoverRect?.height || 0) - (flexible.after.rect?.height || 0)) <= 2,
+    `The hover host should follow the resized wrapper. ${JSON.stringify(flexible)}`);
+    assert.ok((flexible.after.scrollerRect?.right || Infinity) <= (flexible.after.rect?.right || 0) + 1
+      && (flexible.after.scrollerRect?.bottom || Infinity) <= (flexible.after.rect?.bottom || 0) + 1,
+    `The scroll layer should remain contained by the expanded wrapper. ${JSON.stringify(flexible)}`);
+    if ((result.viewport?.width || 0) >= 760) {
+      assert.ok((flexible.after.rect?.width || 0) > 680,
+        `A roomy viewport should resize beyond the old 680px cap. ${JSON.stringify(flexible)}`);
+    }
+    if ((result.viewport?.height || 0) >= 520) {
+      assert.ok((flexible.after.rect?.height || 0) > (flexible.before.maxHeight || 0),
+        `A roomy viewport should resize beyond the old 48vh cap. ${JSON.stringify(flexible)}`);
+    }
+    assert.deepStrictEqual(flexible.reset, {
+      classEnabled: false,
+      widthVariable: '',
+      heightVariable: '',
+      inlineWidth: '',
+      inlineHeight: '',
+    }, `The flexible-size opt-in should reset with the hover session. ${JSON.stringify(flexible)}`);
+  });
+
   test(`[${lang}] renderer hover widget resizes, disposes stale panels, and scrolls`, async function () {
     if (lang !== 'python') { this.skip(); return; }
     this.timeout(120000);
