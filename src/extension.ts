@@ -307,11 +307,33 @@ async function buildResultFromFastHit(
   const defUri = vscode.Uri.file(hit.path);
   const startLine = Math.max(0, hit.line - 1);
   try {
+    const rawDoc = await readRawFileSnapshot(hit.path);
+    if ((hit.kind === 'function' || hit.kind === 'method')
+      && !textLikeLineDeclaresIdentifier(
+        rawDoc,
+        refineDefinitionLineForIdentifier(rawDoc, typeName, startLine),
+        typeName,
+      )) {
+      // LSP discoveries are merged into the sidecar index. Older versions
+      // could accidentally store a call site as a function definition; do
+      // not let that poisoned discovery become a fast-path preview.
+      log.warn(`[bg]   "${typeName}" rejected non-declaration sidecar hit ${hit.path}:${hit.line}`);
+      return null;
+    }
     return await buildDefinitionPreviewResultFromRawFile(typeName, defUri, hit.path, startLine);
   } catch (rawErr) {
     log.warn(`[bg]   "${typeName}" raw fast preview failed: ${rawErr}`);
     const defDoc = findOpenDoc(defUri)
       ?? await withTimeout(vscode.workspace.openTextDocument(defUri), 1_000, 'openDef (fast)');
+    if ((hit.kind === 'function' || hit.kind === 'method')
+      && !textLikeLineDeclaresIdentifier(
+        defDoc,
+        refineDefinitionLineForIdentifier(defDoc, typeName, startLine),
+        typeName,
+      )) {
+      log.warn(`[bg]   "${typeName}" rejected non-declaration sidecar fallback ${hit.path}:${hit.line}`);
+      return null;
+    }
     return buildDefinitionPreviewResult(typeName, defUri, defDoc, startLine);
   }
 }
@@ -446,6 +468,102 @@ let internalHoverProviderRequestDepth = 0;
 // withTimeout moved to ./common-utils (Phase 9 split).
 // open-document index (ensureOpenDocIndex/findOpenDoc/registerOpenDocIndexListeners) moved to ./common-utils (Phase 9 split).
 
+interface NormalizedDefinition {
+  uri: vscode.Uri;
+  /** Precise symbol selection (LocationLink.targetSelectionRange when present). */
+  range: vscode.Range;
+  /** Broader declaration/body hint supplied by LocationLink. */
+  targetRange?: vscode.Range;
+}
+
+interface OpenDefinitionCandidate {
+  def: NormalizedDefinition;
+  doc: vscode.TextDocument;
+  startLine: number;
+  verified: boolean;
+}
+
+function lineDeclaresCallableIdentifier(line: string, identifier: string): boolean {
+  if (!declarationIdentifiersInLine(line).some(item => item.id === identifier)) { return false; }
+  const name = esc(identifier);
+  const trimmed = line.trim();
+  return new RegExp(`^(?:export\\s+)?(?:async\\s+)?(?:def|fn|func|function)\\s+${name}\\b`).test(trimmed)
+    || new RegExp(`^(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set)\\s+)*${name}\\s*(?:<[^>\\n]*>)?\\s*\\(`).test(trimmed);
+}
+
+function definitionCandidateLooksLikeUsage(
+  doc: vscode.TextDocument,
+  def: NormalizedDefinition,
+  identifier: string,
+): boolean {
+  const lineNumber = def.range.start.line;
+  if (lineNumber < 0 || lineNumber >= doc.lineCount) { return true; }
+  const line = doc.lineAt(lineNumber).text;
+  let index = def.range.start.character;
+  if (line.slice(index, index + identifier.length) !== identifier) {
+    const match = new RegExp(`\\b${esc(identifier)}\\b`).exec(line);
+    if (!match) { return true; }
+    index = match.index;
+  }
+  const after = line.slice(index + identifier.length);
+  const isCall = /^\s*(?:<[^>\n]*>)?\s*\(/.test(after);
+  const trimmed = line.trimStart();
+  if (/^(?:from|import)\b/.test(trimmed) || /^export\s+\{/.test(trimmed)) { return true; }
+  if (!isCall) { return false; }
+
+  const before = line.slice(0, index).trim();
+  if (!before) { return true; }
+  // Preserve unknown declaration syntaxes (for example `Result foo(`) as a
+  // soft fallback. These endings, however, are unambiguously expression/use
+  // contexts rather than a return type or declaration modifier.
+  return /(?:[=,:;([{]|\.|->)\s*$/.test(before)
+    || /\b(?:return|await|yield|throw|raise|new|if|elif|while|for|case|when|and|or|not)\s*$/.test(before);
+}
+
+async function selectDefinitionCandidate(
+  typeName: string,
+  defs: any[] | undefined,
+): Promise<OpenDefinitionCandidate | null> {
+  let fallback: OpenDefinitionCandidate | null = null;
+  let best: (OpenDefinitionCandidate & { score: number }) | null = null;
+
+  for (const raw of defs ?? []) {
+    const def = normalizeDef(raw);
+    if (!def) { continue; }
+    let doc: vscode.TextDocument;
+    try {
+      doc = findOpenDoc(def.uri) ?? await withTimeout(
+        vscode.workspace.openTextDocument(def.uri),
+        BG_RESOLVE_DEF_TIMEOUT_MS,
+        'openDef',
+      );
+    } catch (err) {
+      log.warn(`[bg]   "${typeName}" definition candidate open failed: ${err}`);
+      continue;
+    }
+
+    const preferredLine = def.range.start.line;
+    const startLine = refineDefinitionLineForIdentifier(doc, typeName, preferredLine);
+    const verified = textLikeLineDeclaresIdentifier(doc, startLine, typeName);
+    const candidate: OpenDefinitionCandidate = { def, doc, startLine, verified };
+    if (verified) {
+      // An exact selection-range declaration beats a same-file refinement
+      // from an imprecise provider result. Either beats an unverified result.
+      const score = startLine === preferredLine ? 2 : 1;
+      if (score === 2) { return candidate; }
+      if (!best || score > best.score) { best = { ...candidate, score }; }
+      continue;
+    }
+    if (!fallback && !definitionCandidateLooksLikeUsage(doc, def, typeName)) {
+      // Keep compatibility with declaration syntaxes our lightweight matcher
+      // does not understand, but never fall back to an obvious call/import.
+      fallback = candidate;
+    }
+  }
+
+  return best ?? fallback;
+}
+
 /**
  * Actual defProvider + hoverProvider resolve. Runs to completion (bounded by
  * BG_RESOLVE_DEF_TIMEOUT_MS / BG_RESOLVE_HOVER_TIMEOUT_MS) and writes the
@@ -511,16 +629,16 @@ function resolveInBackground(
         'defProvider',
       );
 
-      const def = defs?.length ? normalizeDef(defs[0]) : null;
-      if (def) {
-        const defDoc = findOpenDoc(def.uri) ?? await withTimeout(
-          vscode.workspace.openTextDocument(def.uri),
-          BG_RESOLVE_DEF_TIMEOUT_MS,
-          'openDef',
-        );
-        const startLine = def.range.start.line;
+      const candidate = await selectDefinitionCandidate(typeName, defs);
+      if (candidate) {
+        const { def, doc: defDoc, startLine } = candidate;
         const relPath = vscode.workspace.asRelativePath(def.uri);
-        const hintedEndLine = def.range.end.line > startLine ? def.range.end.line : undefined;
+        const fullRange = def.targetRange;
+        const hintedEndLine = fullRange
+          && fullRange.start.line <= startLine
+          && fullRange.end.line > startLine
+          ? fullRange.end.line
+          : undefined;
         const result = buildDefinitionPreviewResult(typeName, def.uri, defDoc, startLine, hintedEndLine);
         defCacheSet(cacheKey, result);
         // Promote the LSP-resolved location into the sidecar's discovery
@@ -530,14 +648,20 @@ function resolveInBackground(
         // edit to this file. Kind is a heuristic — type-shaped names skew
         // class, anything else falls back to function.
         if (indexManager && isSupportedFsPath(def.uri.fsPath)) {
+          const resolvedLine = result.location.range.start.line;
+          const resolvedText = defDoc.lineAt(resolvedLine).text;
+          const declaration = declarationIdentifiersInLine(resolvedText)
+            .find(item => item.id === typeName);
           const kind: SidecarKind = CONSTANT_SHAPED_NAME.test(typeName)
             ? 'variable'
-            : TYPE_SHAPED_NAME.test(typeName) ? 'class' : 'function';
+            : TYPE_SHAPED_NAME.test(typeName)
+              ? 'class'
+              : lineDeclaresCallableIdentifier(resolvedText, typeName) ? 'function' : 'variable';
           void indexManager.addDiscovery(
             typeName,
             def.uri.fsPath,
-            def.range.start.line + 1,
-            def.range.start.character + 1,
+            resolvedLine + 1,
+            (declaration?.index ?? def.range.start.character) + 1,
             kind,
           );
         }
@@ -1592,6 +1716,27 @@ function patchSharedService(service: any) {
     return new RegExp(`\\b(?:class|interface|enum|struct|type)\\s+${esc(typeName)}\\b`).test(text);
   }
 
+  function nativeHoverHasCallableSignature(res: any, identifier: string): boolean {
+    if (!identifier) { return false; }
+    const text = hoverResultText(res);
+    if (!text) { return false; }
+    const name = esc(identifier);
+    for (const fence of text.matchAll(/```\w*\n?([\s\S]*?)```/g)) {
+      const source = fence[1] || '';
+      // Do not mistake a class constructor signature (`class User(...)`) for
+      // a callable symbol. Class hovers keep the recursive type path.
+      if (new RegExp(`\\b(?:class|interface|enum|struct|type)\\s+${name}\\b`).test(source)) {
+        continue;
+      }
+      if (new RegExp(`\\b(?:async\\s+)?(?:def|fn|func|function)\\s+${name}\\b`).test(source)
+        || new RegExp(`(?:^|[^A-Za-z0-9_$])${name}\\s*(?:<[^>\\n]*>)?\\s*\\(`, 'm').test(source)
+        || new RegExp(`\\b${name}\\s*:\\s*\\([^)]{0,1000}\\)\\s*(?:=>|->)`).test(source)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
   service.$provideHover = async function (handle: number, uri: any, position: any, context: any, token: any) {
     const hoverT0 = Date.now();
     const fileName = (uri?.path || '').split('/').pop() || '?';
@@ -1841,11 +1986,16 @@ function patchSharedService(service: any) {
       return value;
     };
 
-    // Prefer the exact word under the cursor, then supplement with type names
-    // discovered in native hover code fences. This covers symbols where the
-    // language server has definition data but no hover text.
+    // Prefer the exact word under the cursor. For variables and type-shaped
+    // symbols, supplement it with names discovered in native hover code
+    // fences. A callable signature is different: its other names are
+    // parameters/return types, so previewing them here can replace the
+    // function body with its return model when provider responses race.
     const skipDirectClassPreview = hoveredCandidate
       ? nativeHoverHasClassLikeSource(result, hoveredCandidate.name)
+      : false;
+    const preferExactCallablePreview = hoveredCandidate
+      ? nativeHoverHasCallableSignature(result, hoveredCandidate.name)
       : false;
     const directCandidateNeedsFallback = hoveredCandidate
       ? shouldDirectHoverCandidate(hoveredCandidate.name)
@@ -1856,14 +2006,16 @@ function patchSharedService(service: any) {
     if (hoveredCandidate && directCandidateNeedsFallback && !skipDirectClassPreview) {
       types.push(hoveredCandidate.name);
     }
-    for (const content of (result?.contents || [])) {
-      if (!content || typeof content.value !== 'string') { continue; }
-      const fences = content.value.matchAll(/```\w*\n?([\s\S]*?)```/g);
-      for (const fence of fences) {
-        if (!fence[1]) { continue; }
-        for (const name of findTypeNames(fence[1].trim())) {
-          if (skipDirectClassPreview && hoveredCandidate?.name === name) { continue; }
-          types.push(name);
+    if (!preferExactCallablePreview) {
+      for (const content of (result?.contents || [])) {
+        if (!content || typeof content.value !== 'string') { continue; }
+        const fences = content.value.matchAll(/```\w*\n?([\s\S]*?)```/g);
+        for (const fence of fences) {
+          if (!fence[1]) { continue; }
+          for (const name of findTypeNames(fence[1].trim())) {
+            if (skipDirectClassPreview && hoveredCandidate?.name === name) { continue; }
+            types.push(name);
+          }
         }
       }
     }
@@ -4740,6 +4892,100 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
       }
       function detachedHoverDragProbe() {
         try { if (hooks.clearDetachedHovers) hooks.clearDetachedHovers('e2e-start'); } catch (_) {}
+        var themeScope = document.createElement('div');
+        themeScope.className = 'monaco-workbench ir-e2e-detached-theme-scope';
+        var sourceSyntaxScope = document.createElement('div');
+        sourceSyntaxScope.className = 'ir-e2e-detached-source-syntax-scope';
+        themeScope.appendChild(sourceSyntaxScope);
+        var themeStyle = document.createElement('style');
+        themeStyle.className = 'ir-e2e-detached-theme-style';
+        themeStyle.textContent = [
+          '.monaco-workbench.ir-e2e-detached-theme-scope{--ir-e2e-hover-theme-token:scoped-hover-theme;}',
+          '.monaco-workbench.ir-e2e-detached-theme-scope .ir-e2e-detached-source-syntax-scope .ir-e2e-theme-plain.mtk191{color:rgb(17, 34, 51) !important;}',
+          '.monaco-workbench.ir-e2e-detached-theme-scope .ir-e2e-detached-source-syntax-scope .ir-e2e-theme-italic.mtk192.mtki{color:rgb(68, 85, 102) !important;font-style:italic !important;}',
+          '.monaco-workbench.ir-e2e-detached-theme-scope .ir-e2e-detached-source-syntax-scope .ir-e2e-theme-bold.mtk193.mtkb{color:rgb(119, 136, 153) !important;font-weight:700 !important;}',
+          '.monaco-workbench.ir-e2e-detached-theme-scope .ir-e2e-detached-source-syntax-scope .ir-e2e-theme-bracket.bracket-highlighting-0{color:rgb(170, 51, 102) !important;text-decoration-line:underline !important;text-decoration-color:rgb(34, 187, 119) !important;}',
+          '.monaco-workbench.ir-e2e-detached-theme-scope .monaco-tokenized-source span{color:rgb(45, 67, 89);}',
+          '.monaco-workbench.ir-e2e-detached-theme-scope .monaco-tokenized-source span:nth-of-type(2n){color:rgb(98, 76, 54);}'
+        ].join('');
+        (document.head || document.documentElement).appendChild(themeStyle);
+        (document.body || document.documentElement).appendChild(themeScope);
+        function makeThemeLineTokens(line) {
+            var length = String(line || '').length;
+            var first = Math.max(1, Math.floor(length / 3));
+            var second = Math.max(first + 1, Math.floor(length * 2 / 3));
+            if (second >= length) second = Math.max(first, length - 1);
+            var starts = length > 2 ? [0, first, second] : [0];
+            var metadata = length > 2
+              ? [(21 << 15), (22 << 15) | 0x0800, (23 << 15) | 0x1000]
+              : [(21 << 15)];
+            return {
+              getCount: function() { return starts.length; },
+              getStartOffset: function(index) { return starts[index]; },
+              getEndOffset: function(index) { return index + 1 < starts.length ? starts[index + 1] : length; },
+              getMetadata: function(index) { return metadata[index]; },
+              getForeground: function(index) { return (metadata[index] >>> 15) & 0x1FF; },
+              getClassName: function(index) {
+                return index === 1 ? 'mtk22 mtki' : index === 2 ? 'mtk23 mtkb' : 'mtk21';
+              }
+            };
+        }
+        var themeTokenModel = {
+          getLanguageId: function() { return 'python'; },
+          getLineCount: function() { return 2; },
+          tokenization: {
+            forceTokenization: function() {},
+            // TreeSitter-shaped model part: no private TextMate _tokenizer,
+            // only the cross-engine API used by VS Code's inline-edit UI.
+            tokens: { get: function() { return {}; } },
+            tokenizeLinesAt: function(_lineNumber, lines) { return lines.map(makeThemeLineTokens); }
+          }
+        };
+        var themeTokenEditor = { getModel: function() { return themeTokenModel; } };
+        function syntaxThemeSignature(root) {
+          var nodes = root && root.querySelectorAll ? root.querySelectorAll('[data-ir-theme-probe]') : [];
+          var rows = [];
+          for (var i = 0; i < nodes.length; i++) {
+            var node = nodes[i];
+            var cs = window.getComputedStyle(node);
+            rows.push({
+              key: String(node.getAttribute('data-ir-theme-probe') || ''),
+              className: String(node.className || ''),
+              color: String(cs.color || ''),
+              backgroundColor: String(cs.backgroundColor || ''),
+              fontStyle: String(cs.fontStyle || ''),
+              fontWeight: String(cs.fontWeight || ''),
+              textDecorationLine: String(cs.textDecorationLine || ''),
+              textDecorationStyle: String(cs.textDecorationStyle || ''),
+              textDecorationColor: String(cs.textDecorationColor || ''),
+              textDecorationThickness: String(cs.textDecorationThickness || ''),
+              opacity: String(cs.opacity || '')
+            });
+          }
+          return rows;
+        }
+        function tokenizationMetrics(root) {
+          var blocks = root && root.querySelectorAll ? root.querySelectorAll('.monaco-tokenized-source') : [];
+          var spans = root && root.querySelectorAll ? root.querySelectorAll('.monaco-tokenized-source [class*="mtk"]') : [];
+          var classSet = {};
+          var sourceSet = {};
+          var colorSet = {};
+          for (var bi = 0; bi < blocks.length; bi++) {
+            sourceSet[String(blocks[bi].getAttribute('data-ir-tokenization-source') || 'native')] = true;
+          }
+          for (var si = 0; si < spans.length; si++) {
+            var classMatches = String(spans[si].className || '').match(/mtk\\d+/g) || [];
+            for (var ci = 0; ci < classMatches.length; ci++) classSet[classMatches[ci]] = true;
+            colorSet[String(window.getComputedStyle(spans[si]).color || '')] = true;
+          }
+          return {
+            blockCount: blocks.length,
+            tokenSpanCount: spans.length,
+            mtkClasses: Object.keys(classSet).sort(),
+            tokenizationSources: Object.keys(sourceSet).sort(),
+            colors: Object.keys(colorSet).filter(Boolean).sort()
+          };
+        }
         function dragStateSnapshot() {
           return {
             candidate: !!window.__irHoverDragCandidate,
@@ -4762,6 +5008,7 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
             };
           }
           wrapper.__irHoverPinController = controller;
+          wrapper.__irHoverPinEditor = themeTokenEditor;
           return controller;
         }
         function paintPinnedSourceContent(content, label) {
@@ -4778,6 +5025,29 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
           external.setAttribute('data-href', 'https://example.com/cloned-detached-docs');
           external.textContent = ' External docs';
           markdown.appendChild(external);
+          var tokenized = document.createElement('pre');
+          tokenized.className = 'monaco-tokenized-source ir-e2e-theme-tokenized-source';
+          var plain = document.createElement('span');
+          plain.className = 'mtk191 ir-e2e-theme-plain';
+          plain.setAttribute('data-ir-theme-probe', 'plain');
+          plain.textContent = 'class ';
+          var italic = document.createElement('span');
+          italic.className = 'mtk192 mtki ir-e2e-theme-italic';
+          italic.setAttribute('data-ir-theme-probe', 'italic');
+          italic.textContent = label;
+          var bold = document.createElement('span');
+          bold.className = 'mtk193 mtkb ir-e2e-theme-bold';
+          bold.setAttribute('data-ir-theme-probe', 'bold');
+          bold.textContent = ': ';
+          var bracket = document.createElement('span');
+          bracket.className = 'mtk194 bracket-highlighting-0 ir-e2e-theme-bracket';
+          bracket.setAttribute('data-ir-theme-probe', 'bracket');
+          bracket.textContent = '()';
+          tokenized.appendChild(plain);
+          tokenized.appendChild(italic);
+          tokenized.appendChild(bold);
+          tokenized.appendChild(bracket);
+          markdown.appendChild(tokenized);
           markdown.appendChild(document.createTextNode('\\n' + new Array(32).fill(label + ' detail row').join(String.fromCharCode(10))));
           content.appendChild(markdown);
           return link;
@@ -4805,7 +5075,7 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
           hover.appendChild(scroller);
           wrapper.appendChild(hover);
           var controller = makeController(wrapper, directHide);
-          document.body.appendChild(wrapper);
+          sourceSyntaxScope.appendChild(wrapper);
           void scroller.scrollHeight;
           scroller.scrollTop = 37;
           return { wrapper: wrapper, hover: hover, scroller: scroller, content: content, link: link, controller: controller };
@@ -4855,10 +5125,13 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
               if (fallbackSource && fallbackSource.wrapper) fallbackSource.wrapper.style.setProperty('display', 'none', 'important');
             } else if (value.indexOf('DETACHED:') === 0) {
               try { detachedPayloads.push(JSON.parse(value.slice('DETACHED:'.length))); } catch (_) {}
-            } else legacyPayloads.push(value);
+            } else if (value.indexOf('LOG:') !== 0) legacyPayloads.push(value);
           };
           var first = makePinnedSource('DragFirstModel', 60, 70, true);
           sources.push(first);
+          var firstThemeBeforeDetach = syntaxThemeSignature(first.wrapper);
+          var sourceThemeVariableBeforeDetach = window.getComputedStyle(first.wrapper)
+            .getPropertyValue('--ir-e2e-hover-theme-token').trim();
           var firstRect = first.wrapper.getBoundingClientRect();
           var firstX = firstRect.left + 46;
           var firstY = firstRect.top + 34;
@@ -4887,6 +5160,24 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
           afterFirstDrag.sourceMarked = first.wrapper.classList.contains('ir-click-pinned-hover');
           afterFirstDrag.rootMarked = first.hover.classList.contains('ir-click-pinned-hover');
           var firstDetached = afterFirstDrag.windows && afterFirstDrag.windows[0];
+          var firstDetachedEl = firstDetached && document.querySelector('.ir-detached-hover[data-ir-detached-hover-id="' + firstDetached.id + '"]');
+          var detachedLayer = firstDetachedEl && firstDetachedEl.closest('.ir-detached-hover-layer');
+          afterFirstDrag.syntaxTheme = {
+            source: firstThemeBeforeDetach,
+            detached: syntaxThemeSignature(firstDetachedEl),
+            sourceThemeVariable: sourceThemeVariableBeforeDetach,
+            detachedThemeVariable: firstDetachedEl
+              ? window.getComputedStyle(firstDetachedEl).getPropertyValue('--ir-e2e-hover-theme-token').trim()
+              : '',
+            layerThemeVariable: detachedLayer
+              ? window.getComputedStyle(detachedLayer).getPropertyValue('--ir-e2e-hover-theme-token').trim()
+              : '',
+            layerInsideSourceWorkbench: !!(detachedLayer && themeScope.contains(detachedLayer)),
+            detachedInsideSourceWorkbench: !!(firstDetachedEl && themeScope.contains(firstDetachedEl)),
+            layerClosestWorkbenchClass: detachedLayer && detachedLayer.closest('.monaco-workbench')
+              ? String(detachedLayer.closest('.monaco-workbench').className || '')
+              : ''
+          };
           var firstStableRect = firstDetached && firstDetached.rect;
           fire(document.body, moveType, firstX + 110, firstY + 90, 0, 11);
           var afterPointerUpMove = hooks.detachedHoverSnapshot();
@@ -4996,13 +5287,20 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
                     previewMessage.sessionKey,
                     previewMessage.requestId,
                     'DetachedTargetModel',
-                    'DetachedTargetModel preview\\n\\nclass DetachedTargetModel:\\n    nested: NestedTargetModel\\n\\n[Docs](https://example.com/detached-docs)'
+                    'DetachedTargetModel preview\\n\\n' + String.fromCharCode(96, 96, 96)
+                      + 'python\\nclass DetachedTargetModel:\\n    nested: NestedTargetModel\\n'
+                      + String.fromCharCode(96, 96, 96)
+                      + '\\n\\n' + String.fromCharCode(96, 96, 96)
+                      + 'python\\nx\\n'
+                      + String.fromCharCode(96, 96, 96)
+                      + '\\n\\n[Docs](https://example.com/detached-docs)'
                   )
                 : { ok: false, reason: 'missing-preview-message' };
               var commitResult = previewMessage && applyResult && applyResult.ok && hooks.commitDetachedPreview
                 ? hooks.commitDetachedPreview(previewMessage.sessionKey, previewMessage.requestId)
                 : { ok: false, reason: 'missing-apply' };
               var firstTextAfterApply = String(firstEl.textContent || '');
+              var tokenizationAfterApply = tokenizationMetrics(firstEl);
               var safeLink = firstEl.querySelector('a[data-ir-detached-safe-link="1"]');
               var safeLinkState = safeLink ? {
                 href: String(safeLink.getAttribute('href') || ''),
@@ -5028,6 +5326,7 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
                 applyResult: applyResult,
                 commitResult: commitResult,
                 firstTextAfterApply: firstTextAfterApply,
+                tokenizationAfterApply: tokenizationAfterApply,
                 clonedSafeLink: clonedSafeLinkState,
                 safeLink: safeLinkState,
                 otherTextAfterApply: otherTextAfterApply,
@@ -5172,6 +5471,8 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
           for (var si = 0; si < sources.length; si++) {
             try { if (sources[si].wrapper.parentNode) sources[si].wrapper.parentNode.removeChild(sources[si].wrapper); } catch (_) {}
           }
+          try { if (themeScope.parentNode) themeScope.parentNode.removeChild(themeScope); } catch (_) {}
+          try { if (themeStyle.parentNode) themeStyle.parentNode.removeChild(themeStyle); } catch (_) {}
         }
         return result;
       }
@@ -11314,10 +11615,14 @@ async function goToTypeHandler(docUriArg?: unknown, identifierArg?: unknown) {
   }
 }
 
-// Normalize defProvider result (Location or LocationLink) to {uri, range}
-function normalizeDef(d: any): { uri: vscode.Uri; range: vscode.Range } | null {
+// Normalize defProvider result (Location or LocationLink). A LocationLink's
+// selection range is the exact symbol anchor; targetRange can span decorators
+// or a whole declaration and is retained only as an end-range hint.
+function normalizeDef(d: any): NormalizedDefinition | null {
   if (d.targetUri) {
-    return { uri: d.targetUri, range: d.targetRange || d.targetSelectionRange };
+    const range = d.targetSelectionRange || d.targetRange;
+    if (!range) { return null; }
+    return { uri: d.targetUri, range, targetRange: d.targetRange || range };
   }
   if (d.uri && d.range) {
     return { uri: d.uri, range: d.range };
@@ -11344,8 +11649,9 @@ function findDefInText(text: string, identifier: string, doc: vscode.TextDocumen
     new RegExp(`^[ \\t]*pub[ \\t]+(?:struct|enum|fn|type|const|static)[ \\t]+${escaped}\\b`, 'm'),
     // 4. const/let/var declaration: const X, let X, var X, export const X
     new RegExp(`^[ \\t]*(?:export[ \\t]+)?(?:const|let|var)[ \\t]+${escaped}\\b`, 'm'),
-    // 5. Method signature (TS interface/class): X(..., public X(..., X<T>(...
-    new RegExp(`^[ \\t]+${modifiers}${escaped}[ \\t]*(?:<[^>\\n]*>)?[<(]`, 'm'),
+    // 5. Method signature (TS interface/class). Do not accept a bare indented
+    // `X(...)` call: require a body, expression body, or return-type marker.
+    new RegExp(`^[ \\t]+${modifiers}${escaped}[ \\t]*(?:<[^>\\n]*>)?[ \\t]*\\([^)]*\\)[ \\t]*(?:\\{|=>|:[^;{\\n]+(?:\\{|;|$))`, 'm'),
     // 6. Field/property declaration: X: Type, readonly X?: Type, public X = ...
     new RegExp(`^[ \\t]+${modifiers}${escaped}[ \\t]*[:?=][ \\t]*\\w`, 'm'),
     // 7. Django/Python field: X = models.SomeField(...) or X = SomeType(...)

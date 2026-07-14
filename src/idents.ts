@@ -90,7 +90,12 @@ export function declarationIdentifiersInLine(line: string): Array<{ id: string; 
     return out;
   }
 
-  const methodMatch = /^(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>\n]*>)?\s*\([^=;{}]*\)\s*(?::|=>|\{|$)/.exec(trimmed);
+  // A bare `foo()` line is a call, not a declaration. Requiring an explicit
+  // declaration suffix keeps call sites from being promoted into definition
+  // previews while still covering class/interface methods (`foo(): T`,
+  // `foo() {`, and expression-bodied `foo() => ...`). Keyword-led functions
+  // (`def`, `function`, ...) are handled by the patterns above.
+  const methodMatch = /^(?:(?:public|private|protected|static|readonly|override|abstract|async|get|set)\s+)*([A-Za-z_$][\w$]*)\s*(?:<[^>\n]*>)?\s*\([^=;{}]*\)\s*(?::|=>|\{)/.exec(trimmed);
   if (methodMatch?.[1]) {
     const index = line.indexOf(methodMatch[1]);
     if (index >= 0) { out.push({ id: methodMatch[1], index }); }

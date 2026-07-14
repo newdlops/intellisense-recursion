@@ -110,8 +110,11 @@
 //   titlebar-only dragging, selectable/copyable content, viewport-safe resize
 //   handles, and an isolated per-window preview-link lane. Detached navigation
 //   never borrows the native singleton hover's target or drill history.
+// v313 (L141, 2026-07-14): detached windows stay inside the workbench theme
+//   scope, preserve editor-scoped token presentation when snapshotted, and
+//   reuse captured live editor grammars for syntax highlighting after drill.
 // If the running window still logs v<300, the new build is NOT loaded yet.
-export const RENDERER_PATCH_VERSION = 312;
+export const RENDERER_PATCH_VERSION = 313;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -385,6 +388,7 @@ window.__irCleanup=function(reason){
     window.__irMonacoCaps=null;
     window.__irMdRenderer=null;
     window.__irTokSupports={};
+    window.__irTokSupportMisses={};
     window.__irTokenizeToString=null;
     window.__irTestHooks=null;
     window.__irPatchVersion=0;
@@ -4714,14 +4718,31 @@ function irIsDetachedHoverElement(el){
 function irIsDetachedHoverRoot(root){
   try{return !!(root&&root.closest&&root.closest('.ir-detached-hover'))}catch(_){return false}
 }
-function irEnsureDetachedHoverLayer(){
+function irDetachedHoverThemeHost(source){
   try{
+    var node=source&&(source.nodeType===1?source:source.parentElement);
+    var scoped=node&&node.closest?node.closest('.monaco-workbench'):null;
+    if(scoped&&document.documentElement&&document.documentElement.contains(scoped))return scoped;
+    return document.querySelector('.monaco-workbench')||document.body||document.documentElement;
+  }catch(_){return document.body||document.documentElement}
+}
+function irEnsureDetachedHoverLayer(source){
+  try{
+    var host=irDetachedHoverThemeHost(source);
     var layer=window.__irDetachedHoverLayer;
-    if(layer&&document.body&&document.body.contains(layer))return layer;
+    if(layer){
+      // VS Code installs the active color theme (including --vscode-* custom
+      // properties) on .monaco-workbench. A body-level portal is its sibling,
+      // so a detached hover used to lose part of the native hover theme as
+      // soon as it was reparented. Keep the portal inside the same workbench;
+      // position:fixed still gives every detached window viewport geometry.
+      if(host&&layer.parentNode!==host)host.appendChild(layer);
+      return layer;
+    }
     layer=document.createElement('div');
     layer.className='ir-detached-hover-layer';
     layer.setAttribute('data-ir-detached-hover-layer','1');
-    (document.body||document.documentElement).appendChild(layer);
+    host.appendChild(layer);
     window.__irDetachedHoverLayer=layer;
     return layer;
   }catch(_){return null}
@@ -4741,7 +4762,7 @@ function irBringDetachedHoverToFront(state){
     window.__irDetachedHoverZ=next;
     state.z=next;
     state.el.style.setProperty('--ir-detached-hover-z',String(next));
-    irEnsureDetachedHoverLayer();
+    irEnsureDetachedHoverLayer(state.el);
   }catch(_){ }
 }
 function irNotifyDetachedHover(state,op,details){
@@ -4857,6 +4878,45 @@ function irCopyDetachedHoverPresentation(sourceWrapper,clone,sourceRoot,cloneRoo
     }
   }catch(_){ }
 }
+function irRepairDetachedTokenPresentation(sourceWrapper,clone){
+  try{
+    if(!sourceWrapper||!clone||!window.getComputedStyle)return 0;
+    var selector='.monaco-tokenized-source [class*="mtk"],.monaco-tokenized-source [class*="bracket-highlighting-"],.monaco-tokenized-source .unexpected-closing-bracket';
+    var sources=sourceWrapper.querySelectorAll(selector);
+    var targets=clone.querySelectorAll(selector);
+    var properties=['color','background-color','font-style','font-weight','text-decoration-line','text-decoration-style','text-decoration-color','text-decoration-thickness','opacity'];
+    var cache={};
+    var repaired=0;
+    for(var i=0;i<sources.length&&i<targets.length;i++){
+      var source=sources[i],target=targets[i];
+      // Most .mtkN rules are global and therefore already match. Cache the
+      // comparison by token + nearby context so even a very large hover only
+      // performs computed-style reads for its small set of distinct token
+      // shapes. Editor-scoped decorations (notably bracket-highlighting-N)
+      // receive only the properties that actually changed after reparenting.
+      var parent=source.parentElement;
+      var key=String(source.className||'')+'|'+String(source.getAttribute('style')||'')
+        +'|'+String(parent&&parent.className||'')+'|'+String(parent&&parent.getAttribute&&parent.getAttribute('style')||'');
+      var patch=cache[key];
+      if(patch===undefined){
+        patch=[];
+        var sourceStyle=window.getComputedStyle(source);
+        var targetStyle=window.getComputedStyle(target);
+        for(var pi=0;pi<properties.length;pi++){
+          var property=properties[pi];
+          var sourceValue=sourceStyle.getPropertyValue(property);
+          var targetValue=targetStyle.getPropertyValue(property);
+          if(sourceValue&&sourceValue!==targetValue)patch.push([property,sourceValue]);
+        }
+        cache[key]=patch;
+      }
+      for(var pj=0;pj<patch.length;pj++)target.style.setProperty(patch[pj][0],patch[pj][1]);
+      if(patch.length)repaired++;
+    }
+    if(repaired)clone.setAttribute('data-ir-detached-token-repairs',String(repaired));
+    return repaired;
+  }catch(_){return 0}
+}
 function irRehydrateDetachedVtails(sourceWrapper,clone,cloneRoot){
   var renders=[];
   try{
@@ -4963,6 +5023,7 @@ function irRemoveDetachedHover(stateOrEl,reason){
     state.vtailRenders=null;
     state.pageStack=null;
     state.currentPage=null;
+    state.tokenizationEditor=null;
     state.linkScrollTarget=null;
     state.linkScrollListener=null;
     irHERecord('hover-detached-closed',{reason:String(reason||'close'),remaining:list.length});
@@ -5159,6 +5220,7 @@ function irCreateDetachedHoverSnapshot(pin){
       currentTypeName:'',
       currentPage:{kind:'live',typeName:'',md:null},
       pageStack:[],
+      tokenizationEditor:pin.editor||(pin.widget&&pin.widget._editor)||null,
       createdAt:Date.now(),
       capturedScrollTop:(function(){
         for(var si=0;si<scrollOffsets.length;si++)if(scrollOffsets[si].top)return scrollOffsets[si].top;
@@ -5166,9 +5228,10 @@ function irCreateDetachedHoverSnapshot(pin){
       })()
     };
     clone.__irDetachedHoverState=state;
-    var layer=irEnsureDetachedHoverLayer();
+    var layer=irEnsureDetachedHoverLayer(pin.wrapper);
     if(!layer)return null;
     layer.appendChild(clone);
+    irRepairDetachedTokenPresentation(pin.wrapper,clone);
     irFitDetachedHoverSizeToViewport(state);
     irSetDetachedHoverPosition(state,rect.left,rect.top);
     irBringDetachedHoverToFront(state);
@@ -10876,6 +10939,11 @@ function irNativeTokenizedSourceStyle(){
 }
 function irBuildMdDom(md,parent){
   var i=0; var len=md.length;
+  var preferredTokenEditor=null;
+  try{
+    var detachedTokenState=irDetachedHoverStateFromElement(parent);
+    preferredTokenEditor=detachedTokenState&&detachedTokenState.tokenizationEditor||null;
+  }catch(_){}
   while(i<len){
     var fenceAt=-1;
     if(md.substr(i,3)==='\\\`\\\`\\\`') fenceAt=i;
@@ -10896,9 +10964,11 @@ function irBuildMdDom(md,parent){
     // widget approach (which collapses to mtk1) if no grammar-loaded
     // support is found for the language.
     var frag=null;
+    var fragTrusted=false;
     try {
       if(typeof window.__irTokenizeToFragment==='function' && lang){
-        frag=window.__irTokenizeToFragment(code,lang);
+        frag=window.__irTokenizeToFragment(code,lang,preferredTokenEditor);
+        fragTrusted=!!(frag&&frag.__irTrustedTokenization);
       }
     } catch(eT){ irLog('renderer: tokFrag err: '+(eT&&eT.message)); }
     if(!frag){
@@ -10912,7 +10982,7 @@ function irBuildMdDom(md,parent){
     box.className='monaco-tokenized-source';
     box.setAttribute('style', irNativeTokenizedSourceStyle());
     if(lang) box.setAttribute('data-lang',lang);
-    if(frag && !irFragmentTokenizationUseful(frag)){
+    if(frag && !fragTrusted && !irFragmentTokenizationUseful(frag)){
       irLog('renderer: token fragment degenerate; using fallback tokenizer');
       frag=null;
     }
@@ -10935,7 +11005,7 @@ function irBuildMdDom(md,parent){
         box.appendChild(sp);
       }
     }
-    if(!frag||!irFragmentTokenizationUseful(box)){
+    if(!frag||(!fragTrusted&&!irFragmentTokenizationUseful(box))){
       irInstallAsyncThemeTokenization(box,code,lang);
     }
     parent.appendChild(box);
@@ -13747,28 +13817,56 @@ window.__irFindMdRendererFromDom = function(seedEl){
   return null;
 };
 
-window.__irFindTokenSupport = function(langId){
+window.__irFindTokenSupport = function(langId,preferredEditor){
   if (!window.__irTokSupports) window.__irTokSupports = {};
   if (window.__irTokSupports[langId]) return window.__irTokSupports[langId];
+  if (!window.__irTokSupportMisses) window.__irTokSupportMisses = {};
+  var preferredModel=null;
+  try{preferredModel=preferredEditor&&preferredEditor.getModel&&preferredEditor.getModel()}catch(_){}
+  var recentMiss=window.__irTokSupportMisses[langId];
+  if(recentMiss&&recentMiss.model===preferredModel&&Date.now()-Number(recentMiss.at)<250)return null;
   var family = [langId];
   if (langId === 'typescript') family = ['typescript','typescriptreact','javascript','javascriptreact'];
   else if (langId === 'typescriptreact') family = ['typescriptreact','typescript','javascriptreact','javascript'];
   else if (langId === 'javascript') family = ['javascript','javascriptreact','typescript','typescriptreact'];
   else if (langId === 'javascriptreact') family = ['javascriptreact','javascript','typescriptreact','typescript'];
   var caps = window.__irMonacoCaps || window.__irCaptures || {};
-  // Probe: tokenize a known mixed-content string. If it produces only
-  // one foreground color, the grammar isn't loaded for that model.
-  function probe(sup){
+  // Probe a known mixed-content string for real token boundaries. A valid
+  // grammar can still use one foreground in a monochrome/custom theme, so
+  // differing colors are not required here.
+  function probeText(language){
+    var samples={
+      python:'def sample(value: int) -> str:',
+      javascript:'const sample = (value) => 1;',
+      javascriptreact:'const Sample = () => <div />;',
+      typescript:'const sample: number = 1;',
+      typescriptreact:'const Sample = (): JSX.Element => <div />;',
+      java:'public String sample(int value) {',
+      go:'func sample(value int) string {',
+      rust:'fn sample(value: i32) -> String {',
+      cpp:'std::string sample(int value) {',
+      csharp:'public string Sample(int value) {',
+      dart:'String sample(int value) {',
+      json:'{"sample": 1}',
+      yaml:'sample: 1'
+    };
+    return samples[language]||'const sample: number = 1;';
+  }
+  function probe(sup,language){
     try {
       var st = sup.getInitialState();
-      var r = sup.tokenizeEncoded('const x: number = 1', false, st);
+      var r = sup.tokenizeEncoded(probeText(language), false, st);
       if (!r || !r.tokens || r.tokens.length < 4) return false;
-      var fgs = {};
-      for (var ti = 0; ti < r.tokens.length; ti += 2) {
-        fgs[(r.tokens[ti+1] >>> 15) & 0x1FF] = true;
-      }
-      return Object.keys(fgs).length >= 2;
+      return true;
     } catch(_) { return false; }
+  }
+  function probeLineTokenizer(tokenization,language){
+    try{
+      var rows=tokenization.tokenizeLinesAt(1,[probeText(language)]);
+      var row=rows&&rows[0];
+      if(!row||typeof row.getCount!=='function'||row.getCount()<2)return false;
+      return true;
+    }catch(_){return false}
   }
   // Collect all open models via IModelService.getModels(). Sometimes
   // capture misses IModelService directly but materialize finds it via
@@ -13789,12 +13887,38 @@ window.__irFindTokenSupport = function(langId){
   }
   var allModels = [];
   var seenModel = new Set();
+  function addModel(model){
+    try{
+      if(model&&typeof model.getLanguageId==='function'&&!seenModel.has(model)){
+        seenModel.add(model);
+        allModels.push(model);
+      }
+    }catch(_){}
+  }
+  function addEditorModel(editor){
+    try{if(editor&&typeof editor.getModel==='function')addModel(editor.getModel())}catch(_){}
+  }
+  // The normal hover patch already captures real, non-embedded editor
+  // instances. Token capture below is an opt-in diagnostic and is disabled in
+  // production, so relying only on __irMonacoCaps left detached drill pages
+  // on the regex tokenizer. Seed the search from the editors that are always
+  // available before consulting the optional model-service capture.
+  addEditorModel(preferredEditor);
+  addEditorModel(window.__irCapturedHoverWidget&&window.__irCapturedHoverWidget._editor);
+  addEditorModel(window.__irHoverNaturalEditor);
+  addEditorModel(window.__irCapturedEditor);
+  var capturedEditors=window.__irCapturedEditorList||[];
+  for(var cei=0;cei<capturedEditors.length;cei++)addEditorModel(capturedEditors[cei]);
+  try{
+    var listedEditors=typeof irListAllCodeEditors==='function'?irListAllCodeEditors():[];
+    for(var lei=0;lei<listedEditors.length;lei++)addEditorModel(listedEditors[lei]);
+  }catch(_){}
   for (var msi = 0; msi < modelSvcs.length; msi++) {
     try {
       var ml = modelSvcs[msi].getModels();
       if (ml && ml.length) {
         for (var mi = 0; mi < ml.length; mi++) {
-          if (!seenModel.has(ml[mi])) { seenModel.add(ml[mi]); allModels.push(ml[mi]); }
+          addModel(ml[mi]);
         }
       }
     } catch(_) {}
@@ -13816,32 +13940,94 @@ window.__irFindTokenSupport = function(langId){
         var mdl = allModels[mi2];
         if (typeof mdl.getLanguageId !== 'function') continue;
         if (mdl.getLanguageId() !== target) continue;
+        try{
+          if(mdl.tokenization&&typeof mdl.tokenization.forceTokenization==='function'){
+            mdl.tokenization.forceTokenization(1);
+          }
+        }catch(_){}
         var tk = mdl.tokenization;
-        if (!tk || !tk.tokens || !tk.tokens._value || !tk.tokens._value._tokenizer) continue;
-        var sup = tk.tokens._value._tokenizer.tokenizationSupport;
-        if (!sup || typeof sup.tokenizeEncoded !== 'function') continue;
-        if (!probe(sup)) continue;
+        if(!tk)continue;
+        var tokenValue=tk.tokens&&(typeof tk.tokens.get==='function'?tk.tokens.get():tk.tokens._value);
+        var tokenizer=(tokenValue&&tokenValue._tokenizer)||tk._tokenizer;
+        var sup=tokenizer&&tokenizer.tokenizationSupport;
         var uriStr = mdl.uri ? ((mdl.uri.scheme||'?')+':'+(mdl.uri.path||'?').slice(-30)) : '?';
-        irLog('tokSupport: '+langId+' → ok via lang='+target+' uri='+uriStr);
-        window.__irTokSupports[langId] = sup;
-        return sup;
+        if(sup&&typeof sup.tokenizeEncoded==='function'&&probe(sup,target)){
+          irLog('tokSupport: '+langId+' → encoded via lang='+target+' uri='+uriStr);
+          window.__irTokSupports[langId]=sup;
+          delete window.__irTokSupportMisses[langId];
+          return sup;
+        }
+        // TreeSitter-backed models do not expose the TextMate _tokenizer.
+        // tokenizeLinesAt is the model-part API VS Code itself uses to color
+        // inline edits, and returns theme-aware LineTokens for either engine.
+        if(typeof tk.tokenizeLinesAt==='function'&&probeLineTokenizer(tk,target)){
+          var lineSupport={__irLineTokenizer:true,tokenization:tk,language:target};
+          irLog('tokSupport: '+langId+' → line-tokens via lang='+target+' uri='+uriStr);
+          window.__irTokSupports[langId]=lineSupport;
+          delete window.__irTokSupportMisses[langId];
+          return lineSupport;
+        }
       } catch(_) {}
     }
   }
   irLog('tokSupport: no working support for '+langId+' (tried family '+family.join(',')+')');
+  window.__irTokSupportMisses[langId]={at:Date.now(),model:preferredModel};
   return null;
 };
 
 // Tokenize text using a captured grammar-loaded tokenizationSupport.
 // Returns a DocumentFragment of <span class="mtkN">…</span> nodes
 // (matching VS Code's native rendering exactly), or null on failure.
-window.__irTokenizeToFragment = function(text, lang){
+window.__irTokenizeToFragment = function(text, lang, preferredEditor){
   var langId = (lang || 'plaintext').toLowerCase();
   var aliases = { ts:'typescript', js:'javascript', py:'python', tsx:'typescriptreact', jsx:'javascriptreact', sh:'shellscript', md:'markdown', yml:'yaml' };
   if (aliases[langId]) langId = aliases[langId];
-  var support = window.__irFindTokenSupport(langId);
+  var support = window.__irFindTokenSupport(langId,preferredEditor);
   if (!support) { irLog('tokFrag: no support for '+langId); return null; }
   var lines = (text || '').split('\\n');
+  if(support.__irLineTokenizer){
+    try{
+      var lineRows=support.tokenization.tokenizeLinesAt(1,lines);
+      if(!lineRows||lineRows.length!==lines.length)return null;
+      var lineFrag=document.createDocumentFragment();
+      var lineFgCounts={};
+      for(var lri=0;lri<lines.length;lri++){
+        var lineText=lines[lri];
+        var lineTokens=lineRows[lri];
+        if(!lineTokens||typeof lineTokens.getCount!=='function')return null;
+        var linePos=0;
+        for(var lti=0;lti<lineTokens.getCount();lti++){
+          var lineStart=typeof lineTokens.getStartOffset==='function'?lineTokens.getStartOffset(lti):linePos;
+          var lineEnd=lineTokens.getEndOffset(lti);
+          if(lineStart>linePos)lineFrag.appendChild(document.createTextNode(lineText.substring(linePos,lineStart)));
+          var lineMeta=typeof lineTokens.getMetadata==='function'?lineTokens.getMetadata(lti):0;
+          var lineFg=typeof lineTokens.getForeground==='function'?lineTokens.getForeground(lti):((lineMeta>>>15)&0x1FF);
+          lineFgCounts[lineFg]=(lineFgCounts[lineFg]||0)+1;
+          var lineClass=typeof lineTokens.getClassName==='function'?String(lineTokens.getClassName(lti)||''):'';
+          if(!/\\bmtk\\d+\\b/.test(lineClass)){
+            lineClass='mtk'+lineFg;
+            if((lineMeta&0x0800)!==0)lineClass+=' mtki';
+            if((lineMeta&0x1000)!==0)lineClass+=' mtkb';
+            if((lineMeta&0x2000)!==0)lineClass+=' mtku';
+            if((lineMeta&0x4000)!==0)lineClass+=' mtks';
+          }
+          var linePart=lineText.substring(lineStart,lineEnd);
+          if(linePart){
+            var lineSpan=document.createElement('span');
+            lineSpan.className=lineClass.replace(/[^A-Za-z0-9_\\-\\s]/g,'').trim();
+            lineSpan.textContent=linePart;
+            lineFrag.appendChild(lineSpan);
+          }
+          linePos=lineEnd;
+        }
+        if(linePos<lineText.length)lineFrag.appendChild(document.createTextNode(lineText.substring(linePos)));
+        if(lri<lines.length-1)lineFrag.appendChild(document.createTextNode('\\n'));
+      }
+      lineFrag.__irTrustedTokenization=true;
+      irLog('tokFrag: '+langId+' line-tokens='+lines.length+' fgs='+JSON.stringify(lineFgCounts));
+      return lineFrag;
+    }catch(eL){irLog('tokFrag: line-tokenizer err: '+(eL&&eL.message));return null}
+  }
   var state;
   try { state = support.getInitialState(); }
   catch(e) { irLog('tokFrag: getInitialState err: '+(e&&e.message)); return null; }
@@ -13874,10 +14060,12 @@ window.__irTokenizeToFragment = function(text, lang){
       //   ITALIC_MASK    = 0x00000800
       //   BOLD_MASK      = 0x00001000
       //   UNDERLINE_MASK = 0x00002000
+      //   STRIKETHROUGH_MASK = 0x00004000
       var fg = (meta >>> 15) & 0x1FF;
       var italic    = (meta & 0x0800) !== 0;
       var bold      = (meta & 0x1000) !== 0;
       var underline = (meta & 0x2000) !== 0;
+      var strikethrough = (meta & 0x4000) !== 0;
       fgCounts[fg] = (fgCounts[fg] || 0) + 1;
       var part = line.substring(startIdx, endIdx);
       pos = endIdx;
@@ -13886,6 +14074,7 @@ window.__irTokenizeToFragment = function(text, lang){
       if (italic) cls += ' mtki';
       if (bold) cls += ' mtkb';
       if (underline) cls += ' mtku';
+      if (strikethrough) cls += ' mtks';
       var span = document.createElement('span');
       span.className = cls;
       span.textContent = part;
@@ -13896,6 +14085,7 @@ window.__irTokenizeToFragment = function(text, lang){
     }
     if (li < lines.length - 1) frag.appendChild(document.createTextNode('\\n'));
   }
+  frag.__irTrustedTokenization=true;
   irLog('tokFrag: '+langId+' lines='+lines.length+' fgs='+JSON.stringify(fgCounts));
   return frag;
 };

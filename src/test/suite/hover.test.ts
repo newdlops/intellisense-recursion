@@ -4819,6 +4819,168 @@ suite('Hover Drill-Down E2E', () => {
 suite('Hover Symbol Coverage E2E', () => {
   const lang = getFixtureLang();
 
+  test(`[${lang}] function call hover keeps the function definition instead of its return model`, async function () {
+    if (lang !== 'python' && lang !== 'typescript') { this.skip(); return; }
+    this.timeout(60000);
+    await ensureExtensionCommandsReady('intellisenseRecursion.getPatchStatus');
+
+    const folders = vscode.workspace.workspaceFolders!;
+    const root = folders[0].uri.fsPath;
+    const fixture = lang === 'python'
+      ? {
+          file: 'service.py',
+          identifier: 'create_user',
+          expectedHeader: '`create_user` — *service.py:5*',
+          expectedDefinition: 'def create_user',
+          returnModelHeader: '`User` — *models.py:35*',
+        }
+      : {
+          file: 'service.ts',
+          identifier: 'findEntity',
+          expectedHeader: '`findEntity` — *service.ts:20*',
+          expectedDefinition: 'export function findEntity',
+          returnModelHeader: '`BaseEntity` — *models.ts:1*',
+        };
+    const doc = await vscode.workspace.openTextDocument(
+      vscode.Uri.file(path.join(root, fixture.file)),
+    );
+    const callPosition = findIdentifier(doc, fixture.identifier, 1);
+    assert.ok(callPosition, `Could not find call site for ${fixture.identifier}`);
+    const callRange = doc.getWordRangeAtPosition(callPosition!, /[A-Za-z_$][\w$]*/);
+    assert.ok(callRange, `Could not get call range for ${fixture.identifier}`);
+    await vscode.window.showTextDocument(doc);
+    await waitForLanguageServer(doc, fixture.identifier);
+
+    // Add a second native provider that exposes the callable signature and
+    // return model. This deterministically reproduces the real multi-provider
+    // fanout where a later provider used to attach only the return-model
+    // preview after the primary provider had already delivered the function.
+    const signature = lang === 'python'
+      ? '(function) def create_user(name: str, email: str) -> User'
+      : 'function findEntity(data: any): BaseEntity | null';
+    const supplementalProvider = vscode.languages.registerHoverProvider(
+      { language: lang, scheme: 'file' },
+      {
+        provideHover(document, position) {
+          if (document.uri.toString() !== doc.uri.toString() || !callRange!.contains(position)) {
+            return null;
+          }
+          return new vscode.Hover(
+            new vscode.MarkdownString(`\`\`\`${lang}\n${signature}\n\`\`\``),
+            callRange,
+          );
+        },
+      },
+    );
+    let hoverText = '';
+    try {
+      hoverText = await getHoverText(doc.uri, callPosition!);
+    } finally {
+      supplementalProvider.dispose();
+    }
+    assert.ok(hoverText.includes(fixture.expectedHeader),
+      `Hover on ${fixture.identifier} should include its exact definition preview header. `
+      + `Got: ${hoverText.substring(0, 600)}`);
+    assert.ok(hoverText.includes(fixture.expectedDefinition),
+      `Hover on ${fixture.identifier} should include its function body`);
+    assert.ok(!hoverText.includes(fixture.returnModelHeader),
+      `Hover on ${fixture.identifier} should not substitute the return model preview `
+      + `${fixture.returnModelHeader}`);
+  });
+
+  test(`[${lang}] function hover skips usage-only definition results`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(30000);
+    await ensureExtensionCommandsReady('intellisenseRecursion.getPatchStatus');
+
+    const identifier = 'ir_definition_probe';
+    const fixtureRoot = vscode.workspace.workspaceFolders![0].uri;
+    const nonce = `${process.pid}-${Date.now()}`;
+    // VS Code normalizes multi-location results by URI, so keep the deliberate
+    // usage-only candidate lexically first as well as first in the provider.
+    const sourceUri = vscode.Uri.joinPath(fixtureRoot, `.ir-definition-00-usage-${nonce}.rb`);
+    const implementationUri = vscode.Uri.joinPath(fixtureRoot, `.ir-definition-99-impl-${nonce}.rb`);
+    await vscode.workspace.fs.writeFile(sourceUri, Buffer.from([
+      `call_site_only_marker = ${identifier}(1)`,
+      `hover_target = ${identifier}(3)`,
+    ].join('\n')));
+    await vscode.workspace.fs.writeFile(implementationUri, Buffer.from([
+      `def ${identifier}(value)`,
+      '  implementation_only_marker = value * 2',
+      '  implementation_only_marker + 1',
+      'end',
+    ].join('\n')));
+    const sourceDoc = await vscode.workspace.openTextDocument(sourceUri);
+    const implementationDoc = await vscode.workspace.openTextDocument(implementationUri);
+    const wrongPosition = findIdentifier(sourceDoc, identifier, 0);
+    const hoverPosition = findIdentifier(sourceDoc, identifier, 1);
+    const implementationPosition = findIdentifier(implementationDoc, identifier);
+    assert.ok(wrongPosition && hoverPosition && implementationPosition,
+      'Could not locate definition-candidate regression symbols');
+    const wrongRange = sourceDoc.getWordRangeAtPosition(wrongPosition!);
+    const hoverRange = sourceDoc.getWordRangeAtPosition(hoverPosition!);
+    const implementationRange = implementationDoc.getWordRangeAtPosition(implementationPosition!);
+    assert.ok(wrongRange && hoverRange && implementationRange,
+      'Could not create definition-candidate regression ranges');
+
+    const definitionProvider = vscode.languages.registerDefinitionProvider(
+      { language: 'ruby', scheme: 'file' },
+      {
+        provideDefinition(document, position) {
+          if (document.uri.toString() !== sourceDoc.uri.toString() || !hoverRange!.contains(position)) {
+            return null;
+          }
+          return [
+            new vscode.Location(sourceDoc.uri, wrongRange!),
+            new vscode.Location(implementationDoc.uri, implementationRange!),
+          ];
+        },
+      },
+    );
+    const hoverProvider = vscode.languages.registerHoverProvider(
+      { language: 'ruby', scheme: 'file' },
+      {
+        provideHover(document, position) {
+          if (document.uri.toString() !== sourceDoc.uri.toString() || !hoverRange!.contains(position)) {
+            return null;
+          }
+          return new vscode.Hover(
+            new vscode.MarkdownString(`\`\`\`ruby\ndef ${identifier}(value)\n\`\`\``),
+            hoverRange,
+          );
+        },
+      },
+    );
+
+    let hoverText = '';
+    try {
+      const orderedDefs = await vscode.commands.executeCommand<any[]>(
+        'vscode.executeDefinitionProvider',
+        sourceDoc.uri,
+        hoverPosition,
+      );
+      assert.strictEqual(orderedDefs?.length, 2,
+        `Expected two ordered definition candidates, got ${orderedDefs?.length ?? 0}`);
+      assert.strictEqual(orderedDefs[0].uri.toString(), sourceDoc.uri.toString(),
+        'Regression precondition: the usage-only candidate must be first');
+      assert.strictEqual(orderedDefs[1].uri.toString(), implementationDoc.uri.toString(),
+        'Regression precondition: the implementation candidate must be second');
+      hoverText = await getHoverText(sourceDoc.uri, hoverPosition!);
+    } finally {
+      hoverProvider.dispose();
+      definitionProvider.dispose();
+      await vscode.workspace.fs.delete(sourceUri, { useTrash: false }).then(undefined, () => undefined);
+      await vscode.workspace.fs.delete(implementationUri, { useTrash: false }).then(undefined, () => undefined);
+    }
+
+    assert.ok(hoverText.includes(`\`${identifier}\` —`),
+      `Hover should include the exact function preview. Got: ${hoverText.substring(0, 800)}`);
+    assert.ok(hoverText.includes('implementation_only_marker = value * 2'),
+      `Hover should show the implementation body. Got: ${hoverText.substring(0, 800)}`);
+    assert.ok(!hoverText.includes('call_site_only_marker'),
+      `Hover must not render the first call site's surroundings as a definition. Got: ${hoverText.substring(0, 800)}`);
+  });
+
   test(`[${lang}] editor hover recognizes types, constants, functions, and methods`, async function () {
     if (lang !== 'python') { this.skip(); return; }
     this.timeout(90000);
@@ -4969,6 +5131,34 @@ suite('Hover Renderer E2E', () => {
     const firstDetached = drag.afterFirstDrag?.windows?.[0];
     assert.ok(firstDetached?.connected && firstDetached?.text?.includes('DragFirstModel'),
       `The detached window should retain the first hover's painted content. ${JSON.stringify(drag)}`);
+    const syntaxTheme = drag.afterFirstDrag?.syntaxTheme;
+    assert.ok(syntaxTheme?.source?.length === 4 && syntaxTheme?.detached?.length === 4,
+      `The detached syntax-theme probe should capture every source and cloned token. ${JSON.stringify(syntaxTheme)}`);
+    assert.strictEqual(syntaxTheme.sourceThemeVariable, 'scoped-hover-theme',
+      `The synthetic native hover should inherit its workbench theme variable. ${JSON.stringify(syntaxTheme)}`);
+    assert.strictEqual(syntaxTheme.layerInsideSourceWorkbench, true,
+      `The detached layer must remain under the source hover's themed workbench. ${JSON.stringify(syntaxTheme)}`);
+    assert.strictEqual(syntaxTheme.detachedInsideSourceWorkbench, true,
+      `A floating hover must retain the source workbench as its theme ancestor. ${JSON.stringify(syntaxTheme)}`);
+    assert.ok(String(syntaxTheme.layerClosestWorkbenchClass || '').includes('ir-e2e-detached-theme-scope'),
+      `The detached layer should use the same workbench theme scope as its source. ${JSON.stringify(syntaxTheme)}`);
+    assert.strictEqual(syntaxTheme.layerThemeVariable, syntaxTheme.sourceThemeVariable,
+      `The detached layer should inherit the complete workbench theme context. ${JSON.stringify(syntaxTheme)}`);
+    assert.strictEqual(syntaxTheme.detachedThemeVariable, syntaxTheme.sourceThemeVariable,
+      `The detached window should inherit workbench-scoped custom properties. ${JSON.stringify(syntaxTheme)}`);
+    assert.deepStrictEqual(syntaxTheme.detached, syntaxTheme.source,
+      `Detaching must preserve computed mtk, italic, bold, and bracket token presentation. ${JSON.stringify(syntaxTheme)}`);
+    const sourceThemeByKey = new Map<string, any>(
+      (syntaxTheme.source || []).map((row: any) => [row.key, row]),
+    );
+    assert.strictEqual(sourceThemeByKey.get('plain')?.color, 'rgb(17, 34, 51)',
+      `The scoped mtk color rule should be active in the source hover. ${JSON.stringify(syntaxTheme)}`);
+    assert.strictEqual(sourceThemeByKey.get('italic')?.fontStyle, 'italic',
+      `The scoped italic token rule should be active in the source hover. ${JSON.stringify(syntaxTheme)}`);
+    assert.strictEqual(sourceThemeByKey.get('bold')?.fontWeight, '700',
+      `The scoped bold token rule should be active in the source hover. ${JSON.stringify(syntaxTheme)}`);
+    assert.strictEqual(sourceThemeByKey.get('bracket')?.textDecorationLine, 'underline',
+      `The scoped bracket-highlighting rule should be active in the source hover. ${JSON.stringify(syntaxTheme)}`);
     assert.ok((firstDetached?.rect?.left || 0) >= (drag.belowThreshold?.sourceRect?.left || 0) + 35
       && (firstDetached?.rect?.top || 0) >= (drag.belowThreshold?.sourceRect?.top || 0) + 24,
     `The detached window should follow the pointer delta. ${JSON.stringify(drag)}`);
@@ -5050,6 +5240,16 @@ suite('Hover Renderer E2E', () => {
       `The detached preview should unlock only after its isolated history commit. ${JSON.stringify(link)}`);
     assert.ok(String(link.firstTextAfterApply || '').includes('DetachedTargetModel preview'),
       `The clicked detached window should render its preview result. ${JSON.stringify(link)}`);
+    const tokenization = link.tokenizationAfterApply;
+    assert.ok(tokenization?.blockCount >= 2 && tokenization?.tokenSpanCount >= 3,
+      `A detached drill page should retain a tokenized fenced-code block. ${JSON.stringify(link)}`);
+    assert.ok((tokenization?.mtkClasses || []).length >= 2,
+      `Detached fenced code should expose multiple syntax token classes. ${JSON.stringify(tokenization)}`);
+    assert.ok((tokenization?.tokenizationSources || []).some((source: string) => source === 'captured' || source === 'async')
+      && !(tokenization?.tokenizationSources || []).includes('fallback'),
+    `Detached fenced code should use a real language grammar, not the approximate fallback tokenizer. ${JSON.stringify(tokenization)}`);
+    assert.ok((tokenization?.colors || []).length >= 2,
+      `Detached fenced code should retain multiple computed theme colors. ${JSON.stringify(tokenization)}`);
     assert.ok(link.safeLink?.href === 'https://example.com/detached-docs'
       && link.safeLink?.target === '_blank'
       && link.safeLink?.pointerEvents !== 'none',
