@@ -5,6 +5,15 @@ All notable changes to the IntelliSense Recursion extension.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.6036] - 2026-09-02
+
+### Fixed
+- Bound generated global storage by age, generation count, and byte budget.
+- Preserve cache generations leased by live extension-host processes while
+  reclaiming stale leases, abandoned index build files, old Cargo targets,
+  downloaded binaries, and workspace indexes.
+- Use per-process temporary index filenames and remove them after failed builds.
+
 ## [0.2.2] - 2026-04-19
 
 Rust sidecar: a compact symbol index that replaces most LSP fallback work.

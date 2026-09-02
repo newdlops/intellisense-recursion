@@ -15,6 +15,7 @@ import * as fs from 'node:fs';
 import * as crypto from 'node:crypto';
 import * as https from 'node:https';
 import { spawn, spawnSync } from 'node:child_process';
+import { GeneratedStorageLifecycle } from './generatedStorageLifecycle';
 import {
   IndexSidecar,
   SidecarHit,
@@ -437,6 +438,7 @@ export class IndexManager {
   private statusEmitter = new vscode.EventEmitter<IndexStatus>();
   private lastStatus: IndexStatus = { kind: 'idle' };
   private lastReady: { files: number; symbols: number } | null = null;
+  private readonly storageLifecycle: GeneratedStorageLifecycle;
   /** Fires whenever the index manager transitions between idle/building/ready/failed. */
   readonly onStatusChange = this.statusEmitter.event;
 
@@ -454,6 +456,11 @@ export class IndexManager {
       this.workspaceRoot = workspace.root;
       this.indexPath = cachePathFor(storagePath, workspace.key);
     }
+    this.storageLifecycle = new GeneratedStorageLifecycle(storagePath, {
+      target: path.basename(sidecarTargetDir(extensionPath, storagePath)),
+      download: path.basename(sidecarDownloadDir(extensionPath, storagePath)),
+      workspace: this.indexPath ? path.basename(path.dirname(this.indexPath)) : undefined,
+    });
   }
 
   /** Last-emitted status; safe to read from any consumer. */
@@ -500,6 +507,19 @@ export class IndexManager {
    * working via LSP.
    */
   async start(): Promise<void> {
+    try {
+      const cleanup = await this.storageLifecycle.start();
+      const deleted = Object.values(cleanup.deletedGenerations).reduce((sum, count) => sum + count, 0);
+      if (deleted > 0 || cleanup.deletedTemporaryFiles > 0 || cleanup.deletedStaleLeases > 0) {
+        this.log.info(
+          `[ir] generated storage cleanup: ${deleted} generations, ` +
+            `${cleanup.deletedTemporaryFiles} temporary indexes, ` +
+            `${cleanup.deletedStaleLeases} stale leases removed`,
+        );
+      }
+    } catch (err) {
+      this.log.warn(`[ir] generated storage cleanup failed: ${err}`);
+    }
     if (!this.workspaceRoot || !this.indexPath) {
       this.log.info('[ir] no workspace folder; fast lookup disabled');
       this.setStatus({ kind: 'failed', reason: 'no-workspace' }, { kind: 'failed', reason: 'no-workspace' });
@@ -883,12 +903,16 @@ export class IndexManager {
     this.setStatus({ kind: 'building' }, { kind: 'building' });
 
     try {
-      const tmpPath = this.indexPath + '.tmp';
+      const tmpPath = `${this.indexPath}.tmp-${process.pid}-${crypto.randomUUID()}`;
       fs.mkdirSync(path.dirname(this.indexPath), { recursive: true });
 
       const t0 = Date.now();
-      await this.runBuild(tmpPath);
-      fs.renameSync(tmpPath, this.indexPath);
+      try {
+        await this.runBuild(tmpPath);
+        fs.renameSync(tmpPath, this.indexPath);
+      } finally {
+        try { fs.rmSync(tmpPath, { force: true }); } catch {}
+      }
       const elapsed = Date.now() - t0;
       this.log.info(`[ir] build done in ${elapsed}ms`);
 
@@ -995,6 +1019,7 @@ export class IndexManager {
   }
 
   dispose() {
+    this.storageLifecycle.dispose();
     if (this.rebuildTimer) {
       clearTimeout(this.rebuildTimer);
       this.rebuildTimer = null;
