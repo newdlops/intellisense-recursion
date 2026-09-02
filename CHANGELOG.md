@@ -13,6 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
   reclaiming stale leases, abandoned index build files, old Cargo targets,
   downloaded binaries, and workspace indexes.
 - Use per-process temporary index filenames and remove them after failed builds.
+- Update the bundled WebSocket runtime to remove known memory-disclosure and denial-of-service advisories.
 
 ## [0.2.2] - 2026-04-19
 
