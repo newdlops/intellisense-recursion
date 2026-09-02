@@ -5,6 +5,14 @@ All notable changes to the IntelliSense Recursion extension.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.6037] - 2026-09-03
+
+### Fixed
+- Bundle the macOS ARM64 `ir-indexer` so first activation does not compile the
+  Rust sidecar in every open VS Code window.
+- Serialize CPU-heavy sidecar and workspace-index builds across extension-host
+  processes with a cancellation-safe global-storage lease.
+
 ## [0.2.6036] - 2026-09-02
 
 ### Fixed

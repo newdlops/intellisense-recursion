@@ -2,7 +2,7 @@
   "name": "intellisense-recursion",
   "displayName": "IntelliSense Recursion",
   "description": "Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA",
-  "version": "0.2.6036",
+  "version": "0.2.6037",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
@@ -57,7 +57,7 @@
     ]
   },
   "scripts": {
-    "vscode:prepublish": "npm run bundle",
+    "vscode:prepublish": "npm run bundle && node scripts/prepackage.js",
     "compile": "tsc -p ./",
     "bundle": "tsc -p ./ && node esbuild.js",
     "bin:build": "cd indexer && cargo build --release",

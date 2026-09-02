@@ -16,6 +16,7 @@ import * as crypto from 'node:crypto';
 import * as https from 'node:https';
 import { spawn, spawnSync } from 'node:child_process';
 import { GeneratedStorageLifecycle } from './generatedStorageLifecycle';
+import { GlobalStorageBuildLease } from './globalStorageBuildLease';
 import {
   IndexSidecar,
   SidecarHit,
@@ -36,6 +37,7 @@ const SIDECAR_OUTPUT_TAIL_CHARS = 8_000;
 const MAX_SIDECAR_DOWNLOAD_BYTES = 64 * 1024 * 1024;
 const MAX_CHECKSUM_DOWNLOAD_BYTES = 256 * 1024;
 const MIN_SIDECAR_DOWNLOAD_BYTES = 512 * 1024;
+const CHILD_PROCESS_KILL_GRACE_MS = 5_000;
 
 // Extensions whose save events trigger a re-index, matching what the Rust
 // indexer can parse.
@@ -75,10 +77,10 @@ function downloadedBinaryPath(extensionPath: string, storagePath: string): strin
 function locateBinary(extensionPath: string, storagePath: string): string | null {
   const targetDir = sidecarTargetDir(extensionPath, storagePath);
   const candidates = [
-    path.join(extensionPath, 'indexer', 'target', 'release', sidecarExeName()),
     path.join(extensionPath, 'bin', packagedBinaryName()),
     path.join(extensionPath, 'bin', `ir-indexer-${process.platform}-${process.arch}`),
     path.join(extensionPath, 'bin', 'ir-indexer'),
+    path.join(extensionPath, 'indexer', 'target', 'release', sidecarExeName()),
     downloadedBinaryPath(extensionPath, storagePath),
     path.join(targetDir, 'release', sidecarExeName()),
   ];
@@ -136,6 +138,12 @@ function appendLimited(buf: string, chunk: string): string {
   return next.length > SIDECAR_OUTPUT_TAIL_CHARS
     ? next.slice(next.length - SIDECAR_OUTPUT_TAIL_CHARS)
     : next;
+}
+
+function abortedOperationError(operation: string): Error {
+  const error = new Error(`${operation} cancelled`);
+  error.name = 'AbortError';
+  return error;
 }
 
 function httpGetText(
@@ -439,6 +447,8 @@ export class IndexManager {
   private lastStatus: IndexStatus = { kind: 'idle' };
   private lastReady: { files: number; symbols: number } | null = null;
   private readonly storageLifecycle: GeneratedStorageLifecycle;
+  private readonly buildLease: GlobalStorageBuildLease;
+  private readonly disposeAbortController = new AbortController();
   /** Fires whenever the index manager transitions between idle/building/ready/failed. */
   readonly onStatusChange = this.statusEmitter.event;
 
@@ -461,6 +471,7 @@ export class IndexManager {
       download: path.basename(sidecarDownloadDir(extensionPath, storagePath)),
       workspace: this.indexPath ? path.basename(path.dirname(this.indexPath)) : undefined,
     });
+    this.buildLease = new GlobalStorageBuildLease(storagePath);
   }
 
   /** Last-emitted status; safe to read from any consumer. */
@@ -566,6 +577,8 @@ export class IndexManager {
       }
     } else {
       this.log.info('[ir] no existing index — building');
+      await this.rebuild(true);
+      return;
     }
     await this.rebuild();
   }
@@ -743,7 +756,16 @@ export class IndexManager {
     if (!hasBundledIndexerSource(this.extensionPath)) { return null; }
 
     if (!this.binaryBuildInFlight) {
-      this.binaryBuildInFlight = this.buildBundledSidecar()
+      this.binaryBuildInFlight = this.buildLease.runExclusive(
+        'sidecar-compile',
+        async (signal) => {
+          // Another host may have completed the same shared target while this
+          // host waited for the global build slot.
+          const raced = locateBinary(this.extensionPath, this.storagePath);
+          return raced ?? this.buildBundledSidecar(signal);
+        },
+        this.disposeAbortController.signal,
+      )
         .catch((err) => {
           this.log.warn(`[ir] sidecar compile failed: ${err}`);
           return null;
@@ -820,8 +842,12 @@ export class IndexManager {
     }
   }
 
-  private buildBundledSidecar(): Promise<string> {
+  private buildBundledSidecar(signal?: AbortSignal): Promise<string> {
     return new Promise<string>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(abortedOperationError('sidecar compile'));
+        return;
+      }
       const cargo = spawnSync('cargo', ['--version'], { timeout: 3_000, encoding: 'utf8' });
       if (cargo.status !== 0) {
         reject(new Error('cargo not found on PATH; install Rust to enable the fast sidecar'));
@@ -854,25 +880,47 @@ export class IndexManager {
       proc.stdout.on('data', (chunk: string) => { output = appendLimited(output, chunk); });
       proc.stderr.on('data', (chunk: string) => { output = appendLimited(output, chunk); });
 
+      let settled = false;
+      let stopReason: Error | null = null;
+      let forceKillTimer: ReturnType<typeof setTimeout> | null = null;
+      const finish = (err: Error | null, built?: string) => {
+        if (settled) { return; }
+        settled = true;
+        clearTimeout(timer);
+        if (forceKillTimer) { clearTimeout(forceKillTimer); }
+        signal?.removeEventListener('abort', onAbort);
+        if (err) { reject(err); } else { resolve(built!); }
+      };
+      const requestStop = (reason: Error) => {
+        if (stopReason) { return; }
+        stopReason = reason;
+        try { proc.kill(); } catch {}
+        forceKillTimer = setTimeout(() => {
+          try { proc.kill('SIGKILL'); } catch {}
+        }, CHILD_PROCESS_KILL_GRACE_MS);
+      };
+      const onAbort = () => requestStop(abortedOperationError('sidecar compile'));
       const timer = setTimeout(() => {
-        proc.kill();
-        reject(new Error(`cargo build timeout after ${SIDECAR_BUILD_TIMEOUT_MS}ms`));
+        requestStop(new Error(`cargo build timeout after ${SIDECAR_BUILD_TIMEOUT_MS}ms`));
       }, SIDECAR_BUILD_TIMEOUT_MS);
+      signal?.addEventListener('abort', onAbort, { once: true });
 
       proc.on('error', (err) => {
-        clearTimeout(timer);
-        reject(err);
+        finish(err);
       });
       proc.on('exit', (code) => {
-        clearTimeout(timer);
+        if (stopReason) {
+          finish(stopReason);
+          return;
+        }
         if (code !== 0) {
-          reject(new Error(`cargo build exited with code ${code}: ${output.slice(-1_000)}`));
+          finish(new Error(`cargo build exited with code ${code}: ${output.slice(-1_000)}`));
           return;
         }
 
         const built = path.join(targetDir, 'release', sidecarExeName());
         if (!fs.existsSync(built)) {
-          reject(new Error(`cargo build succeeded but binary is missing: ${built}`));
+          finish(new Error(`cargo build succeeded but binary is missing: ${built}`));
           return;
         }
         if (process.platform !== 'win32') {
@@ -882,12 +930,12 @@ export class IndexManager {
           if (line.trim()) { this.log.info(`[ir cargo] ${line}`); }
         }
         this.log.info(`[ir] sidecar compiled: ${built}`);
-        resolve(built);
+        finish(null, built);
       });
     });
   }
 
-  private async rebuild(): Promise<void> {
+  private async rebuild(skipIfIndexExists = false): Promise<void> {
     if (!this.workspaceRoot || !this.indexPath) { return; }
     if (!this.binary) {
       this.binary = await this.ensureBinary();
@@ -904,17 +952,30 @@ export class IndexManager {
 
     try {
       const tmpPath = `${this.indexPath}.tmp-${process.pid}-${crypto.randomUUID()}`;
-      fs.mkdirSync(path.dirname(this.indexPath), { recursive: true });
-
-      const t0 = Date.now();
-      try {
-        await this.runBuild(tmpPath);
-        fs.renameSync(tmpPath, this.indexPath);
-      } finally {
-        try { fs.rmSync(tmpPath, { force: true }); } catch {}
+      let peerBuiltIndex = false;
+      await this.buildLease.runExclusive(
+        `workspace-index:${path.basename(path.dirname(this.indexPath))}`,
+        async (signal) => {
+          if (skipIfIndexExists && fs.existsSync(this.indexPath!)) {
+            peerBuiltIndex = true;
+            return;
+          }
+          fs.mkdirSync(path.dirname(this.indexPath!), { recursive: true });
+          const t0 = Date.now();
+          try {
+            await this.runBuild(tmpPath, signal);
+            fs.renameSync(tmpPath, this.indexPath!);
+          } finally {
+            try { fs.rmSync(tmpPath, { force: true }); } catch {}
+          }
+          const elapsed = Date.now() - t0;
+          this.log.info(`[ir] build done in ${elapsed}ms`);
+        },
+        this.disposeAbortController.signal,
+      );
+      if (peerBuiltIndex) {
+        this.log.info('[ir] another extension host completed this workspace index while waiting');
       }
-      const elapsed = Date.now() - t0;
-      this.log.info(`[ir] build done in ${elapsed}ms`);
 
       // Tear down prior sidecar before respawn.
       if (prevState.kind === 'ready') {
@@ -936,8 +997,12 @@ export class IndexManager {
     }
   }
 
-  private runBuild(outPath: string): Promise<void> {
+  private runBuild(outPath: string, signal?: AbortSignal): Promise<void> {
     return new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) {
+        reject(abortedOperationError('workspace index build'));
+        return;
+      }
       const args = ['build', this.workspaceRoot!, '-o', outPath];
       for (const r of this.extraRoots) {
         args.push('--extra-root', `${r.tag}:${r.path}`);
@@ -948,24 +1013,46 @@ export class IndexManager {
       proc.stderr.on('data', (chunk) => { stderr += chunk; });
       proc.stdout.resume();
 
+      let settled = false;
+      let stopReason: Error | null = null;
+      let forceKillTimer: ReturnType<typeof setTimeout> | null = null;
+      const finish = (err?: Error) => {
+        if (settled) { return; }
+        settled = true;
+        clearTimeout(timer);
+        if (forceKillTimer) { clearTimeout(forceKillTimer); }
+        signal?.removeEventListener('abort', onAbort);
+        if (err) { reject(err); } else { resolve(); }
+      };
+      const requestStop = (reason: Error) => {
+        if (stopReason) { return; }
+        stopReason = reason;
+        try { proc.kill(); } catch {}
+        forceKillTimer = setTimeout(() => {
+          try { proc.kill('SIGKILL'); } catch {}
+        }, CHILD_PROCESS_KILL_GRACE_MS);
+      };
+      const onAbort = () => requestStop(abortedOperationError('workspace index build'));
       const timer = setTimeout(() => {
-        proc.kill();
-        reject(new Error(`build timeout after ${BUILD_TIMEOUT_MS}ms`));
+        requestStop(new Error(`build timeout after ${BUILD_TIMEOUT_MS}ms`));
       }, BUILD_TIMEOUT_MS);
+      signal?.addEventListener('abort', onAbort, { once: true });
 
       proc.on('error', (err) => {
-        clearTimeout(timer);
-        reject(err);
+        finish(err);
       });
       proc.on('exit', (code) => {
-        clearTimeout(timer);
+        if (stopReason) {
+          finish(stopReason);
+          return;
+        }
         if (code === 0) {
           for (const line of stderr.trim().split('\n').slice(-16)) {
             if (line.trim()) { this.log.info(`[ir build] ${line}`); }
           }
-          resolve();
+          finish();
         } else {
-          reject(new Error(`build exited with code ${code}: ${stderr.slice(-500)}`));
+          finish(new Error(`build exited with code ${code}: ${stderr.slice(-500)}`));
         }
       });
     });
@@ -1019,6 +1106,7 @@ export class IndexManager {
   }
 
   dispose() {
+    this.disposeAbortController.abort();
     this.storageLifecycle.dispose();
     if (this.rebuildTimer) {
       clearTimeout(this.rebuildTimer);

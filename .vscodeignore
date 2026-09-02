@@ -37,10 +37,11 @@ out/**/*.test.js
 out/indexManager.js
 out/sidecar.js
 
-# ── optional local/CI prebuilt binaries ──
-# Shipped extensions download release binaries on demand instead of carrying
-# platform-specific binaries in every vsix.
+# ── prebuilt native sidecar ──
+# Ship the current macOS ARM64 binary so activation never compiles Rust on the
+# primary deployment platform. Other locally-staged architectures stay out.
 bin/**
+!bin/ir-indexer-darwin-arm64
 
 # ── previously-packaged vsix files ──
 *.vsix
