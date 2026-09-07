@@ -5,6 +5,11 @@
 .lh/**
 .github/**
 .gitignore
+.codeidx/**
+.codex/**
+.django-shell/**
+.portmanager/**
+.mcp.json
 
 # ── TypeScript source (bundled into out/extension.js by esbuild) ──
 src/**
@@ -14,6 +19,9 @@ esbuild.js
 # ── docs / design notes kept out of the vsix ──
 memory/**
 spec.md
+handover.md
+log-analysis.md
+reports/**
 
 # ── Rust sidecar build output ──
 # The source is packaged as an offline fallback; clients first try to

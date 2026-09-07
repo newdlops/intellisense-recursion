@@ -862,6 +862,8 @@ export class IndexManager {
         'build',
         '--locked',
         '--release',
+        '--jobs',
+        '2',
         '--manifest-path',
         manifest,
         '--target-dir',
@@ -1010,7 +1012,7 @@ export class IndexManager {
       const proc = spawn(this.binary!, args, { stdio: ['ignore', 'pipe', 'pipe'] });
       let stderr = '';
       proc.stderr.setEncoding('utf8');
-      proc.stderr.on('data', (chunk) => { stderr += chunk; });
+      proc.stderr.on('data', (chunk: string) => { stderr = appendLimited(stderr, chunk); });
       proc.stdout.resume();
 
       let settled = false;

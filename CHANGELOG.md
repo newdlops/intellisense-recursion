@@ -5,6 +5,17 @@ All notable changes to the IntelliSense Recursion extension.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.6038] - 2026-09-07
+
+### Fixed
+- Reduce peak indexing memory by parsing bounded file batches with at most two
+  workers and writing the index without duplicate symbol or output buffers.
+- Skip oversized source files before loading them and cap reads if a file grows
+  during indexing.
+- Limit fallback native builds to two Cargo jobs and bound retained indexer logs.
+- Update the bundled macOS ARM64 indexer with the memory improvements.
+- Exclude local development-tool settings and diagnostic reports from the VSIX.
+
 ## [0.2.6037] - 2026-09-03
 
 ### Fixed
