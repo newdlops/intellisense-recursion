@@ -5,6 +5,15 @@ All notable changes to the IntelliSense Recursion extension.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.6039] - 2026-09-07
+
+### Added
+- Click the file path in a definition preview to open that source line in a
+  pinned editor tab. File links also work in detached hover windows and with
+  Enter, preserving the detached window's navigation history.
+- Preserve exact source URIs in preview links, including paths with spaces,
+  brackets, parentheses, and non-ASCII characters.
+
 ## [0.2.6038] - 2026-09-07
 
 ### Fixed

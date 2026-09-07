@@ -113,11 +113,16 @@
 // v313 (L141, 2026-07-14): detached windows stay inside the workbench theme
 //   scope, preserve editor-scoped token presentation when snapshotted, and
 //   reuse captured live editor grammars for syntax highlighting after drill.
+// v314: preview file paths open their exact source location in a pinned
+//   editor tab, including cloned windows and keyboard link activation.
 // If the running window still logs v<300, the new build is NOT loaded yet.
-export const RENDERER_PATCH_VERSION = 313;
+import { parsePreviewFileLink } from './preview-file-link';
+
+export const RENDERER_PATCH_VERSION = 314;
 
 export function getHoverPatchScript(): string {
   return `(function(){
+var irPreviewFileLinkTarget=${parsePreviewFileLink.toString()};
 var IR_PATCH_VERSION = ${RENDERER_PATCH_VERSION};
 // L89/L91 (2026-05-31): native-hover restoration master switch. MUST be assigned HERE at the
 // top of the IIFE — before the CSS array (style.textContent=[...] below) reads it synchronously,
@@ -637,6 +642,8 @@ style.textContent=[
   '.ir-detached-hover.ir-detached-hover .hover-row-contents{display:flex !important;flex-direction:column !important;min-width:0 !important}',
   '.ir-detached-hover.ir-detached-hover .monaco-hover-content,.ir-detached-hover.ir-detached-hover .markdown-hover,.ir-detached-hover.ir-detached-hover .rendered-markdown,.ir-detached-hover.ir-detached-hover pre,.ir-detached-hover.ir-detached-hover code{cursor:text !important;user-select:text !important;-webkit-user-select:text !important}',
   '.ir-detached-hover.ir-detached-hover .ir-type-link,.ir-detached-hover.ir-detached-hover .ir-type-link *,.ir-detached-hover.ir-detached-hover a[data-ir-detached-safe-link="1"]{pointer-events:auto !important;cursor:pointer !important}',
+  '.monaco-hover a:is([href^="command:intellisenseRecursion.openPreviewFile?"],[data-href^="command:intellisenseRecursion.openPreviewFile?"]){cursor:pointer !important;overflow-wrap:anywhere;text-decoration:underline}',
+  '.monaco-hover a:is([href^="command:intellisenseRecursion.openPreviewFile?"],[data-href^="command:intellisenseRecursion.openPreviewFile?"]):focus-visible{outline:2px solid var(--vscode-focusBorder);outline-offset:2px}',
   '.ir-detached-hover.ir-detached-hover button:not(.ir-detached-hover-close):not(.ir-detached-hover-back),.ir-detached-hover.ir-detached-hover input,.ir-detached-hover.ir-detached-hover textarea,.ir-detached-hover.ir-detached-hover select,.ir-detached-hover.ir-detached-hover [contenteditable="true"],.ir-detached-hover.ir-detached-hover [role="button"]:not(.ir-detached-hover-close):not(.ir-detached-hover-back){pointer-events:none !important}',
   '.ir-detached-hover-back,.ir-detached-hover-close{position:static !important;display:flex !important;align-items:center !important;justify-content:center !important;flex:0 0 24px !important;width:24px !important;height:24px !important;min-width:24px !important;min-height:24px !important;padding:0 !important;border:1px solid var(--vscode-contrastBorder,var(--vscode-focusBorder,rgba(255,255,255,0.48))) !important;border-radius:4px !important;background:var(--vscode-button-secondaryBackground,var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.42))) !important;color:var(--vscode-button-secondaryForeground,var(--vscode-foreground,CanvasText)) !important;font:700 17px/1 var(--vscode-font-family,sans-serif) !important;cursor:pointer !important;pointer-events:auto !important;opacity:1 !important;z-index:7 !important}',
   '.ir-detached-hover-back{display:none !important;font-size:15px !important}',
@@ -5116,7 +5123,7 @@ function irCreateDetachedHoverSnapshot(pin){
       var inactiveTag=String(inactive.tagName||'').toLowerCase();
       if(inactiveTag==='a'){
         var href=String(inactive.getAttribute('href')||inactive.getAttribute('data-href')||'').trim();
-        if(/^(https?:|mailto:)/i.test(href)){
+        if(/^(https?:|mailto:)/i.test(href)||irPreviewFileLinkTarget(href)){
           inactive.setAttribute('data-ir-detached-safe-link','1');
           // VS Code may keep the destination only in data-href and rely on a
           // listener that cloneNode cannot copy.  Materialize the validated
@@ -6138,6 +6145,36 @@ function irClickPinnedHoverSnapshot(){
     };
   }catch(_){return {pinned:false,error:true}}
 }
+function irPreviewFileLinkAt(target){
+  var el=irEventElement(target);
+  var link=el&&el.closest?el.closest('a'):null;
+  if(!link||!link.closest('.monaco-hover,.monaco-editor-hover'))return null;
+  var href=String(link.getAttribute('data-href')||link.getAttribute('href')||'');
+  return irPreviewFileLinkTarget(href)?{link:link,href:href}:null;
+}
+function irPreviewFileLinkPointerDown(e){
+  if(typeof e.button==='number'&&e.button!==0)return;
+  var file=irPreviewFileLinkAt(e.target);
+  if(!file)return;
+  // Keep type-link recovery and click-to-pin from consuming the path click.
+  file.link.focus({preventScroll:true});
+  e.preventDefault();
+  e.stopImmediatePropagation();
+}
+function irPreviewFileLinkClick(e){
+  if(e.type==='keydown'&&e.key!=='Enter')return;
+  if(typeof e.button==='number'&&e.button!==0)return;
+  var file=irPreviewFileLinkAt(e.target);
+  if(!file||typeof window.irGoToType!=='function')return;
+  e.preventDefault();
+  e.stopImmediatePropagation();
+  irClearClickPinnedHover('open-file',true);
+  window.irGoToType('OPEN_FILE:'+file.href);
+}
+track(window,'pointerdown',irPreviewFileLinkPointerDown,true);
+track(window,'mousedown',irPreviewFileLinkPointerDown,true);
+track(window,'click',irPreviewFileLinkClick,true);
+track(window,'keydown',irPreviewFileLinkClick,true);
 track(window,'pointerdown',irClickPinPointerDown,true);
 track(window,'mousedown',irClickPinPointerDown,true);
 track(window,'pointermove',irDetachedHoverResizeMove,true);
@@ -10644,6 +10681,20 @@ function irBuildParagraphs(text,parent){
   var paras=text.split(/\\n\\s*\\n/);
   for(var p=0;p<paras.length;p++){
     var t=paras[p].trim(); if(!t) continue;
+    var fileHeader=/^\\x60([^\\x60]+)\\x60\\s+(?:—|-)\\s+\\*\\[.*\\]\\((command:intellisenseRecursion\\.openPreviewFile\\?[^\\s)]+)(?: "[^"]*")?\\)\\*$/.exec(t);
+    var fileTarget=fileHeader&&irPreviewFileLinkTarget(fileHeader[2]);
+    if(fileTarget){
+      var header=document.createElement('p');
+      var name=document.createElement('code');name.textContent=fileHeader[1];
+      header.appendChild(name);header.appendChild(document.createTextNode(' — '));
+      var em=document.createElement('em');
+      var fileLink=document.createElement('a');
+      fileLink.textContent=fileTarget.path+':'+(fileTarget.line+1);
+      fileLink.href=fileHeader[2];fileLink.title='Open file in a new tab';
+      fileLink.setAttribute('data-ir-detached-safe-link','1');
+      em.appendChild(fileLink);header.appendChild(em);parent.appendChild(header);
+      continue;
+    }
     if(/^---+$/.test(t)){ parent.appendChild(document.createElement('hr')); continue; }
     var h=/^(#{1,6})\\s+(.+)$/.exec(t);
     if(h){
@@ -11186,6 +11237,7 @@ function irDecodeContent(s){
   for(var li=0;li<lines.length;li++){
     if(lines[li].indexOf('\\\`\\\`\\\`')===0) { inFence=!inFence; continue; }
     if(inFence) continue;
+    if(lines[li].indexOf('](command:intellisenseRecursion.openPreviewFile?')>=0)continue;
     lines[li]=lines[li].replace(/\\\\([\\\\\\\`*_{}\\[\\]()#+\\-.!<>|~])/g, '$1');
   }
   return lines.join('\\n');

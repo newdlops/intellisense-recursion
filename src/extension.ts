@@ -95,6 +95,7 @@ import {
   declarationIndexInLine,
   registerPreviewMarkdownLocations,
 } from './preview-markdown';
+import { OPEN_PREVIEW_FILE_COMMAND, openPreviewFile, parsePreviewFileLink, PreviewFileTarget } from './preview-file-link';
 import {
   PosPreviewEntry,
   POS_PREVIEW_TTL,
@@ -1175,6 +1176,7 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('intellisenseRecursion.previewType', previewTypeCommandHandler),
     vscode.commands.registerCommand('intellisenseRecursion.drillDown', previewTypeCommandHandler),
     vscode.commands.registerCommand('intellisenseRecursion.previewBack', previewBackHandler),
+    vscode.commands.registerCommand(OPEN_PREVIEW_FILE_COMMAND, openPreviewFileHandler),
     vscode.commands.registerCommand('intellisenseRecursion.getPatchStatus', () => ({
       hoverPatchActive,
       hoverRecursionDepth,
@@ -1269,6 +1271,10 @@ export async function activate(context: vscode.ExtensionContext) {
 
   if (extensionRunsInTestMode) {
     context.subscriptions.push(
+      vscode.commands.registerCommand(
+        'intellisenseRecursion.runPreviewFileLinkHarnessForTests',
+        runPreviewFileLinkHarnessForTests,
+      ),
       vscode.commands.registerCommand(
         'intellisenseRecursion.runHoverRendererHarnessForTests',
         runHoverRendererHarnessForTests,
@@ -3047,6 +3053,11 @@ function startClickListener(mainWs: any, isRendererTarget = false) {
           void handleDetachedPreviewBinding(val, mainWs);
           return;
         }
+        if (val.startsWith('OPEN_FILE:')) {
+          const target = parsePreviewFileLink(val.slice('OPEN_FILE:'.length));
+          if (target) { void openPreviewFileHandler(target); }
+          return;
+        }
         if (val === 'HIDE_HOVER' || val.startsWith('HIDE_HOVER:')) {
           vscode.commands.executeCommand('editor.action.hideHover')
             .then(
@@ -4538,6 +4549,57 @@ async function runDetachedPreviewProtocolHarnessForTests(identifier = 'BaseModel
     } catch {}
     for (const key of createdKeys) { detachedPreviewSessions.delete(key); }
   }
+}
+
+async function runPreviewFileLinkHarnessForTests(markdown: string, detached = false, keyboard = false): Promise<any[]> {
+  await ensureRendererPatchForHarness();
+  const expression = `(function(){
+    var hooks=window.__irTestHooks;
+    if(!hooks)return {ok:false,reason:'missing-hooks'};
+    var wrapper=document.createElement('div');
+    wrapper.className='monaco-resizable-hover';
+    wrapper.style.cssText='position:fixed;left:40px;top:80px;width:400px;height:180px;z-index:2147483647';
+    var root=document.createElement('div');root.className='monaco-hover';
+    var content=document.createElement('div');content.className='rendered-markdown';
+    root.appendChild(content);wrapper.appendChild(root);
+    (document.querySelector('.monaco-workbench')||document.body).appendChild(wrapper);
+    var state=null;
+    try{
+      hooks.buildMdDom(hooks.decodeContent(${JSON.stringify(markdown)}),content);
+      var link=content.querySelector('a');
+      if(!link)return {ok:false,reason:'missing-link',text:content.textContent};
+      var href=link.getAttribute('href');
+      // Native MarkdownRenderer can store its destination only in data-href.
+      link.setAttribute('data-href',href);link.removeAttribute('href');link.tabIndex=0;
+      var blocked=document.createElement('a');blocked.href='command:workbench.action.closeAllEditors';
+      blocked.textContent='unrelated command';content.appendChild(blocked);
+      if(${detached}){
+        state=hooks.createDetachedHoverSnapshot({wrapper:wrapper,root:root});
+        if(!state)return {ok:false,reason:'missing-detached-window'};
+        content=state.root;
+        link=content.querySelector('a[data-ir-detached-safe-link="1"]');
+      }
+      if(!link)return {ok:false,reason:'missing-cloned-link'};
+      var before=state?state.pageStack.length:0;
+      var result={ok:true,text:link.textContent,href:link.getAttribute('href')||link.getAttribute('data-href'),
+        disabled:link.getAttribute('aria-disabled'),tabIndex:link.tabIndex,
+        unrelatedDisabled:!${detached}||content.querySelector('a[aria-disabled="true"]')!==null};
+      link.focus();
+      result.focused=document.activeElement===link;
+      if(${keyboard}){
+        link.dispatchEvent(new KeyboardEvent('keydown',{key:'Enter',bubbles:true,cancelable:true}));
+      }else{
+        link.dispatchEvent(new MouseEvent('mousedown',{button:0,bubbles:true,cancelable:true}));
+        link.click();
+      }
+      result.historyUnchanged=!state||state.pageStack.length===before;
+      return result;
+    }finally{
+      if(state)hooks.removeDetachedHover(state,'file-link-test');
+      wrapper.remove();
+    }
+  })()`;
+  return evaluateInMainProcessForTests(rendererTestWindowEvalExpression(expression, true), 8000);
 }
 
 async function runHoverRendererHarnessForTests(): Promise<any[]> {
@@ -10697,7 +10759,7 @@ async function resolvePreviewIdentifierFromCurrentMarkdown(
   if (!previewState?.markdown) { return null; }
   const parsed = parsePreviewMarkdownSource(previewState.markdown);
   if (!parsed) { return null; }
-  const uri = await resolvePreviewMarkdownUri(parsed.relPath);
+  const uri = parsed.uri ? vscode.Uri.parse(parsed.uri) : await resolvePreviewMarkdownUri(parsed.relPath);
   if (!uri) { return null; }
 
   let doc: vscode.TextDocument;
@@ -11562,6 +11624,15 @@ async function previewTypeCommandHandler(first?: unknown, second?: unknown): Pro
     return;
   }
   await previewTypeHandler(docUriStr, previewIdentifier, false);
+}
+
+async function openPreviewFileHandler(target: PreviewFileTarget): Promise<void> {
+  try {
+    await openPreviewFile(target);
+  } catch (err) {
+    log.warn(`open preview file: ${err}`);
+    void vscode.window.showErrorMessage(`Unable to open file: ${target?.path || target?.uri || 'Unknown file'}`);
+  }
 }
 
 async function goToTypeHandler(docUriArg?: unknown, identifierArg?: unknown) {

@@ -2477,7 +2477,8 @@ function assertTokenizedLinkCounts(
 }
 
 function assertPreviewHeaderMatches(state: PatchStatus, pattern: RegExp, context: string) {
-  const firstLine = state.currentPreviewMarkdown.split(/\r?\n/, 1)[0] || '';
+  const firstLine = (state.currentPreviewMarkdown.split(/\r?\n/, 1)[0] || '')
+    .replace(/\[([^\]]+)\]\(command:intellisenseRecursion\.openPreviewFile\?[^\s)]+ "[^"]*"\)/g, '$1');
   assert.ok(pattern.test(firstLine),
     `${context} should resolve to the expected definition header. First line=${firstLine}`);
 }
@@ -4830,16 +4831,16 @@ suite('Hover Symbol Coverage E2E', () => {
       ? {
           file: 'service.py',
           identifier: 'create_user',
-          expectedHeader: '`create_user` — *service.py:5*',
+          expectedHeader: '`create_user` — *[service.py:5](',
           expectedDefinition: 'def create_user',
-          returnModelHeader: '`User` — *models.py:35*',
+          returnModelHeader: '`User` — *[models.py:35](',
         }
       : {
           file: 'service.ts',
           identifier: 'findEntity',
-          expectedHeader: '`findEntity` — *service.ts:20*',
+          expectedHeader: '`findEntity` — *[service.ts:20](',
           expectedDefinition: 'export function findEntity',
-          returnModelHeader: '`BaseEntity` — *models.ts:1*',
+          returnModelHeader: '`BaseEntity` — *[models.ts:1](',
         };
     const doc = await vscode.workspace.openTextDocument(
       vscode.Uri.file(path.join(root, fixture.file)),

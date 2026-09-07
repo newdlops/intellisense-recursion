@@ -46,6 +46,7 @@ import {
   findBraceBlockEndLine,
 } from './preview-engine';
 import type { DefCacheEntry } from './cache';
+import { previewFileLink } from './preview-file-link';
 
 export const PREVIEW_LOCATION_MAX_SIZE = 1_000;
 export const lastPreviewLocations = new Map<string, vscode.Location>();
@@ -224,9 +225,8 @@ export function buildDefinitionPreviewResult(
 ): NonNullable<DefCacheEntry['result']> {
   const resolvedStartLine = refineDefinitionLineForIdentifier(defDoc, typeName, startLine);
   const previewBlock = collectDefinitionPreview(defDoc, resolvedStartLine, hintedEndLine);
-  const relPath = vscode.workspace.asRelativePath(defUri);
   const lang = defDoc.languageId || 'python';
-  const preview = `\`${typeName}\` — *${relPath}:${previewBlock.definitionLine + 1}*\n${renderPreviewCodeFences(lang, previewBlock.code)}`;
+  const preview = `\`${typeName}\` — ${previewFileLink(defUri, previewBlock.definitionLine)}\n${renderPreviewCodeFences(lang, previewBlock.code)}`;
   // Detached hover windows keep their own navigation lane.  Building one of
   // those pages must not repoint the singleton location LRUs used by the
   // native hover.  Callers can therefore request the same preview payload
@@ -296,9 +296,8 @@ export async function buildDefinitionPreviewResultFromRawFile(
   const rawDoc = await readRawFileSnapshot(fsPath);
   const resolvedStartLine = refineDefinitionLineForIdentifier(rawDoc, typeName, startLine);
   const previewBlock = collectDefinitionPreview(rawDoc, resolvedStartLine, hintedEndLine);
-  const relPath = vscode.workspace.asRelativePath(defUri);
   const lang = rawDoc.languageId || 'python';
-  const preview = `\`${typeName}\` — *${relPath}:${previewBlock.definitionLine + 1}*\n${renderPreviewCodeFences(lang, previewBlock.code)}`;
+  const preview = `\`${typeName}\` — ${previewFileLink(defUri, previewBlock.definitionLine)}\n${renderPreviewCodeFences(lang, previewBlock.code)}`;
   const location = rememberPreviewLocations(typeName, defUri, previewBlock);
   return {
     preview,

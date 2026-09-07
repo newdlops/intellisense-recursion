@@ -19,6 +19,7 @@ import { isCodeDoc } from './util';
 import { declarationIdentifiersInLine } from './idents';
 import type { DefinitionPreview } from './preview-engine';
 import { rememberPreviewLocations } from './preview-builder';
+import { parsePreviewFileLink } from './preview-file-link';
 
 export async function resolvePreviewMarkdownUri(relPath: string): Promise<vscode.Uri | null> {
   const normalized = relPath.trim();
@@ -52,20 +53,26 @@ export async function resolvePreviewMarkdownUri(relPath: string): Promise<vscode
 export function parsePreviewMarkdownSource(markdown: string): {
   typeName: string;
   relPath: string;
+  uri?: string;
   definitionLine: number;
   languageId: string;
   code: string;
 } | null {
-  const match = /^`([^`\n]+)`\s+(?:—|-)\s+\*([^*\n]+):(\d+)\*\s*\n```([^\n`]*)\n([\s\S]*?)\n?```/m.exec(markdown);
+  const match = /^`([^`\n]+)`\s+(?:—|-)\s+\*([^\n]+)\*\s*\n```([^\n`]*)\n([\s\S]*?)\n?```/m.exec(markdown);
   if (!match) { return null; }
-  const line = Number(match[3]);
+  const link = /\]\((command:intellisenseRecursion\.openPreviewFile\?[^\s)]+)(?: "[^"]*")?\)$/.exec(match[2]);
+  const target = link ? parsePreviewFileLink(link[1]) : null;
+  const legacy = !link ? /^(.+):(\d+)$/.exec(match[2]) : null;
+  if (!target && !legacy) { return null; }
+  const line = target ? target.line + 1 : Number(legacy![2]);
   if (!Number.isFinite(line) || line <= 0) { return null; }
   return {
     typeName: match[1],
-    relPath: match[2],
+    relPath: target ? target.path : legacy![1],
+    ...(target ? { uri: target.uri } : {}),
     definitionLine: line - 1,
-    languageId: match[4].trim() || 'plaintext',
-    code: match[5],
+    languageId: match[3].trim() || 'plaintext',
+    code: match[4],
   };
 }
 

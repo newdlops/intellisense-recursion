@@ -13,6 +13,9 @@ positioning, theming. Our only DOM responsibilities are:
 - Wrap discovered type names with `.ir-type-link` so they become clickable.
 - Insert a `[← Back](command:intellisenseRecursion.previewBack)` link at the
   top of the markdown when there's drill-down history.
+- Render the preview's `file path:line` as a link that opens the exact source
+  URI at that line in a pinned editor tab (`preview: false`). The link uses
+  native theme colors, wraps long paths, and supports click and Enter.
 - Keep VS Code's two hover containers (`.monaco-resizable-hover` wrapper and
   `.monaco-hover` child) geometrically aligned (see "JS aligner" below).
 - Keep automatic hovers inside a compact `680px × 48vh` envelope, while
@@ -163,9 +166,11 @@ Type links use a detached-session request ID and apply their result only to the
 window that issued the request. Each window keeps its own DOM/markdown back
 stack, including a live `DocumentFragment` for restoring the original snapshot,
 so detached navigation never mutates the native singleton hover's target or
-history. Safe `http:`, `https:`, and `mailto:` anchors remain active; cloned
-command links and form controls stay disabled. At most 12 detached windows are
-retained, and large virtualized tails keep their own scroll renderer.
+history. Safe `http:`, `https:`, and `mailto:` anchors remain active, as does our
+validated `intellisenseRecursion.openPreviewFile` link. File links open the
+source tab without changing the detached window's page or back stack. Other
+cloned command links and form controls stay disabled. At most 12 detached
+windows are retained, and large virtualized tails keep their own scroll renderer.
 
 ## Box-corner contract (what the golden E2E checks)
 
