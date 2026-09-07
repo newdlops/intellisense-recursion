@@ -35,8 +35,8 @@ import {
   DefinitionPreview,
   TextLikeDocument,
   RawFileSnapshot,
-  RAW_DEF_FILE_CACHE_MAX,
   rawDefFileCache,
+  cacheRawFileSnapshot,
   isPythonLikeDoc,
   includeLeadingDefinitionDecorators,
   normalizePythonDecoratedDefinitionLine,
@@ -274,13 +274,12 @@ export async function readRawFileSnapshot(fsPath: string): Promise<RawFileSnapsh
     },
   };
 
-  if (rawDefFileCache.size >= RAW_DEF_FILE_CACHE_MAX) {
-    const first = rawDefFileCache.keys().next().value;
-    if (first !== undefined) { rawDefFileCache.delete(first); }
-  }
-  rawDefFileCache.set(fsPath, {
+  cacheRawFileSnapshot(fsPath, {
     mtimeMs: stat.mtimeMs,
     size: stat.size,
+    // Allow for UTF-16 backing text, line strings and array slots. This is
+    // a conservative retention estimate, not a cap on the process's RSS.
+    retainedBytes: raw.length * 2 + lines.length * 64,
     snapshot,
   });
   return snapshot;

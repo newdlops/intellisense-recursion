@@ -214,11 +214,7 @@ fn handle<W: Write>(
                 Ok(mut hits) => {
                     rank(&mut hits);
                     let total = hits.len();
-                    let taken: Vec<HitJson> = hits
-                        .iter()
-                        .take(limit)
-                        .map(hit_to_json)
-                        .collect();
+                    let taken: Vec<HitJson> = hits.iter().take(limit).map(hit_to_json).collect();
                     let resp = Response {
                         id: req.id,
                         ok: true,
@@ -236,22 +232,30 @@ fn handle<W: Write>(
                 return emit_error(out, req.id, "lookup_many requires 'names'");
             };
             let lang = req.language.as_deref();
-            let looked: Vec<(String, Vec<Hit>)> = names
+            // Keep only the response-sized prefix for each name. Retaining
+            // every posting until all names were looked up multiplied peak
+            // memory by the batch size, even when the caller wanted 20 hits.
+            let looked: Vec<(&str, usize, Vec<Hit>)> = names
                 .iter()
                 .filter_map(|n| {
-                    merged_lookup(idx, overlay, discoveries, n, lang).ok().map(|mut h| {
-                        rank(&mut h);
-                        (n.clone(), h)
-                    })
+                    merged_lookup(idx, overlay, discoveries, n, lang)
+                        .ok()
+                        .map(|mut h| {
+                            rank(&mut h);
+                            let total = h.len();
+                            h.truncate(limit);
+                            h.shrink_to_fit();
+                            (n.as_str(), total, h)
+                        })
                 })
                 .collect();
 
             let results: Vec<SymbolResult> = looked
                 .iter()
-                .map(|(n, hits)| SymbolResult {
-                    name: n.as_str(),
-                    total: hits.len(),
-                    hits: hits.iter().take(limit).map(hit_to_json).collect(),
+                .map(|(n, total, hits)| SymbolResult {
+                    name: n,
+                    total: *total,
+                    hits: hits.iter().map(hit_to_json).collect(),
                 })
                 .collect();
 
@@ -270,10 +274,7 @@ fn handle<W: Write>(
             let Some(source) = req.source.as_deref() else {
                 return emit_error(out, req.id, "update_file requires 'source'");
             };
-            let ext = match Path::new(path)
-                .extension()
-                .and_then(|e| e.to_str())
-            {
+            let ext = match Path::new(path).extension().and_then(|e| e.to_str()) {
                 Some(e) => e,
                 None => return emit_error(out, req.id, "update_file: path has no extension"),
             };
@@ -342,11 +343,7 @@ fn handle<W: Write>(
         }
         "clear_discoveries_for_path" => {
             let Some(path) = req.path.as_deref() else {
-                return emit_error(
-                    out,
-                    req.id,
-                    "clear_discoveries_for_path requires 'path'",
-                );
+                return emit_error(out, req.id, "clear_discoveries_for_path requires 'path'");
             };
             let removed = discoveries.clear_for_path(path);
             let resp = Response {
@@ -411,7 +408,9 @@ fn hit_to_json(h: &Hit) -> HitJson<'_> {
 }
 
 fn filter_by_language(hits: &mut Vec<Hit>, lang: Option<&str>) {
-    let Some(lang) = lang else { return; };
+    let Some(lang) = lang else {
+        return;
+    };
     hits.retain(|h| language_of(&h.path) == lang);
 }
 
@@ -441,9 +440,20 @@ fn emit_error<W: Write>(out: &mut W, id: u64, msg: &str) -> Result<()> {
 /// built-in `type Omit = ...` (a Variable) beats `@sinclair/typebox`'s
 /// `static Omit()` (a Method).
 fn rank(hits: &mut Vec<Hit>) {
-    hits.sort_by_key(|h| {
-        (kind_rank_adjusted(h), source_rank_adjusted(h), path_rank(&h.path))
-    });
+    let key = |h: &Hit| {
+        (
+            kind_rank_adjusted(h),
+            source_rank_adjusted(h),
+            path_rank(&h.path),
+        )
+    };
+    if hits.len() <= 32 {
+        hits.sort_by_key(key);
+    } else {
+        // Path classification scans strings; compute it once per hit for
+        // large result sets while preserving the existing stable tie order.
+        hits.sort_by_cached_key(key);
+    }
 }
 
 fn source_rank(s: SourceTag) -> u8 {
@@ -513,7 +523,8 @@ fn path_rank(path: &str) -> u8 {
     }
     // Test fixtures / vendored typeshed copies inside libraries ship
     // duplicate definitions that users almost never want to jump to.
-    if path.contains("/test-data/") || path.contains("/tests/")
+    if path.contains("/test-data/")
+        || path.contains("/tests/")
         || path.contains("/jedi/third_party/")
         || path.contains("/mypy/typeshed/")
         || path.contains("/mypyc/test-data/")
@@ -521,4 +532,151 @@ fn path_rank(path: &str) -> u8 {
         return 9;
     }
     5
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index::{build_index, RootSpec};
+    use std::fs;
+    use std::path::PathBuf;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn cached_ranking_preserves_priority_and_stable_ties() {
+        let paths = [
+            "/workspace/project.py",
+            "/workspace/node_modules/@types/react/index.d.ts",
+            "/workspace/node_modules/typescript/lib/lib.es5.d.ts",
+            "/workspace/.venv/typing.py",
+            "/workspace/node_modules/pkg/tests/index.ts",
+        ];
+        let kinds = [
+            Kind::Alias,
+            Kind::Class,
+            Kind::Variable,
+            Kind::Method,
+            Kind::Attribute,
+        ];
+        for count in [0, 1, 32, 33, 300] {
+            let mut hits: Vec<_> = (0..count)
+                .map(|i| Hit {
+                    file_id: i as u32,
+                    path: paths[i % paths.len()].to_string(),
+                    line: i as u32 + 1,
+                    col: 1,
+                    kind: kinds[(i / paths.len()) % kinds.len()],
+                    source: if i % 2 == 0 {
+                        SourceTag::Project
+                    } else {
+                        SourceTag::Venv
+                    },
+                })
+                .collect();
+            let mut previous_order = hits.clone();
+            previous_order.sort_by_key(|h| {
+                (
+                    kind_rank_adjusted(h),
+                    source_rank_adjusted(h),
+                    path_rank(&h.path),
+                )
+            });
+            rank(&mut hits);
+            assert_eq!(
+                hits.iter().map(|h| h.file_id).collect::<Vec<_>>(),
+                previous_order.iter().map(|h| h.file_id).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    struct TestDir(PathBuf);
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn batched_results_match_single_lookup_counts_order_and_limits() {
+        let path = std::env::temp_dir().join(format!(
+            "ir-batch-test-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&path).unwrap();
+        let dir = TestDir(path.canonicalize().unwrap());
+        for i in 0..40 {
+            fs::write(
+                dir.0.join(format!("model_{i}.py")),
+                format!("class Shared: pass\nclass Unique{i}: pass\n"),
+            )
+            .unwrap();
+        }
+        fs::write(dir.0.join("model.ts"), "export class Shared {}\n").unwrap();
+        let index_path = dir.0.join("index.bin");
+        build_index(
+            &[RootSpec {
+                tag: SourceTag::Project,
+                path: dir.0.clone(),
+            }],
+            &index_path,
+        )
+        .unwrap();
+        let index = Index::open(&index_path).unwrap();
+        let mut overlay = Overlay::new();
+        let shadowed = dir.0.join("model_0.py").to_string_lossy().into_owned();
+        overlay
+            .set(&shadowed, b"class Edited: pass\n", "py", index.roots())
+            .unwrap();
+        let mut discoveries = Discoveries::new();
+        discoveries.add(
+            "Shared",
+            &dir.0.join("discovered.py").to_string_lossy(),
+            7,
+            1,
+            Kind::Class,
+            index.roots(),
+        );
+
+        for language in [Some("python"), None] {
+            for limit in [0, 3, 100] {
+                let names = ["Shared", "Missing", "Unique1", "Shared", "Edited"];
+                let request: Request = serde_json::from_value(serde_json::json!({"id":1,"op":"lookup_many","names":names,"limit":limit,"language":language})).unwrap();
+                let mut output = Vec::new();
+                handle(
+                    &index,
+                    &mut overlay,
+                    &mut discoveries,
+                    &request,
+                    &mut output,
+                )
+                .unwrap();
+                let batch: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                assert_eq!(batch["results"].as_array().unwrap().len(), names.len());
+                assert_eq!(
+                    batch["results"][0]["total"],
+                    if language.is_some() { 40 } else { 41 }
+                );
+                for (i, name) in names.iter().enumerate() {
+                    let request: Request = serde_json::from_value(serde_json::json!({"id":2,"op":"lookup","name":name,"limit":limit,"language":language})).unwrap();
+                    output.clear();
+                    handle(
+                        &index,
+                        &mut overlay,
+                        &mut discoveries,
+                        &request,
+                        &mut output,
+                    )
+                    .unwrap();
+                    let single: serde_json::Value = serde_json::from_slice(&output).unwrap();
+                    assert_eq!(batch["results"][i]["name"], *name);
+                    assert_eq!(batch["results"][i]["total"], single["total"]);
+                    assert_eq!(batch["results"][i]["hits"], single["hits"]);
+                }
+            }
+        }
+    }
 }

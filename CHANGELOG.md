@@ -5,6 +5,17 @@ All notable changes to the IntelliSense Recursion extension.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.6040] - 2026-09-07
+
+### Fixed
+- Reduce batched symbol lookup memory by releasing hits beyond each requested
+  limit immediately, while preserving total counts and result order.
+- Cache ranking keys for large result sets and search edited-file symbols by
+  sorted name ranges to reduce repeated path classification and symbol scans.
+- Bound raw preview file caching to both 24 files and a 16 MiB estimated heap
+  budget. Oversized files remain readable without displacing reusable entries.
+- Update the bundled macOS ARM64 indexer with the query improvements.
+
 ## [0.2.6039] - 2026-09-07
 
 ### Added

@@ -4,7 +4,7 @@
 // Scope:
 //   * The three shape interfaces (DefinitionPreview, TextLikeDocument,
 //     RawFileSnapshot) used by every preview builder.
-//   * The rawDefFileCache (LRU, max 24) — backing store for off-document
+//   * The rawDefFileCache (LRU, max 24 / 16 MiB estimate) — backing store for off-document
 //     definition reads.
 //   * Pure functions that locate a definition's enclosing source block:
 //     header end (Python `def ... :`), block end (indentation or `}`),
@@ -41,11 +41,35 @@ export interface RawFileSnapshot extends TextLikeDocument {
 }
 
 export const RAW_DEF_FILE_CACHE_MAX = 24;
+export const RAW_DEF_FILE_CACHE_MAX_BYTES = 16 * 1024 * 1024;
 export const rawDefFileCache = new Map<string, {
   mtimeMs: number;
   size: number;
+  retainedBytes: number;
   snapshot: RawFileSnapshot;
 }>();
+
+/** Retain a snapshot only within both the entry and estimated heap budgets. */
+export function cacheRawFileSnapshot(fsPath: string, entry: {
+  mtimeMs: number;
+  size: number;
+  retainedBytes: number;
+  snapshot: RawFileSnapshot;
+}): void {
+  rawDefFileCache.delete(fsPath);
+  // Oversized files remain available to the current preview, but should not
+  // evict every smaller, reusable snapshot or remain resident after use.
+  if (entry.retainedBytes > RAW_DEF_FILE_CACHE_MAX_BYTES) { return; }
+  let bytes = entry.retainedBytes;
+  for (const cached of rawDefFileCache.values()) { bytes += cached.retainedBytes; }
+  while (rawDefFileCache.size >= RAW_DEF_FILE_CACHE_MAX || bytes > RAW_DEF_FILE_CACHE_MAX_BYTES) {
+    const oldest = rawDefFileCache.entries().next().value;
+    if (!oldest) { break; }
+    bytes -= oldest[1].retainedBytes;
+    rawDefFileCache.delete(oldest[0]);
+  }
+  rawDefFileCache.set(fsPath, entry);
+}
 
 /** Drop every cached raw file snapshot. Used on hard rebuild. */
 export function clearRawDefFileCache(): void {
