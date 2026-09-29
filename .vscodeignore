@@ -41,9 +41,9 @@ package-lock.json
 out/test/**
 out/**/*.test.js
 
-# ── orphan tsc outputs (esbuild inlines these into out/extension.js) ──
-out/indexManager.js
-out/sidecar.js
+# ── only the runtime bundle is needed (all tsc modules are inlined) ──
+out/**
+!out/extension.js
 
 # ── prebuilt native sidecar ──
 # Ship the current macOS ARM64 binary so activation never compiles Rust on the
