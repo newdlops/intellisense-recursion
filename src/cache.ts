@@ -13,6 +13,7 @@
 // state.
 
 import * as vscode from 'vscode';
+import { ExpiringLruCache } from './expiring-lru-cache';
 
 // ── Definition cache (LRU-style with TTL) ───────────────────────────────
 // Key: "uri:line:character:typeName", Value: cached result or negative marker
@@ -27,33 +28,25 @@ export interface DefCacheEntry {
     previewLineCount?: number;
   } | null;
 }
-const defCache = new Map<string, DefCacheEntry>();
 export const DEF_CACHE_TTL = 60_000;       // positive cache: 60s
 export const DEF_CACHE_NEG_TTL = 30_000;   // negative cache: 30s
 export const DEF_CACHE_MAX_SIZE = 200;
+export const DEF_CACHE_MAX_BYTES = 4 * 1024 * 1024;
+const defCache = new ExpiringLruCache<string, DefCacheEntry>(
+  DEF_CACHE_MAX_SIZE, DEF_CACHE_MAX_BYTES,
+  (entry, key) => 128 + 2 * (key.length + (entry.result?.preview.length ?? 0)),
+);
 
 export function defCacheKey(uri: vscode.Uri, pos: vscode.Position, typeName: string): string {
   return `${uri.fsPath}:${pos.line}:${pos.character}:${typeName}`;
 }
 
 export function defCacheGet(key: string): DefCacheEntry | undefined {
-  const entry = defCache.get(key);
-  if (!entry) { return undefined; }
-  const ttl = entry.result ? DEF_CACHE_TTL : DEF_CACHE_NEG_TTL;
-  if (Date.now() - entry.timestamp > ttl) {
-    defCache.delete(key);
-    return undefined;
-  }
-  return entry;
+  return defCache.get(key);
 }
 
 export function defCacheSet(key: string, result: DefCacheEntry['result']) {
-  // Simple eviction: drop oldest entries when over limit
-  if (defCache.size >= DEF_CACHE_MAX_SIZE) {
-    const firstKey = defCache.keys().next().value;
-    if (firstKey !== undefined) { defCache.delete(firstKey); }
-  }
-  defCache.set(key, { timestamp: Date.now(), result });
+  defCache.set(key, { timestamp: Date.now(), result }, result ? DEF_CACHE_TTL : DEF_CACHE_NEG_TTL);
 }
 
 // ── "Not found in docs" global negative cache ────────────────────────────
@@ -132,12 +125,12 @@ export function clearNotFoundInDocs(): void {
 }
 /**
  * Drop every defCache entry whose key starts with `fsPath:` (the prefix
- * shape used by defCacheKey). Called on file save to invalidate stale
- * resolutions for that document.
+ * shape used by defCacheKey), or whose definition belongs to that file.
+ * Called on save/close to invalidate stale results and release documents.
  */
 export function invalidateDefCacheByPath(fsPath: string): void {
   const prefix = fsPath + ':';
-  for (const key of defCache.keys()) {
-    if (key.startsWith(prefix)) { defCache.delete(key); }
+  for (const [key, entry] of defCache.entries()) {
+    if (key.startsWith(prefix) || entry.result?.defUri.fsPath === fsPath) { defCache.delete(key); }
   }
 }
