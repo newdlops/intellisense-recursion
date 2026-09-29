@@ -22,10 +22,7 @@
 
 import * as vscode from 'vscode';
 import * as fs from 'node:fs/promises';
-import {
-  DEFINITION_PREVIEW_FALLBACK_LINES,
-  DEFINITION_PREVIEW_SAFETY_MAX_LINES,
-} from './util';
+import { DEFINITION_PREVIEW_FALLBACK_LINES } from './util';
 import {
   SKIP_WORDS,
   declarationIdentifiersInLine,
@@ -105,14 +102,10 @@ export function collectDefinitionPreview(
     endLine = Math.min(previewStartLine + DEFINITION_PREVIEW_FALLBACK_LINES, doc.lineCount);
   }
 
-  const uncappedEndLine = endLine;
-  endLine = Math.min(endLine, previewStartLine + DEFINITION_PREVIEW_SAFETY_MAX_LINES);
-
+  // Keep the complete definition. Resource limits belong to cache retention,
+  // never to the source shown in the scrollable hover.
   const lines: string[] = [];
   for (let i = previewStartLine; i < endLine; i++) { lines.push(doc.lineAt(i).text); }
-  if (endLine < uncappedEndLine) {
-    lines.push(`... (${uncappedEndLine - endLine} more lines)`);
-  }
 
   return {
     previewStartLine,
@@ -134,7 +127,6 @@ export function rememberPreviewLocations(
   cappedPreviewLocationSet(lastPreviewLocations, typeName, previewLoc);
 
   const seen = new Set<string>([typeName]);
-  const lineTexts = preview.code.split('\n');
   // Cap how many preview lines we eagerly index by identifier. Previously
   // this loop ran over the entire preview block (up to ~600 lines), doing
   // a matchAll on every line and ~hundreds of cappedPreviewLocationSet
@@ -142,8 +134,10 @@ export function rememberPreviewLocations(
   // Cmd+Click into nearby declarations; deeper identifiers can still be
   // resolved by the regular LSP path when the user actually hovers them.
   const REMEMBER_PREVIEW_INDEX_LINES = 24;
-  const indexedLineCount = Math.min(lineTexts.length, REMEMBER_PREVIEW_INDEX_LINES);
-  for (let offset = 0; offset < indexedLineCount; offset++) {
+  // Split only the eagerly indexed prefix, without copying the rest of a large
+  // definition into a temporary line array. The displayed preview stays whole.
+  const lineTexts = preview.code.split('\n', REMEMBER_PREVIEW_INDEX_LINES);
+  for (let offset = 0; offset < lineTexts.length; offset++) {
     const lineText = lineTexts[offset];
     const absLine = preview.previewStartLine + offset;
     for (const decl of decoratorIdentifiersInLine(lineText)) {
@@ -182,36 +176,9 @@ export function rememberPreviewLocations(
   return previewLoc;
 }
 
-// L84 (2026-05-30): lightweight rendering for large code previews. #2 hover-jank
-// was root-caused to VS Code synchronously TextMate-tokenizing huge hover code
-// fences — a genuine 1,657-line class (company.py:242-1898, ~59K chars) blocked the
-// renderer main thread up to 2.4s. Highlight only the head (what's visible when the
-// hover opens) and render the long tail as a PLAIN fence (no language tag → no
-// tokenization), so the off-screen lines cost ~nothing while 100% of the content
-// and the code-block layout are preserved. Small previews are highlighted whole.
-// The two adjacent fences render as one continuous code area with a hairline gap at
-// the highlight boundary. Deterministic (same code → same split), so block dedupe
-// keys stay stable.
+// Preserve the whole source and language in one Markdown code fence. Delivery
+// can reopen the fence across native items to avoid VS Code's character cap.
 function renderPreviewCodeFences(lang: string, code: string): string {
-  // L92 (2026-05-31): native mode now ALSO uses the L84 head/tail split. Full-highlight (the
-  // earlier native choice) made VS Code synchronously tokenize whole 1657-line classes -> ~1.5s
-  // main-thread blocks that even expired drill page-transitions. Highlight only the head; render
-  // the tail as a plain fence so the off-screen lines cost ~nothing. cf. project_hover_jank memory.
-  // L123 (2026-06-01): the tail MUST carry an explicit plaintext language. An EMPTY-language fence
-  // (```\n) was assumed to be untokenized, but VS Code's hover markdown renderer falls back to the
-  // DOCUMENT's language for empty fences and TextMate-tokenized the whole tail anyway — log proof:
-  // a 1657-line class showed tokenized=2 (.monaco-tokenized-source head AND tail) + mtk=6693 spans
-  // (~the whole class), driving the render/scroll/resize CPU. An explicit ```plaintext has no
-  // grammar, so the tail renders as plain monospace (zero .mtkN spans) — DOM drops to head-only.
-  // L130 (2026-06-01): user chose B — FULL syntax highlighting (no head/tail split). The whole
-  // preview is ONE ```lang fence, so VS Code tokenizes all of it = color throughout while scrolling.
-  // TRADEOFF (explicitly accepted): VS Code tokenizes synchronously on hover-show, so a large class
-  // freezes the renderer ~1ms/line on open (a 1657-line class ≈ ~1.7s — the freeze the L84/L123
-  // head/tail split had avoided). Content is still bounded by DEFINITION_PREVIEW_SAFETY_MAX_LINES.
-  // The OTHER perf fixes remain (viewport-band wrap L126, no scroll storm L124, dismiss cleanup L122,
-  // per-move dedup L127), so ONLY the tokenization freeze returns — not the wrap/scan/leak costs.
-  // Revert to head/tail split (L123) if the freeze is unacceptable; dynamic colorize is the
-  // freeze-free alternative but needs reviving the dead Monaco-tokenizer subsystem (big project).
   return `\`\`\`${lang}\n${code}\n\`\`\``;
 }
 

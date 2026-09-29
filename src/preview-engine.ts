@@ -13,12 +13,8 @@
 //     LSP-reported line to the actual identifier-declaring line.
 //
 // All functions are pure and side-effect-free apart from the LRU mutation
-// on the raw file cache. Dependencies are limited to ./util (preview
-// length constants) and ./idents (declaration identifier matcher).
+// on the raw file cache. Depends on ./idents (declaration identifier matcher).
 
-import {
-  DEFINITION_PREVIEW_VALUE_MAX_LINES,
-} from './util';
 import { declarationIdentifiersInLine } from './idents';
 
 export interface DefinitionPreview {
@@ -192,9 +188,9 @@ export function findValueDefinitionEndLine(doc: TextLikeDocument, definitionLine
   let blockComment = false;
   let quote: '"' | "'" | '`' | null = null;
   let escaped = false;
-  const scanEnd = Math.min(doc.lineCount, definitionLine + DEFINITION_PREVIEW_VALUE_MAX_LINES);
-
-  for (let i = definitionLine; i < scanEnd; i++) {
+  // Stop at the actual end of the value, including large arrays/objects and
+  // multiline strings. A line budget would silently drop source from the hover.
+  for (let i = definitionLine; i < doc.lineCount; i++) {
     const line = doc.lineAt(i).text;
     for (let j = 0; j < line.length; j++) {
       const ch = line[j];
@@ -231,7 +227,7 @@ export function findValueDefinitionEndLine(doc: TextLikeDocument, definitionLine
     if (!valueLineContinues(line, pythonLike)) { return i + 1; }
   }
 
-  return scanEnd;
+  return doc.lineCount;
 }
 
 export function findPythonHeaderEndLine(doc: TextLikeDocument, definitionLine: number): number {

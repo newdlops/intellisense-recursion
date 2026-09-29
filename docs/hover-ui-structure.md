@@ -26,6 +26,34 @@ positioning, theming. Our only DOM responsibilities are:
 VS Code still chooses width/height and owns all positioning. Our size rules
 only provide the automatic and user-resize upper bounds described below.
 
+## Complete source content
+
+Definition previews retain the whole resolved source block, including comments,
+docstrings and the final line. Do not replace offscreen source with `...`, an
+excerpt, or a “more lines” summary. Long blocks use the native scrollbar and
+retain syntax highlighting throughout. Dragging into a persistent panel must
+preserve the same content and access to its last line.
+
+The old 10,000-line definition cap and 600-line value scan cap have been removed.
+Both open-document and raw-file builders stop at the structural definition end.
+Cache budgets limit retained results; exceeding a budget skips retention without
+shortening the current preview. Eager navigation indexing may inspect a prefix,
+but must leave the displayed source intact. Ellipses already present in source
+(Python `...`, spread syntax, string literals) remain verbatim.
+
+VS Code 1.139.1 also truncates each individual Markdown item at 100,000 UTF-16
+code units in its renderer. `withCompleteHoverContents` splits large items at
+the final provider boundary into smaller native items, reopening language fences
+for continued code. Small results keep their identity. All provider metadata and
+ranges are preserved; caches, deduplication and history still use the full
+original Markdown. The boundary covers initial, cached and forward/Back results,
+including native language-server descriptions.
+
+Patch 322 consolidates those rendered roots inside a detached clone, in source
+order, before establishing its single navigation/history target. This prevents
+continuation blocks from being left behind when drilling and ensures Back
+restores the complete page. Native hover rows are not reorganized.
+
 ## DOM hierarchy
 
 VS Code wraps every hover in a stack that looks like:
@@ -151,6 +179,19 @@ root observer has already stopped. A replacement rendered in that interval
 keeps the session. Transient 0×0 resize frames do not trigger that reset.
 Pointer release, cancellation, or window blur ends the leave guard immediately.
 
+Patch 321 also snapshots the completed native drag dimensions. A content refire
+can reset the native widget to its small initial dimensions while the flexible
+class remains active; skipping automatic sizing in that state left the drilled
+page permanently cramped. This reproduced with the saved patch 320. The existing
+content-change sizing pass now restores the saved manual size through the native
+node, clamped to current viewport/anchor bounds. Active drags remain owned by
+VS Code. Stable dismissal clears the saved size with the flexible class.
+
+The shipping startup regression in VS Code 1.139.1 checks right-edge and corner
+mouse drags on short content, then a type click, preserved manual dimensions and
+drag-to-detach. It waits for content sizing to finish before capturing; the
+1440 × 900 native/resized/detached screenshots were inspected.
+
 The resize regression uses CDP mouse press/move/release against real native
 sashes above and below the token. It checks edge hit testing, width/height
 growth and shrinkage, corner resizing, native/painted size agreement, token
@@ -198,6 +239,30 @@ these isolated passing runs.
 
 ## Click-to-pin lifecycle
 
+### Production startup verification (2026-09-29)
+
+The comparison with today's starting commit, `590cb45`, retained the 1px
+native wrapper border and the drag-to-detach implementation. The missing UI in
+the live editor was traced to renderer injection failing before either could
+be installed: a second VS Code executable under this project's `.vscode-test`
+directory occupied the default main inspector port while the normal editor
+could not open it. The existing renderer tests injected through their own CDP
+connection and therefore did not detect this startup failure.
+
+Test launches now isolate the main inspector port as well as their profile and
+renderer port. `IR_TEST_PRODUCTION_INJECTION=1` exercises automatic production
+injection, including PID matching and the main-process click bridge, without
+calling an injection harness. If the initial connection failed, the safety
+pass repeats complete initialization instead of injecting UI without its
+extension-host click listener.
+
+The shipping minified bundle passed `renderer-startup.test.js` in VS Code
+1.139.1 at 1440 × 900: all four native borders measured 1px, a real type click
+reached the extension host, and dragging retained the panel after native hover
+dismissal. Native and detached screenshots were inspected. Run this regression
+after `npm run bundle` with
+`IR_TEST_PRODUCTION_INJECTION=1 IR_E2E_FILES=renderer-startup.test.js node out/test/runTest.js`.
+
 A primary pointer-down inside a real `.monaco-resizable-hover` pins that hover.
 The pin uses VS Code's own lifecycle rather than the legacy `ir-sticky` overlay
 management:
@@ -223,6 +288,30 @@ native pin is cleared. The owning controller is then hidden directly (with the
 normal `editor.action.hideHover` request as fallback), returning VS Code's
 single reusable hover widget for the next symbol. This is the transition that
 allows multiple moved hover windows to coexist.
+
+Patch 320 lets an unmodified primary drag start on a type link as well as
+ordinary text or whitespace. A link press stays eligible for a click until it
+moves 5px. Pointer capture is deferred until that threshold so a simple click
+still reaches the original link. While the pointer is held, the 180ms click
+fallback waits for release; a drag cancels it, and cancellation or window blur
+clears it. Native resize sashes, scrollbars, buttons, and file/Back links retain
+their own gestures. Modified link clicks retain their navigation behavior.
+
+Patch 320 verification used the minified renderer in VS Code 1.139.1 at
+1440 × 900. Three CDP mouse tests passed for whitespace, text, and type-link
+dragging, including a 300ms held link press. They check persistence after native
+dismissal; the whitespace case also checks titlebar movement, a second native
+hover becoming an independent window, retained first-window content, and
+closing only the second window. Captured detached-window screenshots were
+inspected. A separate automatic-size test passed two actual link/Back round
+trips with the native token anchor preserved. Test geometry inspection excludes
+intentional detached windows and unrelated workbench splitters from native
+hover-artifact counts.
+
+The separate VS Code 1.139.1 resize run passed the long panel's edge/corner
+resize, scrolling, and cleanup assertions, then failed to keep the next short
+native hover visible. The same failure reproduced with the unchanged patch
+319 renderer. Full resize-suite success is not claimed for this version.
 
 Detached windows are isolated from native-hover activation, native drill
 history, and wrapper-layout observers. A 28 px titlebar owns all subsequent

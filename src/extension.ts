@@ -3,6 +3,7 @@ import * as inspector from 'node:inspector';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import WebSocket from 'ws';
+import { withCompleteHoverContents } from './hover-content';
 import { IndexManager, IndexStatus } from './indexManager';
 import type { SidecarHit, SidecarKind, SidecarLanguage } from './sidecar';
 import {
@@ -18,9 +19,6 @@ import {
   HOVER_NEARBY_SYMBOL_COLUMN_RADIUS,
   HOVER_NOISY_IDENTIFIER_MAX_LENGTH,
   IR_VTAIL_MODE,
-  DEFINITION_PREVIEW_FALLBACK_LINES,
-  DEFINITION_PREVIEW_SAFETY_MAX_LINES,
-  DEFINITION_PREVIEW_VALUE_MAX_LINES,
   CODE_SCHEMES,
   isCodeDoc,
 } from './util';
@@ -418,7 +416,8 @@ function closeMainWebSocket() {
 }
 
 function isTestRendererDebugMode(): boolean {
-  return extensionRunsInTestMode && !!process.env.IR_TEST_REMOTE_DEBUGGING_PORT;
+  return extensionRunsInTestMode && !!process.env.IR_TEST_REMOTE_DEBUGGING_PORT
+    && process.env.IR_TEST_PRODUCTION_INJECTION !== '1';
 }
 
 function scheduleRendererReconnect() {
@@ -604,7 +603,7 @@ function resolveInBackground(
               log.trace(`[bg]   "${typeName}" → fast def ${fastHit.path}:${fastHit.line} lines=${entry.previewLineCount ?? '?'} md=${entry.preview.length} (${Date.now() - t0}ms)`);
               return entry;
             }
-          } else if (await sidecarDefinitivelyMissing(typeName, matchUri.fsPath)) {
+          } else if (await sidecarDefinitivelyMissing(typeName, matchUri.fsPath, findOpenDoc(matchUri))) {
             // Full Python library coverage + zero hits + type-shaped name →
             // LSP won't find anything either. Cache negative and skip the
             // 1.5 s timeout.
@@ -1219,6 +1218,13 @@ export async function activate(context: vscode.ExtensionContext) {
       // Allow prefetch to run again on next activation of this doc
       prefetchedDocs.delete(fsPath);
     }),
+    vscode.workspace.onDidCloseTextDocument(doc => {
+      // Cached definition results can retain the entire TextDocument. Drop both
+      // source and destination entries when the editor releases that document.
+      invalidateDefCacheByPath(doc.uri.fsPath);
+      invalidatePosPreviewCacheByPath(doc.uri.fsPath);
+      prefetchedDocs.delete(doc.uri.fsPath);
+    }),
     // (B) Prefetch on active editor change — warms def cache for visible docs
     vscode.window.onDidChangeActiveTextEditor(editor => {
       schedulePrefetch(editor?.document);
@@ -1748,7 +1754,7 @@ function patchSharedService(service: any) {
     return false;
   }
 
-  service.$provideHover = async function (handle: number, uri: any, position: any, context: any, token: any) {
+  const provideHoverWithPreviews = async function (this: any, handle: number, uri: any, position: any, context: any, token: any) {
     const hoverT0 = Date.now();
     const fileName = (uri?.path || '').split('/').pop() || '?';
     // Internal position format: {lineNumber, column} (1-based) vs VS Code API {line, character} (0-based)
@@ -2292,6 +2298,13 @@ function patchSharedService(service: any) {
     return returnWithNativeFallback(result, 'unresolved');
   };
 
+  // Apply this to every return path, including native documentation, direct
+  // previews, cache hits and forward/Back pages. VS Code renders each item
+  // independently, so no single item may trigger its 100,000-character cap.
+  service.$provideHover = async function (...args: Parameters<typeof provideHoverWithPreviews>) {
+    return withCompleteHoverContents(await provideHoverWithPreviews.apply(this, args));
+  };
+
   hoverPatchActive = true;
   log.info('$provideHover patched');
 }
@@ -2637,6 +2650,12 @@ async function injectRenderer() {
 async function reinjectRenderer() {
   if (isTestRendererDebugMode()) {
     await injectRendererViaTestRemoteDebugging();
+    return;
+  }
+  // A failed initial connection has no click bridge to reuse. Recover the
+  // complete startup path once its inspector becomes available again.
+  if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) {
+    await injectRenderer();
     return;
   }
   try {
@@ -7302,6 +7321,7 @@ async function runNativeHoverGeometryHarnessForTests(input?: {
           && !el.classList.contains('ir-e2e-hover-link')
           && !el.classList.contains('ir-e2e-empty-hover')
           && !el.classList.contains('ir-test-seeded-hover')
+          && !el.closest('.ir-detached-hover')
           && !el.classList.contains('workbench-hover');
       }
       function hoverRoots() {
@@ -7528,6 +7548,7 @@ async function runNativeHoverGeometryHarnessForTests(input?: {
           var node = item.node;
           if (!document.body.contains(node)) continue;
           if (node === selectedRoot || node === document.body || node === document.documentElement) continue;
+          if (node.closest && node.closest('.ir-detached-hover')) continue;
           if (selectedRoot && node.contains && node.contains(selectedRoot)) continue;
           var chromeCls = String(node.className || '');
           if ((node.closest && node.closest('.titlebar,.titlebar-container,.titlebar-drag-region,.command-center,.activitybar,.statusbar,.part.statusbar,.part.activitybar,.part.titlebar'))
@@ -7691,6 +7712,11 @@ async function runNativeHoverGeometryHarnessForTests(input?: {
           var all = document.querySelectorAll(selector);
           for (var ai = 0; ai < all.length; ai++) {
             if (root && root.contains && root.contains(all[ai])) continue;
+            if (all[ai].closest('.ir-detached-hover')) continue;
+            // Workbench splitters can overlap the hover's bottom edge. Only
+            // Monaco sashes belonging to a hover participate in this audit.
+            if (all[ai].closest('.monaco-sash')
+              && !all[ai].closest('.monaco-resizable-hover,.monaco-hover,.monaco-editor-hover')) continue;
             nodes.push({ el: all[ai], ownedByHover: false });
           }
         } catch (_) {}
@@ -8258,6 +8284,7 @@ async function cleanupNativeHoverInteractionStateForTests(reason?: string): Prom
       for (var i = 0; i < roots.length; i++) {
         var root = roots[i];
         if (!root || !document.body.contains(root)) continue;
+        if (root.closest && root.closest('.ir-detached-hover')) continue;
         if (root.classList && (root.classList.contains('ir-e2e-hover') || root.classList.contains('ir-test-seeded-hover'))) continue;
         var isHidden = !visible(root)
           || (root.classList && (root.classList.contains('hidden') || root.classList.contains('ir-stale-hover')))
@@ -9892,6 +9919,7 @@ async function runHoverDomStateHarnessForTests(expectedTypes?: string[] | string
           && !el.classList.contains('ir-e2e-hover')
           && !el.classList.contains('ir-e2e-hover-link')
           && !el.classList.contains('ir-e2e-empty-hover')
+          && !el.closest('.ir-detached-hover')
           && !el.classList.contains('workbench-hover');
       }
       function seededHoverRoot() {
@@ -10114,6 +10142,7 @@ async function runHoverDomStateHarnessForTests(expectedTypes?: string[] | string
           var node = item.node;
           if (!document.body.contains(node)) continue;
           if (node === activeRoot || node === document.body || node === document.documentElement) continue;
+          if (node.closest && node.closest('.ir-detached-hover')) continue;
           if (activeRoot && node.contains && node.contains(activeRoot)) continue;
           var chromeCls = String(node.className || '');
           if ((node.closest && node.closest('.titlebar,.titlebar-container,.titlebar-drag-region,.command-center,.activitybar,.statusbar,.part.statusbar,.part.activitybar,.part.titlebar'))
@@ -12156,7 +12185,7 @@ async function goToTypeHandlerInner(docUriStr: string, identifier: string, signa
         } catch (err) {
           log.warn(`  [0] fast path open error: ${err} (${ms()})`);
         }
-      } else if (await sidecarDefinitivelyMissing(identifier, originFsPath)) {
+      } else if (await sidecarDefinitivelyMissing(identifier, originFsPath, findOpenDoc(vscode.Uri.file(originFsPath)))) {
         log.info(`  [0] sidecar miss (full coverage) → skip LSP, "${identifier}" not navigable (${ms()})`);
         clickNegSet(identifier);
         return;
