@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as os from 'os';
 import * as fs from 'fs';
+import * as net from 'net';
 import { runTests } from '@vscode/test-electron';
 
 function discoverInstalledExtensionIds(extensionsDir: string): string[] {
@@ -31,8 +32,26 @@ async function main() {
     const fixture = process.env.TEST_FIXTURE || 'python';
     const testWorkspace = path.resolve(extensionDevelopmentPath, `src/test/fixtures/${fixture}`);
     const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'ir-vsc-'));
+    const settingsDir = path.join(userDataDir, 'User');
+    fs.mkdirSync(settingsDir, { recursive: true });
+    fs.writeFileSync(path.join(settingsDir, 'settings.json'), JSON.stringify({
+      // Geometry tests read native DOM tokens. Set this before the first
+      // editor is created, rather than switching its input renderer mid-test.
+      'editor.editContext': false,
+      'extensions.autoUpdate': false,
+      'extensions.autoCheckUpdates': false,
+    }));
     const testWindowMarker = `IR_E2E_WINDOW_${process.pid}`;
-    const remoteDebuggingPort = String(39000 + (process.pid % 10000));
+    // A PID-derived port can belong to another editor/test process. Ask the
+    // OS for an available loopback port before starting this isolated host.
+    const remoteDebuggingPort = await new Promise<string>((resolve, reject) => {
+      const probe = net.createServer();
+      probe.once('error', reject);
+      probe.listen(0, '127.0.0.1', () => {
+        const port = (probe.address() as net.AddressInfo).port;
+        probe.close(err => err ? reject(err) : resolve(String(port)));
+      });
+    });
 
     // Use the user's installed extensions (Pylance, TS server, etc.)
     const userExtensionsDir = path.join(os.homedir(), '.vscode', 'extensions');
@@ -72,6 +91,7 @@ async function main() {
         `--user-data-dir=${userDataDir}`,
         `--remote-debugging-port=${remoteDebuggingPort}`,
         '--disable-features=EditContext',
+        '--disable-renderer-backgrounding',
         ...disabledBuiltinUiExtensions.map(id => `--disable-extension=${id}`),
         ...disabledUiExtensions.map(id => `--disable-extension=${id}`),
       ],

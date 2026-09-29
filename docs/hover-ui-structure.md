@@ -106,7 +106,16 @@ We deliberately do NOT set:
 We do set upper bounds on the wrapper/host/scroller chain: automatic hovers
 use `max-width: 680px` and `max-height: 48vh`. These caps prevent injected or
 transient content from briefly expanding to the whole viewport and preserve
-the inner scrolling contract.
+the inner scrolling contract. When rendered content overflows the native
+height, `irFitContentAwareHoverSize` requests a larger size through the owning
+native widget, bounded by the content height, `48vh`, and VS Code's available
+space on the chosen side of the token. Native layout retains control of the
+token anchor, placement, and sash geometry. Never compensate with CSS height
+or translation after layout: a later native render would apply the offset a
+second time. Short content keeps VS Code's native height; a newly rendered
+symbol is measured anew. If the native sizing API is unavailable, leave the
+native geometry unchanged. Automatic sizing does not update VS Code's saved
+last user resize dimensions.
 
 ## Dual size envelope
 
@@ -114,19 +123,78 @@ The compact cap is an automatic-layout safety boundary, not a permanent user
 resize limit. When the user grabs a sash that is actually contained by a
 `.monaco-resizable-hover`, `irEnableFlexibleHoverResize`:
 
-1. snapshots the currently painted width/height, preventing stale transient
-   inline geometry from flashing when the compact cap is relaxed;
-2. unlocks only the grabbed axis toward the corresponding viewport edge,
-   retaining an 8px gutter; and
-3. leaves VS Code in sole control of the drag, width/height writes, and
-   placement.
+1. snapshots the currently painted width/height and cancels pending automatic
+   sizing, preventing stale transient inline geometry from flashing when the
+   compact cap is relaxed;
+2. unlocks the grabbed axis (both axes for an orthogonal corner handle) toward
+   the corresponding viewport edge, retaining an 8px gutter;
+3. synchronizes the painted size with the native resizable node and supplies
+   matching native maximum dimensions throughout the manual resize session;
+4. suppresses the wrapper's direct leave event while the sash is held, so a
+   pointer moving ahead of a resize frame does not dismiss the hover; and
+5. leaves drag deltas, width/height updates, and token placement to VS Code.
+
+The wrapper has `overflow:visible` so the outer half of each native sash is
+hittable. Content clipping belongs to the inner hover. Changing CSS maximums
+alone does not enable flexible resize: the native node refreshes its own
+content-based limits on every drag event. Those native limits must match the
+manual bounds too, including on short content.
 
 The host then fills the resized wrapper and the flex scroller keeps
 `min-height: 0` plus `overflow: auto`, so larger content remains contained and
 scrollable. Sashes outside a hover wrapper (workbench splitters and unrelated
 overlays) are ignored. Once VS Code has stably dismissed the hover, the opt-in
-class, bounds, and size snapshot are cleared before the shared wrapper is
-reused; transient 0×0 resize frames do not trigger that reset.
+class, bounds, and size snapshot are cleared, and the native maximum-dimension
+and hide methods are restored. The native hide hook schedules a single cleanup
+after the existing 1.2s content-swap grace, so cleanup also runs when the active
+root observer has already stopped. A replacement rendered in that interval
+keeps the session. Transient 0×0 resize frames do not trigger that reset.
+Pointer release, cancellation, or window blur ends the leave guard immediately.
+
+The resize regression uses CDP mouse press/move/release against real native
+sashes above and below the token. It checks edge hit testing, width/height
+growth and shrinkage, corner resizing, native/painted size agreement, token
+adjacency, wheel scrolling, cleanup, and expansion beyond short content's
+natural dimensions. A synthetic div whose style is resized directly cannot
+validate the native drag lifecycle.
+
+Patch 318 verification used an isolated VS Code 1.128.0 window at 1440 × 900,
+including the minified renderer. Both placement tests passed: long-content
+width changed `674 → 764 → 814 → 674px`; short-content height grew
+`286 → 366px`. Token gaps stayed at 0px. Captured native-window screenshots
+were inspected for content clipping, sash alignment, and token placement.
+
+## Refiring the owning native hover
+
+Patch 319 fixes a type-link transition that updated preview state without
+replacing the visible hover. The failure also reproduced with patch 316.
+Tracing native calls showed that both the source editor and a chat input could
+report text focus at once. Global `editor.action.hideHover` / `showHover`
+commands then ran against the chat input, so the source HoverProvider was never
+queried for the pending preview.
+
+`irRefireNativeHoverAtAnchor` resolves the clicked hover's owning editor and
+invokes that instance's public Monaco hide/show actions. Native hide cancels
+the previous result; native show queries the provider at the original source
+token. The pinned owner takes precedence when a document is open in multiple
+split editors. URI, connection, visibility, and action support are checked
+before calling either action. This path adds no polling or retry delays.
+
+The optional Django Shell overlay handshake still runs first. Missing renderer
+access or unsupported native actions retain the extension command fallback.
+Back uses the same owner-specific refire path to restore the original content.
+An accepted Back also clears the previous navigation's 1.5s click-deduplication
+records, so immediately reopening the page is not mistaken for a duplicate.
+The current-page guard continues to reject duplicate navigation on an open page.
+
+Patch 319's minified build passed the automatic-size test with two real mouse
+round trips (`LargeHoverModel → BaseModel → Back`) and no stale content. The
+short drilled page grew to fit its content; geometry checks required a single
+native panel at the source token. The two native sash tests also passed in a
+separate run. Screenshots of the drilled/restored pages at 1440 × 900 were
+inspected. An earlier combined run failed a scroll-range assertion and timed
+out during CDP mouse input; combined-suite stability is not established by
+these isolated passing runs.
 
 ## Click-to-pin lifecycle
 

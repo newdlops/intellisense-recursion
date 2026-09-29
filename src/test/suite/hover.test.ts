@@ -1,6 +1,10 @@
 import * as assert from 'assert';
 import * as vscode from 'vscode';
 import * as path from 'path';
+import * as fs from 'fs';
+import WebSocket from 'ws';
+import { httpGet } from '../../cdp-discovery';
+import { cdpRequest } from '../../cdp-eval';
 
 const RUN_DEEP_HOVER_E2E = process.env.IR_E2E_DEEP_HOVER === '1';
 const RUN_POINTER_ORIGIN_HOVER_E2E = process.env.IR_E2E_POINTER_HOVER === '1' || RUN_DEEP_HOVER_E2E;
@@ -5429,6 +5433,302 @@ suite('Hover Renderer E2E', () => {
     assert.strictEqual(result?.sharedLocationCachesUnchanged, true,
       `Detached definition building must not repoint native hover location caches. ${JSON.stringify(result)}`);
   });
+
+  test(`[${lang}] content-aware native hover stays adjacent to its token after layout`, async function () {
+    if (lang !== 'python') { this.skip(); return; }
+    this.timeout(120000);
+    await ensureExtensionCommandsReady('intellisenseRecursion.runHoverRendererHarnessForTests');
+    const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(
+      path.join(vscode.workspace.workspaceFolders![0].uri.fsPath, 'service.py')));
+    const anchor = findIdentifier(doc, 'LargeHoverModel', 1)!;
+    const editor = await vscode.window.showTextDocument(doc);
+    await waitForLanguageServer(doc, 'LargeHoverModel');
+    const config = vscode.workspace.getConfiguration('editor');
+    const previousAbove = config.inspect<boolean>('hover.above')?.globalValue;
+    try {
+      for (const above of [true, false]) {
+        await config.update('hover.above', above, vscode.ConfigurationTarget.Global);
+        await showNativeHoverAt(editor, anchor, 'LargeHoverModel', 'model: LargeHoverModel', 'left', true);
+        await waitForHoverDomState(['BaseModel'], ['LargeHoverModel', 'field_070'], 14000, true, true);
+        const rows = await vscode.commands.executeCommand<any[]>(
+          'intellisenseRecursion.runHoverRendererHarnessForTests', 'content-aware-size');
+        const result = (rows || []).map(row => row?.value).find(value => value?.ok);
+        const size = result?.contentAwareSize;
+        assert.ok(size?.before && size?.grown && size?.short,
+          `Real native sizing probe should run. Rows=${JSON.stringify(rows)}`);
+        console.log(`  native content-aware size (${above ? 'above' : 'below'}): ${JSON.stringify(size)}`);
+        assert.strictEqual(size.before.side, above ? 'above' : 'below');
+        assert.ok(size.grown.rect.height >= size.before.rect.height + 50,
+          `Long content should grow the hover. ${JSON.stringify(size)}`);
+        assert.ok(size.grown.rect.height <= Math.ceil(result.viewport.height * 0.48) + 1,
+          `Automatic growth must keep the compact viewport cap. ${JSON.stringify(size)}`);
+        for (const state of [size.before, size.grown, size.repeated, size.short]) {
+          assert.ok(state.gap >= -2 && state.gap <= 8,
+            `Native layout must keep the panel adjacent to the token. ${JSON.stringify(size)}`);
+          assert.strictEqual(state.translate, 'none', 'Automatic sizing must not translate the native widget');
+          assert.ok(Math.abs(state.nativeHeight - state.rect.height) <= 2,
+            `Native and painted dimensions must agree. ${JSON.stringify(size)}`);
+          for (const sash of state.verticalSashes) {
+            assert.ok(Math.abs(sash.top - state.rect.top) <= 4 && Math.abs(sash.bottom - state.rect.bottom) <= 4,
+              `Native sashes must follow the panel. ${JSON.stringify(size)}`);
+          }
+        }
+        assert.deepStrictEqual(size.repeated.rect, size.grown.rect,
+          'Repeated sizing and native layout must not accumulate a position offset');
+        assert.ok(size.grown.scrollRange > 100, 'Long content must remain scrollable');
+        assert.ok(size.short.rect.height < size.before.rect.height, 'Short content must return to native sizing');
+        assert.ok(size.savedUserSizeUnchanged, 'Automatic sizing must not overwrite the saved manual size');
+        const input: NativeHoverGeometryInput = {
+          symbol: 'LargeHoverModel', lineFragment: 'model: LargeHoverModel', expectedColumn: 'left',
+          expectedTextFragments: ['LargeHoverModel', 'field_070'],
+        };
+        const geometry = await waitForNativeHoverGeometry(input);
+        await vscode.commands.executeCommand('intellisenseRecursion.dispatchRendererMouseMoveForTests', {
+          x: geometry.symbolCenter.x,
+          y: above ? geometry.hoverRect.bottom - 16 : geometry.hoverRect.top + 16,
+          clickBeforeMove: false,
+        });
+        await sleep(250);
+        const entered = await readNativeHoverGeometry(input);
+        assert.strictEqual(entered?.ok, true,
+          `The hover must stay open when moving directly from the token into it. ${JSON.stringify(entered)}`);
+      }
+      // Link bounds are collected after wrapping in one animation frame. The
+      // actual native click path must still drill and return from the resized panel.
+      const pages = JSON.parse(await httpGet(`http://127.0.0.1:${process.env.IR_TEST_REMOTE_DEBUGGING_PORT}/json/list`));
+      const page = pages.find((p: any) => p.type === 'page' && p.title.includes(process.env.IR_TEST_WINDOW_MARKER!));
+      assert.ok(page, 'The dedicated test renderer must be available');
+      const ws = new WebSocket(page.webSocketDebuggerUrl);
+      await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+      const capture = async (name: string) => {
+        if (!process.env.IR_DRILL_CAPTURE_DIR) { return; }
+        fs.mkdirSync(process.env.IR_DRILL_CAPTURE_DIR, { recursive: true });
+        const shot = await cdpRequest(ws, 'Page.captureScreenshot', { format: 'png' });
+        fs.writeFileSync(path.join(process.env.IR_DRILL_CAPTURE_DIR, `${name}.png`), Buffer.from(shot.data, 'base64'));
+      };
+      try {
+        await cdpRequest(ws, 'Page.bringToFront');
+        for (let cycle = 0; cycle < 2; cycle++) {
+          const clickRows = await vscode.commands.executeCommand<any[]>(
+            'intellisenseRecursion.runHoverLinkClickHarnessForTests', 'BaseModel');
+          const click = (clickRows || []).map(row => row?.value).find(value => value?.ok);
+          assert.ok(click, `The resized native hover must expose its type link. ${JSON.stringify(clickRows)}`);
+          assertStrictNativeHoverLinkClick(click, 'Content-aware hover type link');
+          await waitForPreviewIdentifier('BaseModel', 14000);
+          const drilled = await waitForHoverDomState([], ['class BaseModel', 'def save'], 14000, true, true, ['field_070']);
+          assertActualVsCodeHoverRoot(drilled, 'Drilled content-aware hover');
+          const geometry = await waitForNativeHoverGeometry({
+            symbol: 'LargeHoverModel', lineFragment: 'model: LargeHoverModel', expectedColumn: 'left',
+            expectedTextFragments: ['class BaseModel', 'def save'], absentTextFragments: ['field_070'],
+          });
+          assertNativeHoverGeometry(geometry, 'Drilled content-aware hover', 0, ['class BaseModel', 'def save']);
+          await sleep(300);
+          const sizing = await cdpRequest(ws, 'Runtime.evaluate', {
+            expression: `(function(){var h=window.__irActiveHoverEl,w=h&&h.closest('.monaco-resizable-hover'),s=h&&window.__irTestHooks.primaryHoverScroller(h);return {height:w&&w.getBoundingClientRect().height,scrollRange:s&&s.scrollHeight-s.clientHeight};})()`, returnByValue: true,
+          });
+          assert.ok(sizing.result?.value?.height > 200 && sizing.result.value.scrollRange < 10,
+            `The short drilled page should grow to fit its content after layout. ${JSON.stringify(sizing)}`);
+          if (cycle === 0) { await capture('drilled-BaseModel'); }
+
+          // Press the painted Back button through CDP, including hit testing.
+          const back = await cdpRequest(ws, 'Runtime.evaluate', { expression: `(function(){
+            var root=window.__irActiveHoverEl;
+            var button=root&&root.querySelector('.ir-back-btn,a[href*="intellisenseRecursion.previewBack"],a[data-href*="intellisenseRecursion.previewBack"]');
+            if(!button)return null;
+            var r=button.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;
+            var hit=document.elementFromPoint(x,y);
+            return {x:x,y:y,hittable:r.width>0&&r.height>0&&(hit===button||button.contains(hit))};
+          })()`, returnByValue: true });
+          const point = back.result?.value;
+          assert.ok(point?.hittable, `The real Back button must be hittable. ${JSON.stringify(back)}`);
+          await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y });
+          await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: point.x, y: point.y, button: 'left', buttons: 1, clickCount: 1 });
+          await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: point.x, y: point.y, button: 'left', buttons: 0, clickCount: 1 });
+          await waitForPreviewIdentifier(null, 14000);
+          const restored = await waitForHoverDomState(['BaseModel'], ['class LargeHoverModel', 'field_070'], 14000, true, true, ['def save']);
+          assertActualVsCodeHoverRoot(restored, 'Restored content-aware hover');
+          const restoredGeometry = await waitForNativeHoverGeometry({
+            symbol: 'LargeHoverModel', lineFragment: 'model: LargeHoverModel', expectedColumn: 'left',
+            expectedTextFragments: ['class LargeHoverModel', 'field_070'], absentTextFragments: ['def save'],
+          });
+          assertNativeHoverGeometry(restoredGeometry, 'Restored content-aware hover', 0, ['class LargeHoverModel']);
+          if (cycle === 0) { await capture('restored-LargeHoverModel'); }
+        }
+      } finally {
+        ws.close();
+      }
+    } finally {
+      await config.update('hover.above', previousAbove, vscode.ConfigurationTarget.Global);
+      await vscode.commands.executeCommand('editor.action.hideHover');
+    }
+  });
+
+  for (const above of [true, false]) {
+    test(`[${lang}] native sash drag resizes the actual hover on both axes (${above ? 'above' : 'below'})`, async function () {
+      if (lang !== 'python') { this.skip(); return; }
+      this.timeout(90000);
+      // Match the existing native mouse tests: their token geometry reader
+      // needs the DOM text renderer instead of experimental EditContext.
+      await vscode.workspace.getConfiguration('editor').update('editContext', false, vscode.ConfigurationTarget.Global);
+      const config = vscode.workspace.getConfiguration('editor');
+      const previousAbove = config.inspect<boolean>('hover.above')?.globalValue;
+      await config.update('hover.above', above, vscode.ConfigurationTarget.Global);
+      await ensureExtensionCommandsReady('intellisenseRecursion.runHoverRendererHarnessForTests');
+      const targets = JSON.parse(await httpGet(`http://127.0.0.1:${process.env.IR_TEST_REMOTE_DEBUGGING_PORT}/json/list`));
+      const target = targets.find((page: any) => page.type === 'page'
+        && String(page.title).includes(process.env.IR_TEST_WINDOW_MARKER!));
+      assert.ok(target, 'The dedicated test renderer must be available');
+      const ws = new WebSocket(target.webSocketDebuggerUrl);
+      await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+      try {
+        await cdpRequest(ws, 'Page.bringToFront');
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(
+          path.join(vscode.workspace.workspaceFolders![0].uri.fsPath, 'service.py')));
+        const editor = await vscode.window.showTextDocument(doc);
+        const anchor = findIdentifier(doc, 'LargeHoverModel', 1)!;
+        await waitForLanguageServer(doc, 'LargeHoverModel');
+        await showNativeHoverAt(editor, anchor, 'LargeHoverModel', 'model: LargeHoverModel', 'left', true);
+        await waitForHoverDomState(['BaseModel'], ['LargeHoverModel', 'field_070'], 14000, true, true);
+        let contentFragment = 'field_070';
+        const snapshot = async (edge = 'right'): Promise<any> => {
+          const result = await cdpRequest(ws, 'Runtime.evaluate', {
+            expression: `(function() {
+              var wrapper=Array.from(document.querySelectorAll('.monaco-resizable-hover')).find(function(el) {
+                var r=el.getBoundingClientRect(); return r.width>60 && r.height>20 && el.textContent.includes(${JSON.stringify(contentFragment)});
+              });
+              if(!wrapper)return {error:'missing-visible-hover'};
+              var widget=window.__irTestHooks.hoverOwnerForWrapper(wrapper).widget;
+              var above=widget._positionPreference===1;
+              var edge=${JSON.stringify(edge)};
+              var sash=Array.from(wrapper.querySelectorAll('.monaco-sash:not(.disabled)')).find(function(el) {
+                return edge==='right' ? el.classList.contains('vertical')
+                  : el.classList.contains(above?'orthogonal-edge-north':'orthogonal-edge-south');
+              });
+              var handle=edge==='corner'&&sash ? sash.querySelector('.orthogonal-drag-handle.end') : sash;
+              function rect(el){var r=el.getBoundingClientRect();return {left:r.left,top:r.top,right:r.right,bottom:r.bottom,width:r.width,height:r.height};}
+              var hr=handle&&rect(handle),wr=rect(wrapper);
+              var point=hr&&{x:(hr.left+hr.right)/2,y:(hr.top+hr.bottom)/2};
+              var hit=point&&document.elementFromPoint(point.x,point.y);
+              var token=widget._editor.getScrolledVisiblePosition(widget._renderedHover.showAtPosition);
+              var tokenTop=widget._editor.getDomNode().getBoundingClientRect().top+token.top;
+              var sc=window.__irTestHooks.primaryHoverScroller(wrapper.querySelector('.monaco-hover'));
+              return {rect:wr,native:{width:widget._resizableNode.size.width,height:widget._resizableNode.size.height},
+                max:{width:widget._resizableNode.maxSize.width,height:widget._resizableNode.maxSize.height},
+                above:above,gap:above?tokenTop-wr.bottom:wr.top-tokenTop-token.height,
+                point:point,hit:hit&&hit.className,handleHit:!!(handle&&hit&&(handle===hit||handle.contains(hit))),
+                flexible:wrapper.classList.contains('ir-flexible-hover-size'),
+                resizing:widget.isResizing,
+                viewport:{width:innerWidth,height:innerHeight},scrollRange:sc.scrollHeight-sc.clientHeight,
+                scrollTop:Math.max(sc.scrollTop,widget._hover.scrollbar.getScrollPosition().scrollTop),
+                detached:document.querySelectorAll('.ir-detached-hover').length};
+            })()`, returnByValue: true,
+          });
+          assert.ok(!result.exceptionDetails, JSON.stringify(result.exceptionDetails));
+          return result.result.value;
+        };
+        const drag = async (edge: string, dx: number, dy: number) => {
+          const before = await snapshot(edge);
+          assert.ok(before.handleHit, `Native ${edge} handle must be hittable, including its outer half: ${JSON.stringify(before)}`);
+          const { x, y } = before.point;
+          // Enter through the token-facing edge before crossing the panel to a
+          // sash. A teleport from the token to the far edge bypasses native
+          // hover's mouse trajectory handling.
+          await cdpRequest(ws, 'Input.dispatchMouseEvent', {
+            type: 'mouseMoved', x: before.rect.left + 24,
+            y: before.above ? before.rect.bottom - 12 : before.rect.top + 12,
+          });
+          await cdpRequest(ws, 'Input.dispatchMouseEvent', {
+            type: 'mouseMoved', x: before.rect.left + before.rect.width / 2,
+            y: before.rect.top + before.rect.height / 2,
+          });
+          await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x, y });
+          assert.ok((await snapshot(edge)).point, 'The native hover must remain visible when approaching its sash');
+          await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mousePressed', x, y, button: 'left', buttons: 1, clickCount: 1 });
+          console.log(`  native sash pressed: ${JSON.stringify(await snapshot(edge))}`);
+          try {
+            for (let step = 1; step <= 8; step++) {
+              await cdpRequest(ws, 'Input.dispatchMouseEvent', {
+                type: 'mouseMoved', x: x + dx * step / 8, y: y + dy * step / 8, button: 'left', buttons: 1,
+              });
+            }
+          } finally {
+            await cdpRequest(ws, 'Input.dispatchMouseEvent', {
+              type: 'mouseReleased', x: x + dx, y: y + dy, button: 'left', buttons: 0, clickCount: 1,
+            });
+          }
+          await sleep(100);
+          const after = await snapshot(edge);
+          console.log(`  native sash ${edge} ${dx},${dy}: ${JSON.stringify({before,after})}`);
+          if (process.env.IR_RESIZE_CAPTURE_DIR) {
+            const directory = process.env.IR_RESIZE_CAPTURE_DIR;
+            fs.mkdirSync(directory, { recursive: true });
+            const shot = await cdpRequest(ws, 'Page.captureScreenshot', { format: 'png' });
+            fs.writeFileSync(path.join(directory, `${above ? 'above' : 'below'}-${contentFragment}-${edge}-${dx}-${dy}.png`), Buffer.from(shot.data, 'base64'));
+          }
+          assert.ok(after.flexible, 'A real mouse grab must unlock manual resizing');
+          assert.ok(Math.abs(after.rect.width - after.native.width) <= 2
+            && Math.abs(after.rect.height - after.native.height) <= 2, 'Native and painted dimensions must agree');
+          assert.ok(after.gap >= -2 && after.gap <= 8, 'Resize must keep the panel beside its token');
+          assert.ok(after.rect.left >= 7 && after.rect.right <= after.viewport.width - 7
+            && after.rect.top >= 7 && after.rect.bottom <= after.viewport.height - 7, 'Resize must stay inside the viewport');
+          assert.strictEqual(after.detached, 0, 'Dragging a sash must not turn the hover into a detached window');
+          return { before, after };
+        };
+        assert.strictEqual((await snapshot()).above, above, 'The hover must use the placement under test');
+        assert.strictEqual((await snapshot()).flexible, false, 'A fresh hover must start with automatic size limits');
+        const widened = await drag('right', 90, 0);
+        assert.ok(widened.after.rect.width > widened.before.rect.width + 50, 'Width must follow the drag beyond the old content width');
+        assert.ok(widened.after.rect.width > 680, 'Manual width must exceed the automatic 680px cap');
+        const direction = widened.after.above ? -1 : 1;
+        const shrunk = await drag('height', 0, -direction * 150);
+        assert.ok(shrunk.after.rect.height < shrunk.before.rect.height - 80, 'Height must shrink');
+        const corner = await drag('corner', 50, direction * 90);
+        assert.ok(corner.after.rect.width > corner.before.rect.width + 25
+          && corner.after.rect.height > corner.before.rect.height + 50, 'Corner drag must resize both axes');
+        const narrowed = await drag('right', -140, 0);
+        assert.ok(narrowed.after.rect.width < narrowed.before.rect.width - 90, 'Width must shrink after expansion');
+        const taller = await drag('height', 0, direction * 140);
+        assert.ok(taller.after.rect.height > taller.before.rect.height + 30, 'Height must grow after shrinking');
+        assert.ok(taller.after.scrollRange > 100, 'Long content must remain scrollable after manual resizing');
+        const point = { x: taller.after.rect.left + 80, y: taller.after.rect.top + 80 };
+        await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', ...point });
+        await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseWheel', ...point, deltaX: 0, deltaY: 240 });
+        await sleep(180);
+        const scrolled = await snapshot();
+        assert.ok(scrolled.scrollTop > taller.after.scrollTop + 40, 'Wheel scrolling must still work after a real sash drag');
+        await vscode.commands.executeCommand('editor.action.hideHover');
+        // Existing hover cleanup allows 1.2s for an in-flight drill replacement.
+        await sleep(1500);
+        const cleanup = await cdpRequest(ws, 'Runtime.evaluate', {
+          expression: `({active:!!window.__irFlexibleResizeActiveWrapper,
+            flexible:document.querySelectorAll('.monaco-resizable-hover.ir-flexible-hover-size').length})`, returnByValue: true,
+        });
+        console.log(`  native sash cleanup: ${JSON.stringify(cleanup.result.value)}`);
+        assert.deepStrictEqual(cleanup.result.value, { active: false, flexible: 0 },
+          'Dismissal must release the manual limits before another hover opens');
+        if (above) {
+          // A short hover exercises native content-based maximums, which CSS
+          // alone cannot override once the first native drag event recalculates them.
+          contentFragment = 'BaseModel';
+          const shortAnchor = findIdentifier(doc, 'BaseModel', 1)!;
+          await showNativeHoverAt(editor, shortAnchor, 'BaseModel', 'model: BaseModel', 'left', true);
+          await waitForHoverDomState(['save'], ['class BaseModel', 'def save'], 14000, true, true);
+          assert.strictEqual((await snapshot()).flexible, false, 'Short content must start a fresh resize session');
+          const shortWidth = await drag('right', 80, 0);
+          assert.ok(shortWidth.after.rect.width > shortWidth.before.rect.width + 50,
+            'Short-content width must grow beyond its natural size');
+          const shortHeight = await drag('height', 0, shortWidth.after.above ? -80 : 80);
+          assert.ok(shortHeight.after.rect.height > shortHeight.before.rect.height + 50,
+            'Short-content height must grow beyond its natural size');
+        }
+      } finally {
+        ws.close();
+        await vscode.commands.executeCommand('editor.action.hideHover');
+        await sleep(1500);
+        await config.update('hover.above', previousAbove, vscode.ConfigurationTarget.Global);
+      }
+    });
+  }
 
   test(`[${lang}] native sash enables viewport-safe flexible hover resizing`, async function () {
     if (lang !== 'python') { this.skip(); return; }

@@ -115,10 +115,20 @@
 //   reuse captured live editor grammars for syntax highlighting after drill.
 // v314: preview file paths open their exact source location in a pinned
 //   editor tab, including cloned windows and keyboard link activation.
+// v315: grow a native hover only when its rendered content overflows the
+//   current box. Keep the compact envelope and the original anchor edge.
+// v316: resize through the native widget so its token anchor, geometry and
+//   sashes stay in sync. Remove the post-layout CSS translation from v315.
+// v317: retire global capture hooks after discovering the native editor
+//   service, release disposed editors, and ignore unrelated DOM mutations.
+// v318: keep native resize handles hittable, synchronize manual limits with
+//   the native resize model, and unlock both axes for a corner grab.
+// v319: refire drill/back hovers through actions bound to the owning editor,
+//   so stale focus in another editor cannot consume the page transition.
 // If the running window still logs v<300, the new build is NOT loaded yet.
 import { parsePreviewFileLink } from './preview-file-link';
 
-export const RENDERER_PATCH_VERSION = 314;
+export const RENDERER_PATCH_VERSION = 319;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -330,11 +340,14 @@ function irPruneDetachedHoverState(){
 }
 window.__irCleanup=function(reason){
   try{
+    window.irRefireNativeHoverAtAnchor=null;
     try{irClearClickPinnedHover('patch-cleanup',false);}catch(_){}
     try{irClearDetachedHovers('patch-cleanup');}catch(_){}
     try{
       var flexibleWrappers=document.querySelectorAll('.monaco-resizable-hover.ir-flexible-hover-size');
       for(var fi=0;fi<flexibleWrappers.length;fi++)irResetFlexibleHoverResize(flexibleWrappers[fi],false);
+      var autoWrappers=document.querySelectorAll('.monaco-resizable-hover.ir-auto-hover-size');
+      for(var ai=0;ai<autoWrappers.length;ai++)irResetContentAwareHoverSize(autoWrappers[ai]);
     }catch(_){}
     if(window.__irListeners){
       for(var i=0;i<window.__irListeners.length;i++){
@@ -347,6 +360,8 @@ window.__irCleanup=function(reason){
     }
     if(window.__irScanInterval){try{clearInterval(window.__irScanInterval)}catch(_){}}
     if(window.__irScanTimer){try{clearTimeout(window.__irScanTimer)}catch(_){}}
+    if(irLinkGeometryFrame){try{cancelAnimationFrame(irLinkGeometryFrame)}catch(_){}}
+    if(irLinkGeometryRoots)irLinkGeometryRoots.clear();
     if(window.__irCaptureFallbackTimer){try{clearTimeout(window.__irCaptureFallbackTimer)}catch(_){}}
     if(window.__irCaptureGraceTimer){try{clearTimeout(window.__irCaptureGraceTimer)}catch(_){}}
     if(window.__irTimers){
@@ -363,6 +378,17 @@ window.__irCleanup=function(reason){
     }
     window.__irCleanupInProgress=true;
     if(window.__irStopCapture){try{window.__irStopCapture()}catch(_){}}
+    if(window.__irStopEditorCapture){try{window.__irStopEditorCapture()}catch(_){}}
+    if(window.__irEditorCaptureDisposables){
+      var captureDisposables=window.__irEditorCaptureDisposables.slice();
+      window.__irEditorCaptureDisposables=[];
+      for(var ci=0;ci<captureDisposables.length;ci++)try{captureDisposables[ci].dispose();}catch(_){}
+    }
+    window.__irCapturedEditorList=[];
+    window.__irCapturedEditor=null;
+    window.__irCapturedHoverWidget=null;
+    window.__irHoverNaturalEditor=null;
+    window.__irCapturedEditorSet=new WeakSet();
     window.__irCleanupInProgress=false;
     if(window.__irDisposeMonaco){try{window.__irDisposeMonaco(reason||'cleanup')}catch(_){}}
     window.__irListeners=[];
@@ -502,8 +528,8 @@ style.textContent=[
   // width to 680px regardless of what _resizableNode.layout writes
   // to inline style — without !important on width:min(...) VS Code's
   // inline width="1800px" wins; we use width:min() to combine our
-  // soft sizing with a hard ceiling, plus overflow:hidden on the
-  // wrapper so a stretchier inner can't escape.
+  // soft sizing with a hard ceiling. The inner hover clips content;
+  // the wrapper must let the native sashes extend beyond its border.
   // L60 (2026-05-28): lead with --vscode-focusBorder so the stroke wins in both light and
   // dark themes (L58's editorHoverWidget-border alone read as nearly invisible on light themes —
   // a very faint platform gray). focusBorder is theme-specified to stand out (blue/accent), with
@@ -521,7 +547,7 @@ style.textContent=[
   // VS Code owns the box height AND placement — growing the box past VS Code's height fights its
   // positioning. Accept VS Code's (smaller) height; the box scrolls. cf. feedback_vscode_owns_hover_height.
   (IR_HOVER_NATIVE_ONLY
-    ? '.monaco-resizable-hover{box-sizing:border-box !important;width:min(max-content,680px);height:max-content;max-width:680px !important;max-height:48vh !important;min-width:0 !important;min-height:0 !important;overflow:hidden !important;transform:none !important;padding:0 !important;margin:0 !important;pointer-events:auto !important;z-index:2147483647 !important;border:1px solid var(--vscode-focusBorder, var(--vscode-editorHoverWidget-border, rgba(128,128,128,0.85))) !important;border-radius:4px !important}'
+    ? '.monaco-resizable-hover{box-sizing:border-box !important;width:min(max-content,680px);height:max-content;max-width:680px !important;max-height:48vh !important;min-width:0 !important;min-height:0 !important;overflow:visible !important;transform:none !important;padding:0 !important;margin:0 !important;pointer-events:auto !important;z-index:2147483647 !important;border:1px solid var(--vscode-focusBorder, var(--vscode-editorHoverWidget-border, rgba(128,128,128,0.85))) !important;border-radius:4px !important}'
     : '.monaco-resizable-hover{box-sizing:border-box !important;width:min(max-content,680px) !important;height:max-content !important;max-width:680px !important;max-height:48vh !important;min-width:0 !important;min-height:0 !important;overflow:hidden !important;transform:none !important;padding:0 !important;margin:0 !important;pointer-events:auto !important;z-index:2147483647 !important;border:1px solid var(--vscode-focusBorder, var(--vscode-editorHoverWidget-border, rgba(128,128,128,0.85))) !important;border-radius:4px !important}'),
   // Force inner .monaco-hover (and its primary inner panels) to stick
   // to the ancestor wrapper via position:static and clear any fixed/
@@ -1320,6 +1346,7 @@ window.__irClearAnchorSession=function(){
 window.__irDrillFrozenPosition=window.__irDrillFrozenPosition||null;
 function irGetMonacoEditorApi(){
   try{
+    if(window.__irNativeEditorApi)return window.__irNativeEditorApi;
     var api=window.monaco&&window.monaco.editor;
     if(api&&typeof api.getEditors==='function')return api;
     if(typeof require==='function'){
@@ -1333,6 +1360,10 @@ function irGetMonacoEditorApi(){
 }
 function irLooksLikeCodeEditorWidget(v){
   if(!v||typeof v!=='object')return false;
+  // RPC proxies manufacture arbitrary methods. Never invoke getDomNode/getId
+  // on them: the old duck check sent spurious IPC requests during startup.
+  var dom=Object.getOwnPropertyDescriptor(v,'_domElement');
+  if(!dom||!dom.value||dom.value.nodeType!==1)return false;
   return typeof v.layout==='function'
     &&typeof v.getModel==='function'
     &&typeof v.getDomNode==='function'
@@ -1352,9 +1383,9 @@ function irLooksLikeCodeEditorWidget(v){
 // the same machine — its renderer patch confirms this is the working
 // path on the same VS Code build that hosts us.
 //
-// We install the hooks once per renderer session and leave them in place;
-// the sniff function is constant-time so the global slowdown is
-// negligible. The CodeEditorWidget instance is parked at
+// Capture only until we can subscribe to the native editor service. Its
+// add/remove events then replace renderer-wide collection interception.
+// The CodeEditorWidget instance is parked at
 // window.__irCapturedEditor; an "on capture" callback notifies our
 // prototype patcher so it can hook addContentWidget the instant we have
 // a reference.
@@ -1424,16 +1455,41 @@ function irPointerTriplet(){
 // syntax-highlighted code blocks, blowing up CPU and frame timing.
 window.__irCapturedEditorSet=window.__irCapturedEditorSet||(typeof WeakSet==='function'?new WeakSet():null);
 window.__irCapturedEditorCount=window.__irCapturedEditorCount||0;
+window.__irEditorCaptureDisposables=window.__irEditorCaptureDisposables||[];
+var irWatchedCodeEditorService=null;
+function irForgetCapturedEditor(widget){
+  var list=window.__irCapturedEditorList||[];
+  var index=list.indexOf(widget);
+  if(index>=0)list.splice(index,1);
+  if(window.__irCapturedEditor===widget)window.__irCapturedEditor=null;
+  if(window.__irHoverNaturalEditor===widget)window.__irHoverNaturalEditor=null;
+  if(window.__irCapturedHoverWidget&&window.__irCapturedHoverWidget._editor===widget)window.__irCapturedHoverWidget=null;
+}
+function irWatchCodeEditorService(widget){
+  try{
+    var service=widget&&widget._codeEditorService;
+    if(!service||service===irWatchedCodeEditorService)return;
+    if(typeof service.listCodeEditors!=='function'||typeof service.onCodeEditorAdd!=='function'
+      ||typeof service.onCodeEditorRemove!=='function')return;
+    irWatchedCodeEditorService=service;
+    window.__irNativeEditorApi={getEditors:service.listCodeEditors.bind(service)};
+    window.__irEditorCaptureDisposables.push(service.onCodeEditorAdd(irOnEditorCaptured));
+    window.__irEditorCaptureDisposables.push(service.onCodeEditorRemove(irForgetCapturedEditor));
+    // Finish the current constructor/registration stack before restoring the
+    // collection prototypes. Future editor instances use the service events.
+    irSetTimer(function(){if(window.__irStopEditorCapture)window.__irStopEditorCapture();},0);
+  }catch(_){}
+}
 function irOnEditorCaptured(widget){
   try{
     if(!widget||!irLooksLikeCodeEditorWidget(widget))return;
+    irWatchCodeEditorService(widget);
     // O(1) dedupe via WeakSet.
     if(window.__irCapturedEditorSet){
       if(window.__irCapturedEditorSet.has(widget))return;
       window.__irCapturedEditorSet.add(widget);
     }
     window.__irCapturedEditorCount=(window.__irCapturedEditorCount||0)+1;
-    if(!window.__irCapturedEditor)window.__irCapturedEditor=widget;
     // Throttle log spam: workbench creates many short-lived editor
     // instances (peek view, suggest overlay, minimap, hover code blocks).
     // Record only the first few + every 500th.
@@ -1457,9 +1513,20 @@ function irOnEditorCaptured(widget){
     if(isEmbedded){
       return; // skip prototype patch / content widget walk / scroll watch
     }
+    if(!window.__irCapturedEditor)window.__irCapturedEditor=widget;
     // Track non-embedded editors in the list (used by irScanAndPatchEditors
     // as a fallback source for prototype patching).
     try{window.__irCapturedEditorList.push(widget);}catch(_){}
+    if(typeof widget.onDidDispose==='function'){
+      var release=widget.onDidDispose(function(){
+        irForgetCapturedEditor(widget);
+        var disposables=window.__irEditorCaptureDisposables||[];
+        var index=disposables.indexOf(release);
+        if(index>=0)disposables.splice(index,1);
+        try{release.dispose();}catch(_){}
+      });
+      window.__irEditorCaptureDisposables.push(release);
+    }
     // Patch the prototype immediately. Subsequent addContentWidget calls
     // (including ones for the hover widget) will flow through our wrap.
     try{irPatchEditorPrototype(widget);}catch(_){}
@@ -2394,6 +2461,8 @@ function irRepositionDrilledHover(editor,widget){
 function irLooksLikeHoverWidget(v){
   if(!v||typeof v!=='object')return false;
   try{
+    var node=Object.getOwnPropertyDescriptor(v,'_resizableNode');
+    if(!node||!node.value||!node.value.domNode||node.value.domNode.nodeType!==1)return false;
     if(typeof v.getId==='function'){
       var id=String(v.getId()||'');
       if(id==='editor.contrib.resizableContentHoverWidget')return true;
@@ -3443,40 +3512,50 @@ function irOnHoverWidgetCaptured(widget){
 }
 function irSniffValue(value){
   if(!value||typeof value!=='object')return;
-  if(irLooksLikeCodeEditorWidget(value))irOnEditorCaptured(value);
-  if(irLooksLikeHoverWidget(value))irOnHoverWidgetCaptured(value);
+  // The common case is a plain workbench record. Avoid descriptor walks and
+  // method inspection until it has one of the native widget's own fields.
+  if(value._domElement&&irLooksLikeCodeEditorWidget(value))irOnEditorCaptured(value);
+  if(value._resizableNode&&irLooksLikeHoverWidget(value))irOnHoverWidgetCaptured(value);
 }
 if(!window.__irMapPrototypePatched){
   try{
     var origMapSet=Map.prototype.set;
-    Map.prototype.set=function(k,v){
+    var mapCapture=Map.prototype.set=function(k,v){
       try{irSniffValue(v);}catch(_){}
       return origMapSet.apply(this,arguments);
     };
     var origWeakMapSet=WeakMap.prototype.set;
-    WeakMap.prototype.set=function(k,v){
+    var weakMapCapture=WeakMap.prototype.set=function(k,v){
       try{irSniffValue(v);}catch(_){}
       return origWeakMapSet.apply(this,arguments);
     };
     var origSetAdd=Set.prototype.add;
-    Set.prototype.add=function(v){
+    var setCapture=Set.prototype.add=function(v){
       try{irSniffValue(v);}catch(_){}
       return origSetAdd.apply(this,arguments);
     };
     var origArrayPush=Array.prototype.push;
-    Array.prototype.push=function(){
+    var arrayCapture=Array.prototype.push=function(){
       try{for(var i=0;i<arguments.length;i++)irSniffValue(arguments[i]);}catch(_){}
       return origArrayPush.apply(this,arguments);
     };
     if(typeof Reflect!=='undefined'&&typeof Reflect.construct==='function'){
       var origRC=Reflect.construct;
-      Reflect.construct=function(target,args,newTarget){
+      var reflectCapture=Reflect.construct=function(target,args,newTarget){
         var inst=origRC.apply(Reflect,arguments);
         try{irSniffValue(inst);}catch(_){}
         return inst;
       };
     }
     window.__irMapPrototypePatched=true;
+    window.__irStopEditorCapture=function(){
+      if(Map.prototype.set===mapCapture)Map.prototype.set=origMapSet;
+      if(WeakMap.prototype.set===weakMapCapture)WeakMap.prototype.set=origWeakMapSet;
+      if(Set.prototype.add===setCapture)Set.prototype.add=origSetAdd;
+      if(Array.prototype.push===arrayCapture)Array.prototype.push=origArrayPush;
+      if(typeof Reflect!=='undefined'&&Reflect.construct===reflectCapture)Reflect.construct=origRC;
+      window.__irMapPrototypePatched=false;
+    };
     irHERecord('global-prototype-patched',{});
   }catch(_){}
 }
@@ -3590,6 +3669,8 @@ function irListAllCodeEditors(){
   // we don't assume it).
   var result=[];
   try{
+    var nativeApi=irGetMonacoEditorApi();
+    if(nativeApi)return nativeApi.getEditors().filter(irLooksLikeCodeEditorWidget);
     var seen=typeof WeakSet==='function'?new WeakSet():null;
     var protos=typeof WeakSet==='function'?new WeakSet():null;
     var nodes=document.querySelectorAll('.monaco-editor');
@@ -3979,9 +4060,10 @@ function irScanAndPatchEditors(){
     if(!editors||!editors.length)return false;
     var patchedAny=false;
     for(var i=0;i<editors.length;i++){
+      irOnEditorCaptured(editors[i]);
       if(irPatchEditorPrototype(editors[i]))patchedAny=true;
     }
-    return patchedAny;
+    return patchedAny||editors.length>0;
   }catch(_){return false}
 }
 // Try to patch immediately, then retry until at least one editor exists.
@@ -4619,11 +4701,95 @@ function irLogPointerActionTrace(e,stage,link,resolution){
   }catch(_){}
 }
 
+function irResetContentAwareHoverSize(wrapper){
+  if(!wrapper)return;
+  try{
+    var hover=wrapper.querySelector('.monaco-hover,.monaco-editor-hover');
+    if(hover&&hover.__irAutoSizeTimer){irClearTimer(hover.__irAutoSizeTimer);hover.__irAutoSizeTimer=0;}
+    if(hover&&hover.__irAutoSizeFrame){cancelAnimationFrame(hover.__irAutoSizeFrame);hover.__irAutoSizeFrame=0;}
+    wrapper.classList.remove('ir-auto-hover-size');
+    wrapper.style.removeProperty('--ir-auto-hover-height');
+    wrapper.style.removeProperty('--ir-auto-hover-shift');
+  }catch(_){}
+}
+function irFitContentAwareHoverSize(hover){
+  if(!IR_HOVER_NATIVE_ONLY||!hover||!document.body.contains(hover))return;
+  try{
+    var wrapper=hover.closest('.monaco-resizable-hover');
+    if(!wrapper||wrapper.classList.contains('ir-flexible-hover-size'))return;
+    if(!irIsRenderableHoverRoot(hover))return;
+    // Also remove v315's CSS override when upgrading an already open hover.
+    irResetContentAwareHoverSize(wrapper);
+    var owner=irHoverPinOwnerForWrapper(wrapper);
+    var widget=owner.widget;
+    var node=widget&&widget._resizableNode;
+    // Private native APIs vary across VS Code releases. Without the owning
+    // widget, leave geometry alone: CSS resizing cannot update the token anchor.
+    if(!widget||!node||node.domNode!==wrapper||widget.isResizing
+      ||!widget._renderedHover||!widget._renderedHover.showAtPosition
+      ||typeof widget._findAvailableSpaceVertically!=='function'
+      ||typeof widget._updateResizableNodeMaxDimensions!=='function'
+      ||typeof widget._setHoverWidgetDimensions!=='function'
+      ||typeof node.layout!=='function')return;
+    var sc=irPrimaryHoverScroller(hover);
+    if(!sc)return;
+    var rect=wrapper.getBoundingClientRect();
+    if(rect.width<60||rect.height<20)return;
+    var viewportH=window.innerHeight||document.documentElement.clientHeight||900;
+    // Keep VS Code's chosen side of the token, even when the pointer has moved
+    // inside the panel or an async preview finishes after the pointer moved away.
+    var room=widget._findAvailableSpaceVertically();
+    if(!Number.isFinite(room)||room<=0)return;
+    var cap=Math.min(Math.floor(viewportH*0.48),Math.floor(room));
+    // scrollHeight measures the laid-out content, including wrapped prose and
+    // long source previews, without walking every token in a huge hover.
+    var natural=Math.ceil(sc.scrollHeight+Math.max(0,rect.height-sc.clientHeight));
+    var desired=Math.min(natural,cap);
+    if(desired<=rect.height+20)return;
+    // Update the native size before requesting its layout. This keeps the
+    // content-widget anchor and sash geometry consistent across later renders.
+    // Do not call _resize: it saves a global last-user-size for future hovers.
+    widget._updateResizableNodeMaxDimensions();
+    node.layout(desired,rect.width);
+    widget._setHoverWidgetDimensions(node.size.width,node.size.height);
+    if(widget._hover&&widget._hover.scrollbar)widget._hover.scrollbar.scanDomNode();
+    irHERecord('hover-auto-size',{from:Math.round(rect.height),to:node.size.height,natural:natural});
+  }catch(_){}
+}
+function irScheduleContentAwareHoverSize(hover){
+  if(!IR_HOVER_NATIVE_ONLY||!hover||hover.__irAutoSizeTimer||hover.__irAutoSizeFrame)return;
+  try{
+    var wrapper=hover.closest('.monaco-resizable-hover');
+    if(!wrapper||wrapper.classList.contains('ir-flexible-hover-size'))return;
+    hover.__irAutoSizeTimer=irSetTimer(function(){
+      hover.__irAutoSizeTimer=0;
+      hover.__irAutoSizeFrame=requestAnimationFrame(function(){
+        hover.__irAutoSizeFrame=0;
+        irFitContentAwareHoverSize(hover);
+      });
+    },80);
+  }catch(_){}
+}
+
 // L137: preserve the compact automatic cap, but let an explicit native-sash
-// gesture opt this widget into the viewport-safe cap. We only snapshot the
-// currently painted size and publish upper bounds; VS Code remains the sole
-// writer of width, height, and position during the drag, so its proven resize
-// lifecycle is undisturbed.
+// gesture opt this widget into the viewport-safe cap. Native sashes extend
+// beyond the wrapper, so it must not clip them; the inner hover clips content.
+// CSS limits and ResizableHTMLElement.maxSize must agree. VS Code refreshes
+// maxSize after every drag event and otherwise clamps it to the content size.
+function irSyncFlexibleHoverResizeLimits(wrapper,widget){
+  if(!wrapper||!widget||!wrapper.classList.contains('ir-flexible-hover-size'))return;
+  var node=widget._resizableNode;
+  if(!node||node.domNode!==wrapper)return;
+  var viewportW=window.innerWidth||1200,viewportH=window.innerHeight||900;
+  var width=parseFloat(wrapper.style.getPropertyValue('--ir-flex-hover-max-width'))||680;
+  var height=parseFloat(wrapper.style.getPropertyValue('--ir-flex-hover-max-height'))||Math.floor(viewportH*0.48);
+  var room=typeof widget._findAvailableSpaceVertically==='function'?widget._findAvailableSpaceVertically():null;
+  if(Number.isFinite(room)&&room>0)height=Math.min(height,room);
+  width=Math.min(width,viewportW-16);
+  height=Math.min(height,viewportH-16);
+  node.maxSize={width:Math.max(node.minSize.width,Math.floor(width)),height:Math.max(node.minSize.height,Math.floor(height))};
+  widget._setHoverWidgetMaxDimensions(node.maxSize.width,node.maxSize.height);
+}
 function irEnableFlexibleHoverResize(target){
   if(!IR_HOVER_NATIVE_ONLY)return null;
   try{
@@ -4633,11 +4799,14 @@ function irEnableFlexibleHoverResize(target){
     if(!sash)return null;
     var wrapper=sash.closest?sash.closest('.monaco-resizable-hover'):null;
     if(!wrapper||!wrapper.classList||!wrapper.querySelector('.monaco-hover,.monaco-editor-hover'))return null;
+    // Window/document pointerdown and mousedown listeners share this path.
+    if(window.__irFlexibleResizeActiveWrapper===wrapper&&wrapper.__irFlexibleResizeSash===sash)return wrapper;
     var wr=wrapper.getBoundingClientRect();
     if(!wr||wr.width<60||wr.height<20)return null;
     var sr=sash.getBoundingClientRect?sash.getBoundingClientRect():null;
+    irResetContentAwareHoverSize(wrapper);
     var sashClass=String(sash.className||'').toLowerCase();
-    var isCorner=sashClass.indexOf('corner')>=0||(sr&&sr.width>=6&&sr.height>=6&&sr.width<40&&sr.height<40);
+    var isCorner=!!el.closest('.orthogonal-drag-handle')||sashClass.indexOf('corner')>=0||(sr&&sr.width>=6&&sr.height>=6&&sr.width<40&&sr.height<40);
     var changesWidth=isCorner||sashClass.indexOf('vertical')>=0||(sr&&sr.height>sr.width*2);
     var changesHeight=isCorner||sashClass.indexOf('horizontal')>=0||(sr&&sr.width>sr.height*2);
     if(!changesWidth&&!changesHeight){changesWidth=true;changesHeight=true;}
@@ -4667,6 +4836,46 @@ function irEnableFlexibleHoverResize(target){
       wrapper.__irFlexibleHoverSizeAt=Date.now();
       irHERecord('hover-flexible-size-enabled',{});
     }
+    var owner=irHoverPinOwnerForWrapper(wrapper);
+    var widget=owner&&owner.widget;
+    if(widget&&widget._resizableNode&&typeof widget._updateResizableNodeMaxDimensions==='function'
+      &&typeof widget._setHoverWidgetDimensions==='function'&&typeof widget._setHoverWidgetMaxDimensions==='function'){
+      if(!wrapper.__irFlexibleResizeNative){
+        var originalUpdate=widget._updateResizableNodeMaxDimensions;
+        var manualUpdate=function(){
+          var result=originalUpdate.apply(this,arguments);
+          irSyncFlexibleHoverResizeLimits(wrapper,this);
+          return result;
+        };
+        wrapper.__irFlexibleResizeNative={widget:widget,original:originalUpdate,wrapped:manualUpdate};
+        widget._updateResizableNodeMaxDimensions=manualUpdate;
+        if(typeof widget.hide==='function'){
+          var originalHide=widget.hide;
+          var manualHide=function(){
+            var result=originalHide.apply(this,arguments);
+            // Native hide can leave the wrapper in the DOM after our active
+            // root observer has stopped. Complete cleanup once, after the
+            // existing drill-swap grace, even if no more DOM mutations occur.
+            if(!this._renderedHover&&!wrapper.__irFlexibleResizeResetTimer){
+              wrapper.__irFlexibleResizeResetTimer=irSetTimer(function(){
+                wrapper.__irFlexibleResizeResetTimer=0;
+                if(!widget._renderedHover)irResetFlexibleHoverResize(wrapper,true);
+              },Math.max(1200,(Number(window.__irNativeHoverRefireUntil)||0)-Date.now()+30));
+            }
+            return result;
+          };
+          wrapper.__irFlexibleResizeNative.originalHide=originalHide;
+          wrapper.__irFlexibleResizeNative.wrappedHide=manualHide;
+          widget.hide=manualHide;
+        }
+      }
+      // Start the native drag from the painted size, not a stale size hidden
+      // behind our automatic CSS cap. Its own event listeners own every delta.
+      widget._updateResizableNodeMaxDimensions();
+      widget._resizableNode.layout(Math.round(wr.height),Math.round(wr.width));
+      widget._setHoverWidgetDimensions(widget._resizableNode.size.width,widget._resizableNode.size.height);
+    }
+    wrapper.__irFlexibleResizeSash=sash;
     window.__irFlexibleResizeActiveWrapper=wrapper;
     return wrapper;
   }catch(_){return null}
@@ -4677,6 +4886,19 @@ function irResetFlexibleHoverResize(wrapper,clearSize){
     wrapper.classList.remove('ir-flexible-hover-size');
     wrapper.style.removeProperty('--ir-flex-hover-max-width');
     wrapper.style.removeProperty('--ir-flex-hover-max-height');
+    var nativeResize=wrapper.__irFlexibleResizeNative;
+    if(nativeResize&&nativeResize.widget._updateResizableNodeMaxDimensions===nativeResize.wrapped){
+      nativeResize.widget._updateResizableNodeMaxDimensions=nativeResize.original;
+    }
+    if(nativeResize&&nativeResize.wrappedHide&&nativeResize.widget.hide===nativeResize.wrappedHide){
+      nativeResize.widget.hide=nativeResize.originalHide;
+    }
+    if(wrapper.__irFlexibleResizeResetTimer){
+      irClearTimer(wrapper.__irFlexibleResizeResetTimer);
+      wrapper.__irFlexibleResizeResetTimer=0;
+    }
+    wrapper.__irFlexibleResizeNative=null;
+    wrapper.__irFlexibleResizeSash=null;
     if(clearSize){
       wrapper.style.removeProperty('width');
       wrapper.style.removeProperty('height');
@@ -4692,6 +4914,7 @@ function irFinishFlexibleHoverResize(){
     var wrapper=window.__irFlexibleResizeActiveWrapper;
     window.__irFlexibleResizeActiveWrapper=null;
     if(wrapper){
+      wrapper.__irFlexibleResizeSash=null;
       irSetTimer(function(){
         try{
           var root=wrapper.querySelector?wrapper.querySelector('.monaco-hover,.monaco-editor-hover'):null;
@@ -5971,6 +6194,9 @@ function irHoverPinOwnerForWrapper(wrapper){
       }catch(_){}
     }
     var editors=irListAllCodeEditors();
+    if(window.__irCapturedEditorList)editors=editors.concat(window.__irCapturedEditorList);
+    var api=irGetMonacoEditorApi();
+    if(api)editors=editors.concat(api.getEditors()||[]);
     for(var ei=0;ei<editors.length;ei++){
       var ed=editors[ei];
       try{
@@ -5998,6 +6224,53 @@ function irFocusClickPinnedHover(pin){
     return document.activeElement===pin.root||!!(pin.root.contains&&pin.root.contains(document.activeElement));
   }catch(_){return false}
 }
+window.irRefireNativeHoverAtAnchor=async function(anchor){
+  try{
+    if(!anchor||typeof anchor.uri!=='string'||!Number.isInteger(anchor.line)||anchor.line<0
+      ||!Number.isInteger(anchor.character)||anchor.character<0)return {ok:false,reason:'invalid-anchor'};
+    function matches(editor){
+      try{
+        var model=editor&&editor.getModel(),dom=editor&&editor.getDomNode();
+        if(!model||String(model.uri)!==anchor.uri||!dom||!dom.isConnected)return false;
+        var r=dom.getBoundingClientRect();
+        return r.width>0&&r.height>0;
+      }catch(_){return false}
+    }
+    // A document can be open in several split editors. Prefer the owner of
+    // the clicked hover; global "focused editor" state can still name chat.
+    var pin=window.__irClickPinnedHover;
+    var editor=pin&&matches(pin.editor)?pin.editor:null;
+    var root=window.__irActiveHoverEl;
+    if(!editor&&root&&root.closest){
+      var owner=irHoverPinOwnerForWrapper(root.closest('.monaco-resizable-hover'));
+      if(matches(owner.editor))editor=owner.editor;
+    }
+    if(!editor){
+      var candidates=irListAllCodeEditors().filter(matches);
+      editor=candidates.find(function(ed){return ed.getDomNode().contains(document.activeElement)})
+        ||(candidates.length===1?candidates[0]:null);
+    }
+    if(!editor||typeof editor.getAction!=='function')return {ok:false,reason:'missing-anchor-editor'};
+    var hide=editor.getAction('editor.action.hideHover');
+    var show=editor.getAction('editor.action.showHover');
+    if(!hide||!show||typeof hide.run!=='function'||typeof show.run!=='function'
+      ||(hide.isSupported&&!hide.isSupported())||(show.isSupported&&!show.isSupported())){
+      return {ok:false,reason:'missing-native-hover-actions'};
+    }
+    var position={lineNumber:anchor.line+1,column:anchor.character+1};
+    window.__irNativeHoverRefireUntil=Date.now()+1600;
+    await hide.run();
+    if(!matches(editor))return {ok:false,reason:'anchor-editor-changed'};
+    editor.setPosition(position);
+    if(typeof editor.revealPositionInCenterIfOutsideViewport==='function')editor.revealPositionInCenterIfOutsideViewport(position);
+    editor.focus();
+    // These public Monaco actions capture this editor instance. Global
+    // executeCommand can resolve both commands to a different input editor.
+    // Native hide cancels the old result, so show re-queries the HoverProvider.
+    await show.run({focus:'autoFocusImmediately'});
+    return {ok:true,editorId:editor.getId(),uri:anchor.uri};
+  }catch(err){return {ok:false,reason:String(err&&err.message||err)}}
+};
 function irPinNativeHoverRoot(root,controllerOverride){
   try{
     if(!root||!root.classList||!root.closest)return null;
@@ -6122,8 +6395,13 @@ function irClickPinPointerDown(e){
 function irClickPinnedHoverLeaveGuard(e){
   try{
     var pin=window.__irClickPinnedHover;
-    if(!pin||!e)return;
-    if((e.type==='mouseleave'||e.type==='pointerleave')&&e.target===pin.wrapper){
+    var resize=window.__irFlexibleResizeActiveWrapper;
+    if((!pin&&!resize)||!e)return;
+    // The native wrapper's mouseleave listener hides outside the editor even
+    // while its sash is resizing. The pointer can outrun the newly laid-out
+    // edge between native drag events; hold only this wrapper until release.
+    if((e.type==='mouseleave'||e.type==='pointerleave')
+      &&((pin&&e.target===pin.wrapper)||(resize&&e.target===resize))){
       e.stopImmediatePropagation();
     }
   }catch(_){}
@@ -8594,7 +8872,7 @@ function irNativeReleaseDismissedHoverBookkeeping(root){
     if(__blks)for(var __bi=0;__bi<__blks.length;__bi++){
       var __b=__blks[__bi];
       try{__b.__irScanCacheText=null;__b.__irScanCacheCandidateText=null;__b.__irScanCacheTypes=null;__b.__irScanCacheRegex=null;}catch(_){}
-      try{__b.__irLastScanText=null;__b.__irLastScanSig=null;__b.__irViewportWrap=false;__b.__irHoverLinkCandidates=null;}catch(_){}
+      try{__b.__irLastScanText=null;__b.__irLastScanSig=null;__b.__irAutoSizeObservedSig=null;__b.__irViewportWrap=false;__b.__irHoverLinkCandidates=null;}catch(_){}
     }
   }catch(_){}
   // L137: a resized wrapper is reused by VS Code. Reset our opt-in only after
@@ -8608,6 +8886,7 @@ function irNativeReleaseDismissedHoverBookkeeping(root){
       var clickPin=window.__irClickPinnedHover;
       if(clickPin&&(!flexibleWrapper||clickPin.wrapper===flexibleWrapper))irClearClickPinnedHover('native-dismiss',false);
       if(flexibleWrapper&&window.__irFlexibleResizeActiveWrapper!==flexibleWrapper)irResetFlexibleHoverResize(flexibleWrapper,true);
+      if(flexibleWrapper)irResetContentAwareHoverSize(flexibleWrapper);
     }
   }catch(_){}
   // L134 (2026-06-01): VS Code dismissed this hover — also release the drill history/snapshot
@@ -9746,16 +10025,23 @@ function irRememberTypeLinkGeometry(link,reason,markRecent){
     return rec;
   }catch(_){return null}
 }
+var irLinkGeometryRoots=new Map();
+var irLinkGeometryFrame=0;
 function irRefreshTypeLinkGeometry(root,reason){
-  try{
-    if(!root||!root.querySelectorAll)return 0;
-    var links=root.querySelectorAll('.ir-type-link');
-    var count=0;
-    for(var i=0;i<links.length;i++){
-      if(irRememberTypeLinkGeometry(links[i],reason||'refresh',false))count++;
-    }
-    return count;
-  }catch(_){return 0}
+  if(!root||!root.querySelectorAll)return 0;
+  irLinkGeometryRoots.set(root,reason||'refresh');
+  if(!irLinkGeometryFrame)irLinkGeometryFrame=requestAnimationFrame(function(){
+    irLinkGeometryFrame=0;
+    // All wrapping writes finish before any bounds reads. Pointer handlers
+    // still measure the actual hit link synchronously when the user interacts.
+    irLinkGeometryRoots.forEach(function(why,block){
+      if(!block.isConnected)return;
+      var links=block.querySelectorAll('.ir-type-link');
+      for(var i=0;i<links.length;i++)irRememberTypeLinkGeometry(links[i],why,false);
+    });
+    irLinkGeometryRoots.clear();
+  });
+  return 0;
 }
 function irPointInsideStoredTypeLinkRect(e,rec,padX,padY){
   try{
@@ -10618,6 +10904,8 @@ window.__irTestHooks={
   activateHoverRoot:irActivateHoverRoot,
   refreshEmptyHoverRootState:irRefreshEmptyHoverRootState,
   applyHoverSizeTier:irApplyHoverSizeTier,
+  fitContentAwareHoverSize:irFitContentAwareHoverSize,
+  hoverOwnerForWrapper:irHoverPinOwnerForWrapper,
   enableFlexibleHoverResize:irEnableFlexibleHoverResize,
   resetFlexibleHoverResize:irResetFlexibleHoverResize,
   pinNativeHoverRoot:irPinNativeHoverRoot,
@@ -12223,6 +12511,13 @@ function irScanRenderedMarkdown(){
       if(preText.indexOf('IRVTAIL:')>=0){try{irHandleVtailMarker(preBlock,preText);}catch(_){}}
       if(preHost&&preBlock.__irLastScanText!==preText){
         irTouchHoverRootContent(preHost,'pre-scan-text-change',preText);
+        var autoSig=preText.length+':'+preText.slice(0,80)+':'+preText.slice(-80);
+        if(preBlock.__irAutoSizeObservedSig!==autoSig){
+          preBlock.__irAutoSizeObservedSig=autoSig;
+          var preWrapper=preHost.closest&&preHost.closest('.monaco-resizable-hover');
+          if(preWrapper&&preWrapper.classList.contains('ir-auto-hover-size'))irResetContentAwareHoverSize(preWrapper);
+          irScheduleContentAwareHoverSize(preHost);
+        }
       }
     }catch(_){}
   }
@@ -12570,7 +12865,10 @@ function irIsOwnLinkWrapMutation(mut){
 }
 window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
   var __moT0=irNowMs();   // L83: time the markdown MO burst (a #2 block suspect on 57K-char content)
-  irPruneDetachedHoverState();
+  // Ordinary typing, terminal output and workbench updates are not a reason
+  // to measure/prune the active hover. Detached roots still release promptly.
+  if((window.__irActiveHoverEl&&!window.__irActiveHoverEl.isConnected)
+    ||(window.__irHistoryFor&&!window.__irHistoryFor.isConnected))irPruneDetachedHoverState();
   // L37: dedupe per-hover work within a single mutation-observer
   // callback. drill mutation bursts deliver 50+ records in one tick and
   // most reference the same hover host — without dedup we called
@@ -12583,7 +12881,7 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
   var seenScan=false;
   function touchOnce(hover,reason,el){
     if(!hover||irIsDetachedHoverRoot(hover))return;
-    if(!seenHovers)seenHovers=new Set?new Set():null;
+    if(!seenHovers)seenHovers=new Set();
     if(seenHovers&&seenHovers.has(hover))return;
     if(seenHovers)seenHovers.add(hover);
     irTouchHoverRootContent(hover,reason,el?(el.textContent||''):null);
@@ -12605,6 +12903,21 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
     // newly-scrolled-in rows still get their drill links.
     if(irIsOwnLinkWrapMutation(mut))continue;
     var nodes=mut.addedNodes||[];
+    var target=mut.target;
+    var targetEl=target&&(target.nodeType===1?target:target.parentElement);
+    var insideHover=targetEl&&targetEl.closest?targetEl.closest('.monaco-hover,.monaco-editor-hover,.ij-find-hover-tooltip'):null;
+    // Monaco paints editor lines by replacing token rows. Those rows cannot
+    // host an overflow hover. Keep the full path for code rendered in a hover.
+    if(!insideHover&&nodes.length){
+      var editorPaintOnly=true;
+      for(var pi=0;pi<nodes.length;pi++){
+        var paintNode=nodes[pi];
+        if(paintNode.nodeType===3)continue;
+        var paintClass=typeof paintNode.className==='string'?paintNode.className:'';
+        if(!/^(?:view-line|mtk[0-9]+)(?:\\s|$)/.test(paintClass)){editorPaintOnly=false;break;}
+      }
+      if(editorPaintOnly)continue;
+    }
     for(var ni=0;ni<nodes.length;ni++){
       irActivateAddedHoverRoots(nodes[ni],'mutation-added');
       try{
@@ -12613,8 +12926,6 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
         touchOnce(addedHover,'mutation-added',addedEl);
       }catch(_){}
     }
-    var target=mut.target;
-    var targetEl=target&&(target.nodeType===1?target:target.parentElement);
     if(targetEl&&targetEl.closest&&targetEl.closest('.rendered-markdown,.monaco-hover,.monaco-editor-hover,.ij-find-hover-tooltip')){
       var targetDetached=false;
       try{
@@ -12642,7 +12953,7 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
       }
     }
   }
-  if(seenScan)irScheduleScan();
+  if(seenScan){irPruneDetachedHoverState();irScheduleScan();}
   try{var __moDur=irNowMs()-__moT0;if(__moDur>=IR_SYNC_LONGTASK_MIN_MS)irHERecord('ir-sync-longtask',{fn:'markdown-mo',durMs:Math.round(__moDur),muts:muts&&muts.length,staging:irStageElapsedNow()});}catch(_){}
 }));
 // L40: characterData:true was firing the observer on every keystroke

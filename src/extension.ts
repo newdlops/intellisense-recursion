@@ -351,6 +351,9 @@ let rendererInjectInFlight: Promise<void> | null = null;
 let rendererHoverFallbackLogCount = 0;
 let extensionDeactivated = false;
 let extensionRunsInTestMode = false;
+// Undefined in tsc development builds; production bundling removes the large
+// command harnesses along with their otherwise-unreferenced functions.
+declare const __IR_TEST_BUILD__: boolean;
 let rendererUserDataDirHint: string | null = null;
 let mainWsRefIsRendererTarget = false;
 let testRendererWebSocketUrlRef: string | null = null;
@@ -1269,7 +1272,7 @@ export async function activate(context: vscode.ExtensionContext) {
     }),
   );
 
-  if (extensionRunsInTestMode) {
+  if ((typeof __IR_TEST_BUILD__ === 'undefined' || __IR_TEST_BUILD__) && extensionRunsInTestMode) {
     context.subscriptions.push(
       vscode.commands.registerCommand(
         'intellisenseRecursion.runPreviewFileLinkHarnessForTests',
@@ -1463,7 +1466,9 @@ export async function activate(context: vscode.ExtensionContext) {
   if (process.env.IR_SKIP_RENDERER_INJECTION === '1') {
     log.info('[inject] Renderer injection disabled by IR_SKIP_RENDERER_INJECTION');
   } else {
-    await runRendererInjection(injectRenderer);
+    // Commands/providers are ready. CDP discovery can wait on renderer startup
+    // or reconnects; it must not hold the extension's activation promise open.
+    void runRendererInjection(injectRenderer).catch(err => log.warn(`[inject] Initial injection failed: ${err}`));
     // Low-frequency safety pass for renderer windows that open after our
     // initial injection. Used to be every 60s, which was constant Node↔CDP
     // chatter and re-evaluation of the ~25KB injection bundle for no real
@@ -4602,12 +4607,13 @@ async function runPreviewFileLinkHarnessForTests(markdown: string, detached = fa
   return evaluateInMainProcessForTests(rendererTestWindowEvalExpression(expression, true), 8000);
 }
 
-async function runHoverRendererHarnessForTests(): Promise<any[]> {
+async function runHoverRendererHarnessForTests(mode?: string): Promise<any[]> {
   await ensureRendererPatchForHarness();
   await cleanupRendererTestArtifactsAcrossWindowsForTests();
   const rendererExpr = `
     (async function() {
       var hooks = window.__irTestHooks;
+      var mode = ${jsonStringifyAscii(String(mode || ''))};
       function rectObj(r) {
         return {
           left: r.left, top: r.top, right: r.right, bottom: r.bottom,
@@ -4884,6 +4890,86 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
         try { wrapper.parentNode && wrapper.parentNode.removeChild(wrapper); } catch (_) {}
         try { unrelated.parentNode && unrelated.parentNode.removeChild(unrelated); } catch (_) {}
         return { before: before, after: after, reset: reset };
+      }
+      async function contentAwareSizeProbe() {
+        var wrapper = Array.from(document.querySelectorAll('.monaco-resizable-hover')).find(function(el) {
+          var r = el.getBoundingClientRect();
+          return r.width > 60 && r.height > 20 && window.getComputedStyle(el).visibility !== 'hidden';
+        });
+        var owner = wrapper && hooks.hoverOwnerForWrapper(wrapper);
+        var widget = owner && owner.widget;
+        if (!widget || !widget._renderedHover) return {
+          error: 'missing-native-widget', hasWrapper: !!wrapper, hasWidget: !!widget,
+          status: window.__irGetPatchStatus && window.__irGetPatchStatus()
+        };
+        var hover = wrapper.querySelector('.monaco-hover,.monaco-editor-hover');
+        var content = widget._hover.contentsDomNode;
+        var scroller = hooks.primaryHoverScroller(hover);
+        var originalNodes = Array.from(content.childNodes);
+        var savedUserSize = widget.constructor._lastDimensions;
+        var oldPointer = window.__irLastPointer;
+        function renderNow() {
+          owner.editor.layoutContentWidget(widget);
+          owner.editor.render(true);
+        }
+        async function render() {
+          renderNow();
+          // render(true) flushes native layout. A timer also lets observers run
+          // when Electron throttles animation frames in a background test window.
+          await new Promise(function(resolve) { setTimeout(resolve, 60); });
+        }
+        function snapshot() {
+          var r = wrapper.getBoundingClientRect();
+          var editorRect = owner.editor.getDomNode().getBoundingClientRect();
+          var token = owner.editor.getScrolledVisiblePosition(widget._renderedHover.showAtPosition);
+          var tokenTop = editorRect.top + token.top;
+          return {
+            rect: rectObj(r),
+            gap: widget._positionPreference === 1 ? tokenTop - r.bottom : r.top - tokenTop - token.height,
+            side: widget._positionPreference === 1 ? 'above' : 'below',
+            nativeHeight: widget._resizableNode.size.height,
+            scrollRange: Math.max(0, scroller.scrollHeight - scroller.clientHeight),
+            translate: window.getComputedStyle(wrapper).translate,
+            verticalSashes: Array.from(wrapper.querySelectorAll('.monaco-sash.vertical')).map(function(el) {
+              return rectObj(el.getBoundingClientRect());
+            })
+          };
+        }
+        try {
+          // Exercise a real native widget and later native renders. A fixed DOM
+          // fixture cannot catch a CSS offset being applied a second time.
+          widget._resizableNode.layout(120, wrapper.getBoundingClientRect().width);
+          widget._setHoverWidgetDimensions(widget._resizableNode.size.width, widget._resizableNode.size.height);
+          // Capture the baseline in the same task, before the normal scheduled
+          // content fit can grow it for us.
+          renderNow();
+          var before = snapshot();
+          window.__irLastPointer = { y: 1, at: Date.now() };
+          hooks.fitContentAwareHoverSize(hover);
+          await render();
+          var grown = snapshot();
+          window.__irLastPointer = { y: window.innerHeight - 1, at: Date.now() };
+          hooks.fitContentAwareHoverSize(hover);
+          await render();
+          var repeated = snapshot();
+          content.replaceChildren(document.createTextNode('Short preview'));
+          widget.handleContentsChanged();
+          await render();
+          hooks.fitContentAwareHoverSize(hover);
+          await render();
+          var short = snapshot();
+          return {
+            before: before, grown: grown, repeated: repeated, short: short,
+            savedUserSizeUnchanged: widget.constructor._lastDimensions === savedUserSize
+          };
+        } finally {
+          window.__irLastPointer = oldPointer;
+          content.replaceChildren.apply(content, originalNodes);
+          widget.handleContentsChanged();
+          await render();
+          hooks.fitContentAwareHoverSize(hover);
+          await render();
+        }
       }
       function clickPinProbe() {
         var wrapper = document.createElement('div');
@@ -5890,6 +5976,15 @@ async function runHoverRendererHarnessForTests(): Promise<any[]> {
       }
       if (!hooks || typeof hooks.makeHoverScrollable !== 'function') {
         return { ok: false, reason: 'missing-hooks', patchVersion: Number(window.__irPatchVersion) || 0 };
+      }
+      if (mode === 'performance') return { ok: true, patchVersion: Number(window.__irPatchVersion) || 0 };
+      if (mode === 'content-aware-size') {
+        return {
+          ok: true,
+          patchVersion: Number(window.__irPatchVersion) || 0,
+          viewport: { width: window.innerWidth || 0, height: window.innerHeight || 0 },
+          contentAwareSize: await contentAwareSizeProbe()
+        };
       }
       Array.prototype.slice.call(document.querySelectorAll('.monaco-hover,.monaco-editor-hover')).forEach(function(el) {
         try { el.parentNode && el.parentNode.removeChild(el); } catch (_) {}
@@ -11186,6 +11281,28 @@ async function previewTypeHandler(
   setCurrentPreviewState(nextPreviewState);
 }
 
+async function refireNativeHoverInRenderer(anchor: NativeHoverRefireAnchor): Promise<boolean> {
+  if (!isTestRendererDebugMode() && (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN)) { return false; }
+  const payload = { uri: anchor.uri.toString(), line: anchor.line, character: anchor.character };
+  const rendererExpr = `(typeof window.irRefireNativeHoverAtAnchor === 'function'
+    ? window.irRefireNativeHoverAtAnchor(${jsonStringifyAscii(payload)})
+    : {ok:false,reason:'missing-native-refire'})`;
+  try {
+    const rows = await evaluateInMainProcessForTests(
+      mainWsRefIsRendererTarget ? rendererExpr : rendererTestWindowEvalExpression(rendererExpr, true),
+      2000,
+    );
+    const result = (Array.isArray(rows) ? rows : [{ value: rows }])
+      .map((row: any) => row?.value).find((value: any) => value?.ok)
+      ?? (Array.isArray(rows) ? rows[0]?.value : rows);
+    recordPreviewHoverDebug({ kind: 'native-owner-refire', ...payload, result });
+    return result?.ok === true;
+  } catch (err) {
+    recordPreviewHoverDebug({ kind: 'native-owner-refire-error', ...payload, error: String(err) });
+    return false;
+  }
+}
+
 async function refireHoverAtAnchor(anchor: { uri: vscode.Uri; line: number; character: number }): Promise<void> {
   // Overlay editors are renderer-owned and cannot be targeted through the
   // active file editor. Give the owner the first chance to refire in-place;
@@ -11199,6 +11316,7 @@ async function refireHoverAtAnchor(anchor: { uri: vscode.Uri; line: number; char
     });
     return;
   }
+  if (await refireNativeHoverInRenderer(anchor)) { return; }
   const newPos = new vscode.Position(anchor.line, anchor.character);
   const current = vscode.window.activeTextEditor;
   const visible = vscode.window.visibleTextEditors.find(editor =>
@@ -11287,6 +11405,10 @@ async function previewBackHandler(): Promise<void> {
     log.info(`previewBack: no current drill-down state — ignoring`);
     return;
   }
+  // Back starts a new navigation step. The previous page's 1.5s click
+  // dedupe must not swallow an intentional return to that page afterward.
+  // The current-page guard still rejects duplicate clicks on an open page.
+  previewClickDedupe.clear();
   if (previewHistory.length > 0) {
     const prev = previewHistory.pop()!;
     prev.lastActivityAt = Date.now();
