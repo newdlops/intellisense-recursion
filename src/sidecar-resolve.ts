@@ -18,7 +18,9 @@
 import * as vscode from 'vscode';
 import * as path from 'node:path';
 import type { IndexManager } from './indexManager';
-import type { SidecarHit } from './sidecar';
+import type { SidecarHit, SidecarKind } from './sidecar';
+import { readRawFileSnapshot } from './preview-builder';
+import { findOpenDoc } from './common-utils';
 import {
   TYPE_SHAPED_NAME,
   CONSTANT_SHAPED_NAME,
@@ -43,10 +45,14 @@ export function setSidecarIndexManager(im: IndexManager | null): void {
 export async function sidecarDefinitivelyMissing(
   typeName: string,
   originFsPath: string,
+  originDoc?: vscode.TextDocument,
 ): Promise<boolean> {
   if (!_indexManager?.hasFullCoverage()) { return false; }
   if (!TYPE_SHAPED_NAME.test(typeName)) { return false; }
   if (CONSTANT_SHAPED_NAME.test(typeName)) { return false; }
+  // An index miss does not invalidate an explicit source import (for example
+  // a newly added file, unsupported syntax or an older index generation).
+  if (importTargetsForIdentifier(originDoc, typeName).length > 0) { return false; }
   const language = languageOf(originFsPath);
   if (!language) { return false; }
   // Applies to Python (.venv + stdlib + typeshed covered) and TypeScript
@@ -194,23 +200,23 @@ export function pythonModuleCandidates(sourceRelPath: string, moduleName: string
   }
   const base = baseParts.join('/');
   if (!base) { return []; }
-  return [`${base}.py`, `${base}.pyi`, `${base}/__init__.py`, `${base}/__init__.pyi`];
+  return [`${base}.py`, `${base}/__init__.py`, `${base}.pyi`, `${base}/__init__.pyi`];
 }
 
 export function pythonImportTargetsForIdentifier(documentText: string, sourceRelPath: string, localName: string): ImportTarget[] {
   const out: ImportTarget[] = [];
-  const fromImportRegex = /^\s*from\s+([.\w]+)\s+import\s+(.+)$/gm;
+  const fromImportRegex = /^[ \t]*from[ \t]+([.\w]+)[ \t]+import[ \t]+(\([^)]*\)|[^\r\n]+)/gm;
   for (const match of documentText.matchAll(fromImportRegex)) {
     const moduleName = match[1] ?? '';
-    const clause = (match[2] ?? '').split('#')[0] ?? '';
+    const clause = (match[2] ?? '').replace(/#[^\r\n]*/g, '').replace(/^\(|\)$/g, '');
     const targetRelPaths = pythonModuleCandidates(sourceRelPath, moduleName);
     if (targetRelPaths.length === 0) { continue; }
     for (const rawItem of clause.split(',')) {
       const item = rawItem.trim();
       if (!item || item === '*') { continue; }
-      const parts = item.split(/\s+as\s+/);
-      const imported = parts[0]?.trim();
-      const local = (parts[1] ?? parts[0])?.trim();
+      const parts = /^([A-Za-z_]\w*)(?:\s+as\s+([A-Za-z_]\w*))?$/.exec(item);
+      const imported = parts?.[1];
+      const local = parts?.[2] ?? imported;
       if (local !== localName || !imported) { continue; }
       for (const relPath of targetRelPaths) {
         out.push({ relPath, importedName: imported });
@@ -238,7 +244,17 @@ export function importTargetsForIdentifier(
 }
 
 export function hitMatchesImportTarget(hit: SidecarHit, queryName: string, target: ImportTarget): boolean {
-  const rel = sidecarHitRelPath(hit);
+  let rel = sidecarHitRelPath(hit);
+  if (hit.source !== 'project' && /\.pyi?$/.test(hit.path)) {
+    // Imports name the package, not the environment or typeshed installation.
+    // Do not suffix-match arbitrary vendored/test copies of the same filename.
+    const normalized = hit.path.replace(/\\/g, '/');
+    rel = /\/(?:site-packages|dist-packages)\/(.+)$/.exec(normalized)?.[1]
+      ?? /\/lib\/python\d+\.\d+\/(.+)$/.exec(normalized)?.[1]
+      ?? /\/typeshed[^/]*\/stdlib\/(.+)$/.exec(normalized)?.[1]
+      ?? /\/typeshed[^/]*\/stubs\/[^/]+\/(.+)$/.exec(normalized)?.[1]
+      ?? rel;
+  }
   if (!rel) { return false; }
   const importedMatches = target.importedName === MODULE_IMPORT_TARGET
     || queryName === target.importedName;
@@ -249,6 +265,36 @@ export function hitMatchesImportTarget(hit: SidecarHit, queryName: string, targe
     return rel.startsWith(`${dir}/`);
   }
   return false;
+}
+
+/** Recover an explicitly imported source even when the index missed it. */
+async function resolveWorkspaceImportTarget(targets: ImportTarget[]): Promise<SidecarHit | null> {
+  const root = workspaceRootFsPath();
+  if (!root) { return null; }
+  const declarationPattern = /^(?:export\s+)?(?:default\s+)?(?:abstract\s+)?(class|interface|enum|struct|type|(?:async\s+)?def|function|const|let|var)\s+([A-Za-z_$][\w$]*)\b/;
+  const assignmentPattern = /^([A-Za-z_]\w*)\s*(?::[^=]+)?=/;
+  for (const target of targets) {
+    if (target.importedName === MODULE_IMPORT_TARGET) { continue; }
+    const fsPath = path.resolve(root, target.relPath);
+    const relative = path.relative(root, fsPath);
+    if (relative.startsWith('..') || path.isAbsolute(relative)) { continue; }
+    try {
+      const doc = findOpenDoc(vscode.Uri.file(fsPath)) ?? await readRawFileSnapshot(fsPath);
+      // Module imports bind top-level declarations, not same-named fields or
+      // nested classes. Leave less familiar syntax to the definition provider.
+      for (let line = 0; line < doc.lineCount; line++) {
+        const text = doc.lineAt(line).text;
+        const declaration = declarationPattern.exec(text);
+        const assignment = !declaration && assignmentPattern.exec(text);
+        const name = declaration?.[2] ?? (assignment ? assignment[1] : undefined);
+        if (name !== target.importedName) { continue; }
+        const kind: SidecarKind = declaration && /^(class|interface|enum|struct)$/.test(declaration[1])
+          ? 'class' : declaration && /def$|function/.test(declaration[1]) ? 'function' : 'variable';
+        return { path: fsPath, line: line + 1, col: text.indexOf(name) + 1, kind, source: 'project', language: languageOf(fsPath) ?? 'other' };
+      }
+    } catch { /* Missing/unreadable import candidates fall through to LSP. */ }
+  }
+  return null;
 }
 
 export function chooseSidecarHit(
@@ -267,7 +313,11 @@ export function chooseSidecarHit(
   }
 
   if (!TYPE_SHAPED_NAME.test(typeName)) { return null; }
-  return nonAlias[0];
+  // A library's class attribute is not evidence for a same-named type in the
+  // source document. Ambiguous external names require the language server.
+  const externalDefinitions = nonAlias.filter(h => h.kind !== 'attribute' && h.kind !== 'method');
+  const unique = [...new Map(externalDefinitions.map(hit => [`${hit.path}:${hit.line}:${hit.col}`, hit])).values()];
+  return unique.length === 1 ? unique[0] : null;
 }
 
 export async function fastResolveTypeName(
@@ -280,6 +330,11 @@ export async function fastResolveTypeName(
   // (e.g. `.tsx` → Python stub file) are always wrong for our users.
   const language = languageOf(originFsPath);
   const importTargets = importTargetsForIdentifier(originDoc, typeName);
+  const bindings = new Set(importTargets.map(target =>
+    `${target.relPath.replace(/(?:\/(?:__init__|index))?\.(?:pyi?|d\.ts|tsx?|jsx?|mjs|cjs)$/, '')}:${target.importedName}`));
+  // Conditional/shadowed imports of the same local name need scope analysis.
+  // Extension alternatives for one module are one binding, not an ambiguity.
+  if (bindings.size > 1) { return null; }
   const queryNames = [...new Set([
     typeName,
     ...importTargets
@@ -287,8 +342,10 @@ export async function fastResolveTypeName(
       .filter((name) => name !== MODULE_IMPORT_TARGET),
   ])];
 
-  if (importTargets.length > 0 && queryNames.length > 1) {
-    const results = await _indexManager.lookupMany(queryNames, 50, language);
+  if (importTargets.length > 0) {
+    const results = queryNames.length > 1
+      ? await _indexManager.lookupMany(queryNames, 50, language)
+      : [{ name: typeName, hits: await _indexManager.lookup(typeName, 50, language) }];
     const importedHits: Array<{ hit: SidecarHit; queryName: string }> = [];
     for (const result of results) {
       for (const hit of result.hits) {
@@ -297,23 +354,22 @@ export async function fastResolveTypeName(
         }
       }
     }
-    const chosenImported = chooseSidecarHit(
-      importedHits.map((entry) => entry.hit),
+    const scopedHits = importedHits.map(entry => entry.hit);
+    // Prefer implementations to stubs only within the proven import scope.
+    const sourceHits = scopedHits.filter(hit => !hit.path.endsWith('.pyi') && !hit.path.endsWith('.d.ts'));
+    const chosenSource = chooseSidecarHit(sourceHits, originFsPath, typeName);
+    if (chosenSource) { return chosenSource; }
+    const importedSource = await resolveWorkspaceImportTarget(importTargets);
+    if (importedSource) { return importedSource; }
+    return chooseSidecarHit(
+      scopedHits,
       originFsPath,
       typeName,
     );
-    if (chosenImported) { return chosenImported; }
   }
 
   const hits = await _indexManager.lookup(typeName, 50, language);
   if (hits.length === 0) { return null; }
-
-  if (importTargets.length > 0) {
-    const scopedHits = hits.filter((hit) =>
-      importTargets.some((target) => hitMatchesImportTarget(hit, typeName, target)));
-    const chosenScoped = chooseSidecarHit(scopedHits, originFsPath, typeName);
-    if (chosenScoped) { return chosenScoped; }
-  }
 
   // If the workspace itself defines the symbol, prefer project-side hits.
   // Multiple project definitions (e.g. `class Meta` across Django models,
