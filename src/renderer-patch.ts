@@ -125,10 +125,14 @@
 //   the native resize model, and unlock both axes for a corner grab.
 // v319: refire drill/back hovers through actions bound to the owning editor,
 //   so stale focus in another editor cannot consume the page transition.
+// v320: arbitrate native type-link clicks and drags before firing preview;
+//   dragging from a link must detach the panel just like dragging its body.
+// v321: make diagnostic observers/listeners opt-in, cancel scheduled work on
+//   cleanup, share one pointer-intent path, and retain manual size across drill.
 // If the running window still logs v<300, the new build is NOT loaded yet.
 import { parsePreviewFileLink } from './preview-file-link';
 
-export const RENDERER_PATCH_VERSION = 319;
+export const RENDERER_PATCH_VERSION = 322;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -340,6 +344,9 @@ function irPruneDetachedHoverState(){
 }
 window.__irCleanup=function(reason){
   try{
+    irHEDispose();
+    if(window.__irCancelScan)window.__irCancelScan();
+    if(window.__irPatchEditorRetryTimer){clearTimeout(window.__irPatchEditorRetryTimer);window.__irPatchEditorRetryTimer=null;}
     window.irRefireNativeHoverAtAnchor=null;
     try{irClearClickPinnedHover('patch-cleanup',false);}catch(_){}
     try{irClearDetachedHovers('patch-cleanup');}catch(_){}
@@ -405,6 +412,10 @@ window.__irCleanup=function(reason){
     window.__irOriginalHoverSnapshot=null;
     window.__irLastPreviewTarget=null;
     window.__irPendingLinkPointerDown=null;
+    window.__irLastTypeLinkAtPoint=null;
+    window.__irPointActiveLink=null;
+    window.__irPointWrapLast=null;
+    window.__irHoverGuardOutsideLast=null;
     window.__irActiveHoverEl=null;
     window.__irFlexibleResizeActiveWrapper=null;
     window.__irClickPinnedHover=null;
@@ -422,6 +433,8 @@ window.__irCleanup=function(reason){
     window.__irTokSupportMisses={};
     window.__irTokenizeToString=null;
     window.__irTestHooks=null;
+    window.__irCancelScan=null;
+    window.__irCleanup=null;
     window.__irPatchVersion=0;
     window.__irRecaptureScheduled=false;
     window.__irCaptureActive=false;
@@ -945,7 +958,8 @@ function irHERecord(kind,detail){
     };
     if(detail){for(var k in detail){if(Object.prototype.hasOwnProperty.call(detail,k))entry[k]=detail[k];}}
     window.__irHoverEventLog.push(entry);
-    var max=Number(window.__irHoverEventLogConfig.max)||4000;
+    // Production keeps a small recent audit trail. Full traces are opt-in.
+    var max=window.__irHoverEventLogConfig.enabled?(Number(window.__irHoverEventLogConfig.max)||4000):128;
     while(window.__irHoverEventLog.length>max)window.__irHoverEventLog.shift();
     // Forward selected diagnostic kinds to log.txt via irLog. Wrap in a
     // try so a stringify error never breaks the in-renderer buffer write.
@@ -975,9 +989,14 @@ function irHERecord(kind,detail){
   }catch(_){}
 }
 var IR_HE_EVENT_TYPES=['mousedown','mouseup','mousemove','click','mouseleave','mouseenter','mouseout','mouseover','pointerdown','pointermove','pointerup','pointerleave','pointerenter','pointerout','pointerover','focusin','focusout','blur','wheel','contextmenu','keydown','keyup'];
-for(var __irHE_i=0;__irHE_i<IR_HE_EVENT_TYPES.length;__irHE_i++){(function(type){
-  document.addEventListener(type,function(e){
+var IR_HE_ENABLED=!!window.__irHoverEventLogConfig.enabled;
+var IR_HE_LISTENING=false;
+var IR_HE_DISPOSED=false;
+var IR_HE_ATTRIBUTE_OBSERVERS=new Map();
+function irHEHandleEvent(e){
     try{
+      if(!IR_HE_ENABLED)return;
+      var type=e.type;
       var tgt=e.target;
       // Skip intellij-styled-search's surface (.ij-find-overlay). This hover-engine
       // diagnostic runs irHEHoverRoot + a document-wide querySelector on EVERY one of
@@ -1014,13 +1033,12 @@ for(var __irHE_i=0;__irHE_i<IR_HE_EVENT_TYPES.length;__irHE_i++){(function(type)
       }
       irHERecord('evt',detail);
     }catch(_){}
-  },true);
-})(IR_HE_EVENT_TYPES[__irHE_i]);}
+}
 function irHEAttachAttributeObserver(el){
-  if(!el||el.__irHEAttrObserved)return;
-  el.__irHEAttrObserved=true;
+  if(!IR_HE_ENABLED||!el||!el.isConnected||IR_HE_ATTRIBUTE_OBSERVERS.has(el))return;
   try{
     var observer=new MutationObserver(function(records){
+      if(!IR_HE_ENABLED)return;
       for(var r=0;r<records.length;r++){
         var rec=records[r];
         if(rec.type==='attributes'){
@@ -1042,7 +1060,7 @@ function irHEAttachAttributeObserver(el){
       }
     });
     observer.observe(el,{attributes:true,attributeOldValue:true,attributeFilter:['style','class','aria-hidden','hidden'],childList:true,subtree:false});
-    el.__irHEAttrObserver=observer;
+    IR_HE_ATTRIBUTE_OBSERVERS.set(el,observer);
   }catch(_){}
 }
 function irHEScanForHovers(){
@@ -1054,7 +1072,11 @@ function irHEScanForHovers(){
 var IR_HE_BODY_OBSERVER=null;
 var IR_HE_PENDING_RECORDS=null;
 var IR_HE_RAF_HANDLE=null;
+var IR_HE_CANCEL_FRAME=null;
 function irHEProcessRecords(records){
+  IR_HE_ATTRIBUTE_OBSERVERS.forEach(function(observer,el){
+    if(!el.isConnected){observer.disconnect();IR_HE_ATTRIBUTE_OBSERVERS.delete(el);}
+  });
   for(var r=0;r<records.length;r++){
     var rec=records[r];
     if(rec.type!=='childList')continue;
@@ -1092,7 +1114,7 @@ function irHEProcessRecords(records){
   }
 }
 function irHESetupBodyObserver(){
-  if(IR_HE_BODY_OBSERVER||!document.body)return;
+  if(!IR_HE_ENABLED||IR_HE_BODY_OBSERVER||!document.body)return;
   try{
     IR_HE_BODY_OBSERVER=new MutationObserver(function(records){
       // Coalesce mutation bursts (typing, layout) into one rAF-batched
@@ -1104,6 +1126,7 @@ function irHESetupBodyObserver(){
       }
       IR_HE_PENDING_RECORDS=records.slice();
       var schedule=window.requestAnimationFrame||function(cb){return setTimeout(cb,16);};
+      IR_HE_CANCEL_FRAME=window.requestAnimationFrame?window.cancelAnimationFrame:window.clearTimeout;
       IR_HE_RAF_HANDLE=schedule(function(){
         var pending=IR_HE_PENDING_RECORDS;
         IR_HE_PENDING_RECORDS=null;
@@ -1115,7 +1138,53 @@ function irHESetupBodyObserver(){
     irHEScanForHovers();
   }catch(_){}
 }
-if(document.body)irHESetupBodyObserver();else document.addEventListener('DOMContentLoaded',irHESetupBodyObserver,{once:true});
+function irHESetEnabled(enabled){
+  IR_HE_ENABLED=!!enabled;
+  if(IR_HE_ENABLED){
+    if(!IR_HE_LISTENING){
+      for(var i=0;i<IR_HE_EVENT_TYPES.length;i++)document.addEventListener(IR_HE_EVENT_TYPES[i],irHEHandleEvent,{capture:true,passive:true});
+      IR_HE_LISTENING=true;
+    }
+    if(document.body)irHESetupBodyObserver();
+    else document.addEventListener('DOMContentLoaded',irHESetupBodyObserver,{once:true});
+    irInstallLongTaskObserver();
+  }else{
+    for(var j=0;j<IR_HE_EVENT_TYPES.length;j++)document.removeEventListener(IR_HE_EVENT_TYPES[j],irHEHandleEvent,true);
+    document.removeEventListener('DOMContentLoaded',irHESetupBodyObserver);
+    IR_HE_LISTENING=false;
+    if(IR_HE_BODY_OBSERVER)IR_HE_BODY_OBSERVER.disconnect();
+    IR_HE_BODY_OBSERVER=null;
+    if(IR_HE_RAF_HANDLE&&IR_HE_CANCEL_FRAME)IR_HE_CANCEL_FRAME.call(window,IR_HE_RAF_HANDLE);
+    IR_HE_RAF_HANDLE=null;
+    IR_HE_PENDING_RECORDS=null;
+    IR_HE_ATTRIBUTE_OBSERVERS.forEach(function(observer){observer.disconnect();});
+    IR_HE_ATTRIBUTE_OBSERVERS.clear();
+    if(window.__irLongTaskObs)window.__irLongTaskObs.disconnect();
+    window.__irLongTaskObs=null;
+    window.__irHEMoveSampleState=null;
+    window.__irHoverEventLog=[];
+  }
+  return {enabled:IR_HE_ENABLED,listeners:IR_HE_LISTENING?IR_HE_EVENT_TYPES.length:0,
+    observedHovers:IR_HE_ATTRIBUTE_OBSERVERS.size,bodyObserver:!!IR_HE_BODY_OBSERVER,
+    longTaskObserver:!!window.__irLongTaskObs};
+}
+function irHEDispose(){
+  if(IR_HE_DISPOSED)return;
+  IR_HE_DISPOSED=true;
+  var requested=IR_HE_ENABLED;
+  irHESetEnabled(false);
+  // Do not retain this patch's closures through a configuration accessor.
+  Object.defineProperty(window.__irHoverEventLogConfig,'enabled',{configurable:true,enumerable:true,writable:true,value:requested});
+  window.__irSetHoverEventLogging=null;
+  window.__irHEDrain=null;
+  window.__irHEClear=null;
+}
+// Preserve the existing diagnostic opt-in, including toggles after startup.
+Object.defineProperty(window.__irHoverEventLogConfig,'enabled',{
+  configurable:true,enumerable:true,get:function(){return IR_HE_ENABLED;},set:irHESetEnabled
+});
+window.__irSetHoverEventLogging=irHESetEnabled;
+if(IR_HE_ENABLED)irHESetEnabled(true);
 window.__irHEDrain=function(){
   var out=window.__irHoverEventLog.slice();
   return {ok:true,count:out.length,events:out,hoverState:irHEHoverState(),patchVersion:Number(window.__irPatchVersion)||0};
@@ -1749,6 +1818,7 @@ function irStageElapsedNow(){
   return -1;
 }
 function irTimeSync(label,fn){
+  if(!IR_HE_ENABLED)return fn();
   var t0=irNowMs();
   try{return fn();}
   finally{
@@ -1757,6 +1827,7 @@ function irTimeSync(label,fn){
 }
 function irInstallLongTaskObserver(){
   try{
+    if(!IR_HE_ENABLED)return;
     if(window.__irLongTaskObs)return;
     if(typeof window.PerformanceObserver!=='function')return;
     var obs=new PerformanceObserver(function(list){
@@ -4589,6 +4660,10 @@ function irScheduleTypeLinkPointerDownFallback(link,e){
     try{
       var pending=window.__irPendingLinkPointerDown;
       if(!pending||pending.link!==link)return;
+      // A held native press may still become a panel drag. Pointer release
+      // rearms this fallback; an ordinary click cancels it as before.
+      var candidate=window.__irHoverDragCandidate;
+      if(candidate&&candidate.kind==='native'&&candidate.link===link)return;
       window.__irPendingLinkPointerDown=null;
       if(window.__irPointerActionLogCount<140){
         window.__irPointerActionLogCount++;
@@ -4716,7 +4791,9 @@ function irFitContentAwareHoverSize(hover){
   if(!IR_HOVER_NATIVE_ONLY||!hover||!document.body.contains(hover))return;
   try{
     var wrapper=hover.closest('.monaco-resizable-hover');
-    if(!wrapper||wrapper.classList.contains('ir-flexible-hover-size'))return;
+    if(!wrapper)return;
+    var manualSize=wrapper.classList.contains('ir-flexible-hover-size')?wrapper.__irFlexiblePreferredSize:null;
+    if(wrapper.classList.contains('ir-flexible-hover-size')&&!manualSize)return;
     if(!irIsRenderableHoverRoot(hover))return;
     // Also remove v315's CSS override when upgrading an already open hover.
     irResetContentAwareHoverSize(wrapper);
@@ -4725,7 +4802,7 @@ function irFitContentAwareHoverSize(hover){
     var node=widget&&widget._resizableNode;
     // Private native APIs vary across VS Code releases. Without the owning
     // widget, leave geometry alone: CSS resizing cannot update the token anchor.
-    if(!widget||!node||node.domNode!==wrapper||widget.isResizing
+    if(!widget||!node||node.domNode!==wrapper||widget.isResizing||window.__irFlexibleResizeActiveWrapper===wrapper
       ||!widget._renderedHover||!widget._renderedHover.showAtPosition
       ||typeof widget._findAvailableSpaceVertically!=='function'
       ||typeof widget._updateResizableNodeMaxDimensions!=='function'
@@ -4735,6 +4812,19 @@ function irFitContentAwareHoverSize(hover){
     if(!sc)return;
     var rect=wrapper.getBoundingClientRect();
     if(rect.width<60||rect.height<20)return;
+    if(manualSize){
+      // A native refire rebuilds the contents at their default dimensions.
+      // Restore the user's completed drag through the native widget once the
+      // new content arrives, within the current viewport and anchor limits.
+      irSyncFlexibleHoverResizeLimits(wrapper,widget);
+      var manualWidth=irClamp(manualSize.width,node.minSize.width,node.maxSize.width);
+      var manualHeight=irClamp(manualSize.height,node.minSize.height,node.maxSize.height);
+      if(Math.abs(rect.width-manualWidth)<=1&&Math.abs(rect.height-manualHeight)<=1)return;
+      node.layout(manualHeight,manualWidth);
+      widget._setHoverWidgetDimensions(node.size.width,node.size.height);
+      if(widget._hover&&widget._hover.scrollbar)widget._hover.scrollbar.scanDomNode();
+      return;
+    }
     var viewportH=window.innerHeight||document.documentElement.clientHeight||900;
     // Keep VS Code's chosen side of the token, even when the pointer has moved
     // inside the panel or an async preview finishes after the pointer moved away.
@@ -4760,7 +4850,7 @@ function irScheduleContentAwareHoverSize(hover){
   if(!IR_HOVER_NATIVE_ONLY||!hover||hover.__irAutoSizeTimer||hover.__irAutoSizeFrame)return;
   try{
     var wrapper=hover.closest('.monaco-resizable-hover');
-    if(!wrapper||wrapper.classList.contains('ir-flexible-hover-size'))return;
+    if(!wrapper||(wrapper.classList.contains('ir-flexible-hover-size')&&!wrapper.__irFlexiblePreferredSize))return;
     hover.__irAutoSizeTimer=irSetTimer(function(){
       hover.__irAutoSizeTimer=0;
       hover.__irAutoSizeFrame=requestAnimationFrame(function(){
@@ -4904,6 +4994,7 @@ function irResetFlexibleHoverResize(wrapper,clearSize){
       wrapper.style.removeProperty('height');
     }
     wrapper.__irFlexibleHoverSizeAt=0;
+    wrapper.__irFlexiblePreferredSize=null;
     wrapper.__irFlexibleWidthEdge=null;
     wrapper.__irFlexibleHeightEdge=null;
     if(window.__irFlexibleResizeActiveWrapper===wrapper)window.__irFlexibleResizeActiveWrapper=null;
@@ -4915,6 +5006,9 @@ function irFinishFlexibleHoverResize(){
     window.__irFlexibleResizeActiveWrapper=null;
     if(wrapper){
       wrapper.__irFlexibleResizeSash=null;
+      var nativeResize=wrapper.__irFlexibleResizeNative;
+      var size=nativeResize&&nativeResize.widget._resizableNode.size;
+      if(size&&size.width>0&&size.height>0)wrapper.__irFlexiblePreferredSize={width:size.width,height:size.height};
       irSetTimer(function(){
         try{
           var root=wrapper.querySelector?wrapper.querySelector('.monaco-hover,.monaco-editor-hover'):null;
@@ -5420,7 +5514,8 @@ function irCreateDetachedHoverSnapshot(pin){
     var sessionKey=String(window.__irHostWindowId||'?')+':'+String(IR_PATCH_VERSION)+':'+String(seq)+':'+String(Date.now());
     var previewTarget=null;
     try{
-      previewTarget=root.querySelector('.rendered-markdown.ir-primary-preview-target')
+      previewTarget=irConsolidateDetachedMarkdown(root)
+        ||root.querySelector('.rendered-markdown.ir-primary-preview-target')
         ||root.querySelector('.rendered-markdown.ir-applied')
         ||root.querySelector('.rendered-markdown');
       if(previewTarget)irSetPreviewTarget(root,previewTarget);
@@ -5512,6 +5607,26 @@ function irDetachedHoverStateForSessionKey(sessionKey){
     for(var i=0;i<list.length;i++)if(list[i]&&String(list[i].sessionKey)===String(sessionKey))return list[i];
   }catch(_){ }
   return null;
+}
+function irConsolidateDetachedMarkdown(root){
+  // Native Markdown items have a character limit, so a complete source can
+  // span several roots. A detached page has one history target: move every
+  // continuation into it once, preserving order, tokens and the original text.
+  // Only the detached clone is changed; native layout keeps its own rows.
+  if(!root)return null;
+  var blocks=root.querySelectorAll('.rendered-markdown'),target=null;
+  for(var i=0;i<blocks.length;i++){
+    var block=blocks[i];
+    if(!target){target=block;continue;}
+    if(target.contains(block)||block.contains(target))continue;
+    var row=block.closest?block.closest('.hover-row'):null;
+    while(block.firstChild)target.appendChild(block.firstChild);
+    if(block.parentNode)block.parentNode.removeChild(block);
+    if(row&&!row.contains(target)&&!String(row.textContent||'').trim()&&row.parentNode){
+      row.parentNode.removeChild(row);
+    }
+  }
+  return target;
 }
 function irDetachedPreviewTarget(state){
   try{
@@ -5881,9 +5996,10 @@ function irReleaseNativeHoverAfterDetach(pin){
     irHERecord('hover-native-released-for-detached',{direct:!!hidden,directController:directController,directWidget:directWidget,directCapturedWidget:directCapturedWidget});
   }catch(_){ }
 }
-function irHoverDragExcludedTarget(target){
+function irHoverDragExcludedTarget(target,allowTypeLink){
   try{
-    return !!(target&&target.closest&&target.closest('a,button,input,textarea,select,option,[contenteditable="true"],.ir-type-link,.ir-detached-hover-resize-handle,.monaco-sash,[class*="sash"],.scrollbar,.slider,.scroll-decoration'));
+    return !!(target&&target.closest&&(target.closest('a,button,input,textarea,select,option,[contenteditable="true"],.ir-detached-hover-resize-handle,.monaco-sash,[class*="sash"],.scrollbar,.slider,.scroll-decoration')
+      ||(!allowTypeLink&&target.closest('.ir-type-link'))));
   }catch(_){return false}
 }
 function irSetHoverDragPointerCapture(candidate,el){
@@ -5915,6 +6031,7 @@ function irCancelHoverDragCandidate(){
     var active=window.__irHoverDragActive;
     window.__irHoverDragCandidate=null;
     window.__irHoverDragActive=null;
+    if(candidate&&candidate.link)irClearPendingTypeLinkPointerDown(candidate.link,'hover-drag-cancel');
     irReleaseHoverDragPointerCapture(candidate);
     if(active&&active.state&&active.state.el)active.state.el.classList.remove('ir-detached-hover-dragging');
   }catch(_){ }
@@ -5995,18 +6112,21 @@ function irDetachedHoverResizeEnd(e){
 }
 function irArmPinnedHoverDrag(pin,e,target){
   try{
-    if(!pin||!e||irHoverDragExcludedTarget(target))return false;
+    if(!pin||!e||irHoverDragExcludedTarget(target,true))return false;
+    if(e.metaKey||e.ctrlKey||e.altKey||e.shiftKey)return false;
     if(typeof e.buttons==='number'&&(e.buttons&1)===0)return false;
     var rect=pin.wrapper&&pin.wrapper.getBoundingClientRect?pin.wrapper.getBoundingClientRect():null;
     if(!rect)return false;
     var candidate={
-      kind:'native',pin:pin,state:null,
+      kind:'native',pin:pin,state:null,link:irClosestTypeLink(target),
       startX:Number(e.clientX)||0,startY:Number(e.clientY)||0,
       originLeft:rect.left,originTop:rect.top,
       pointerId:typeof e.pointerId==='number'?e.pointerId:null,captureEl:null
     };
     window.__irHoverDragCandidate=candidate;
-    irSetHoverDragPointerCapture(candidate,pin.wrapper);
+    // Keep the native click target until the gesture crosses the threshold.
+    // Capturing the wrapper now would retarget a link's pointerup and click.
+    if(!candidate.link)irSetHoverDragPointerCapture(candidate,pin.wrapper);
     return true;
   }catch(_){return false}
 }
@@ -6052,6 +6172,7 @@ function irHoverDragMove(e){
       if((dx*dx)+(dy*dy)<IR_HOVER_DRAG_THRESHOLD_PX*IR_HOVER_DRAG_THRESHOLD_PX)return;
       var state=candidate.state;
       if(candidate.kind==='native'){
+        irSetHoverDragPointerCapture(candidate,candidate.pin.wrapper);
         state=irCreateDetachedHoverSnapshot(candidate.pin);
         if(!state){irCancelHoverDragCandidate();return;}
         candidate.state=state;
@@ -6084,7 +6205,14 @@ function irHoverDragEnd(e){
     window.__irHoverDragCandidate=null;
     window.__irHoverDragActive=null;
     irReleaseHoverDragPointerCapture(candidate);
-    if(!active||!active.state)return;
+    if(!active||!active.state){
+      var pending=window.__irPendingLinkPointerDown;
+      if(pending&&candidate.link===pending.link){
+        if(e&&(e.type==='pointerup'||e.type==='mouseup'))irScheduleTypeLinkPointerDownFallback(pending.link,e);
+        else irClearPendingTypeLinkPointerDown(null,'hover-drag-cancel');
+      }
+      return;
+    }
     if(active.state.el)active.state.el.classList.remove('ir-detached-hover-dragging');
     var clickSuppress={
       until:Date.now()+120,
@@ -6514,6 +6642,13 @@ function irTypeLinkPointerDown(e){
   }
   irMarkHoverManaged(irClosestHover(link),true);
   if(recoveredLink&&recoveredLink.target)window.__irLastPreviewTarget=recoveredLink.target;
+  var candidate=window.__irHoverDragCandidate;
+  if(candidate&&candidate.kind==='native'&&candidate.pin&&candidate.pin.root.contains(link)){
+    candidate.link=link;
+    // Lazy word wrapping can discover a link after the native press was
+    // armed on plain text. Preserve that link's subsequent click target too.
+    irReleaseHoverDragPointerCapture(candidate);
+  }
   irScheduleTypeLinkPointerDownFallback(link,e);
   e.preventDefault();
   e.stopImmediatePropagation();
@@ -6525,14 +6660,25 @@ track(document,'mousedown',irTypeLinkPointerDown,true);
 
 function irTypeLinkHoverIntent(e){
   try{
-    if(irIsDetachedHoverElement(e&&e.target))return;
-    var directLink=irClosestTypeLink(e&&e.target);
+    var target=e&&e.target;
+    var hover=irClosestHover(target);
+    if(!hover||irIsDetachedHoverElement(target)){
+      irSetPointActiveLink(null);
+      window.__irPointWrapLast=null;
+      return;
+    }
+    // Pointer and compatibility mouse events describe the same physical move.
+    // Keep distinct coordinates/targets immediate, including adjacent tokens.
+    var now=Date.now(),last=window.__irPointWrapLast;
+    if(last&&last.target===target&&last.x===e.clientX&&last.y===e.clientY&&now-last.t<16)return;
+    window.__irPointWrapLast={target:target,x:e.clientX,y:e.clientY,t:now};
+    var directLink=irClosestTypeLink(target);
     var wrappedLink=null;
     if(!directLink)wrappedLink=irWrapWordAtPoint(e);
     var link=directLink||wrappedLink;
     if(!link)return;
     irSetPointActiveLink(link);
-    irMarkHoverManaged(irClosestHover(link),true);
+    irMarkHoverManaged(hover,true);
   }catch(_){}
 }
 // L42: window listeners alone suffice (capture phase fires window
@@ -7458,14 +7604,18 @@ track(window,'pointermove',irRememberPointerEvent,true);
 track(window,'mousemove',irRememberPointerEvent,true);
 track(window,'mouseover',irRememberPointerEvent,true);
 track(window,'pointerover',irRememberPointerEvent,true);
-track(window,'pointermove',irHoverGuard,true);
-track(window,'pointerover',irHoverGuard,true);
-track(window,'pointerout',irHoverGuard,true);
-track(window,'pointerleave',irHoverGuard,true);
-track(window,'mousemove',irHoverGuard,true);
-track(window,'mouseover',irHoverGuard,true);
-track(window,'mouseout',irHoverGuard,true);
-track(window,'mouseleave',irHoverGuard,true);
+// Native mode already handles link intent above. Registering the legacy guard
+// there repeated the same word lookup and geometry reads for every movement.
+if(!IR_HOVER_NATIVE_ONLY){
+  track(window,'pointermove',irHoverGuard,true);
+  track(window,'pointerover',irHoverGuard,true);
+  track(window,'pointerout',irHoverGuard,true);
+  track(window,'pointerleave',irHoverGuard,true);
+  track(window,'mousemove',irHoverGuard,true);
+  track(window,'mouseover',irHoverGuard,true);
+  track(window,'mouseout',irHoverGuard,true);
+  track(window,'mouseleave',irHoverGuard,true);
+}
 function irHoverInternalWheelGuard(e){
   // L97 (2026-05-31): NOT deprecated — scrolls the hover CONTENT and preventDefaults at the scroll
   // boundary so over-scroll does NOT propagate to the editor and dismiss the hover (user: "스크롤
@@ -12796,6 +12946,11 @@ function irScanRenderedMarkdown(){
   }
 }
 
+var irCancelScanSchedule=null;
+window.__irCancelScan=function(){
+  if(window.__irScanTimer&&irCancelScanSchedule)irCancelScanSchedule.call(window,window.__irScanTimer);
+  window.__irScanTimer=null;
+};
 function irScheduleScan(){
   if(window.__irScanTimer)return;
   // L25 → L33 progression:
@@ -12818,10 +12973,13 @@ function irScheduleScan(){
   var schedule;
   if(typeof window.requestIdleCallback==='function'){
     schedule=function(cb){return window.requestIdleCallback(cb,{timeout:500});};
+    irCancelScanSchedule=window.cancelIdleCallback;
   }else if(typeof window.requestAnimationFrame==='function'){
     schedule=window.requestAnimationFrame;
+    irCancelScanSchedule=window.cancelAnimationFrame;
   }else{
     schedule=function(cb){return setTimeout(cb,16);};
+    irCancelScanSchedule=window.clearTimeout;
   }
   window.__irScanTimer=schedule(function(){
     window.__irScanTimer=null;
@@ -12864,7 +13022,7 @@ function irIsOwnLinkWrapMutation(mut){
   return true;
 }
 window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
-  var __moT0=irNowMs();   // L83: time the markdown MO burst (a #2 block suspect on 57K-char content)
+  var __moT0=IR_HE_ENABLED?irNowMs():0;
   // Ordinary typing, terminal output and workbench updates are not a reason
   // to measure/prune the active hover. Detached roots still release promptly.
   if((window.__irActiveHoverEl&&!window.__irActiveHoverEl.isConnected)
@@ -12954,7 +13112,7 @@ window.__irMarkdownObserver=irTrackObserver(new MutationObserver(function(muts){
     }
   }
   if(seenScan){irPruneDetachedHoverState();irScheduleScan();}
-  try{var __moDur=irNowMs()-__moT0;if(__moDur>=IR_SYNC_LONGTASK_MIN_MS)irHERecord('ir-sync-longtask',{fn:'markdown-mo',durMs:Math.round(__moDur),muts:muts&&muts.length,staging:irStageElapsedNow()});}catch(_){}
+  if(IR_HE_ENABLED)try{var __moDur=irNowMs()-__moT0;if(__moDur>=IR_SYNC_LONGTASK_MIN_MS)irHERecord('ir-sync-longtask',{fn:'markdown-mo',durMs:Math.round(__moDur),muts:muts&&muts.length,staging:irStageElapsedNow()});}catch(_){}
 }));
 // L40: characterData:true was firing the observer on every keystroke
 // the user typed in the editor (each character data mutation in

@@ -42,6 +42,25 @@ async function main() {
       'extensions.autoCheckUpdates': false,
     }));
     const testWindowMarker = `IR_E2E_WINDOW_${process.pid}`;
+    const productionInjection = process.env.IR_TEST_PRODUCTION_INJECTION === '1';
+    let inspectorPort = 0;
+    if (productionInjection) {
+      // The normal injection path discovers a PID-matched main inspector.
+      // Never compete with a running user's VS Code for the default 9229.
+      for (let candidate = 9230; candidate <= 9249; candidate++) {
+        const available = await new Promise<boolean>(resolve => {
+          // A local port manager may redirect bind() to another loopback
+          // address. Probe the exact address Electron's inspector will use.
+          const probe = net.createConnection({ host: '127.0.0.1', port: candidate });
+          const finish = (free: boolean) => { probe.destroy(); resolve(free); };
+          probe.once('connect', () => finish(false));
+          probe.once('error', (err: NodeJS.ErrnoException) => finish(err.code === 'ECONNREFUSED'));
+          probe.setTimeout(300, () => finish(false));
+        });
+        if (available) { inspectorPort = candidate; break; }
+      }
+      if (!inspectorPort) { throw new Error('No isolated main inspector port available for startup verification'); }
+    }
     // A PID-derived port can belong to another editor/test process. Ask the
     // OS for an available loopback port before starting this isolated host.
     const remoteDebuggingPort = await new Promise<string>((resolve, reject) => {
@@ -78,7 +97,8 @@ async function main() {
       extensionDevelopmentPath,
       extensionTestsPath,
       extensionTestsEnv: {
-        IR_SKIP_RENDERER_INJECTION: '1',
+        IR_SKIP_RENDERER_INJECTION: productionInjection ? '0' : '1',
+        IR_TEST_PRODUCTION_INJECTION: productionInjection ? '1' : '0',
         IR_TEST_USER_DATA_DIR: userDataDir,
         IR_TEST_WINDOW_MARKER: testWindowMarker,
         IR_TEST_REMOTE_DEBUGGING_PORT: remoteDebuggingPort,
@@ -86,14 +106,16 @@ async function main() {
         IR_E2E_GREP: process.env.IR_E2E_GREP || '',
       },
       launchArgs: [
-        testWorkspace,
         `--extensions-dir=${userExtensionsDir}`,
         `--user-data-dir=${userDataDir}`,
         `--remote-debugging-port=${remoteDebuggingPort}`,
+        // SIGUSR1 on a test host must not take the real editor's default port.
+        productionInjection ? `--inspect=${inspectorPort}` : '--inspect-port=0',
         '--disable-features=EditContext',
         '--disable-renderer-backgrounding',
         ...disabledBuiltinUiExtensions.map(id => `--disable-extension=${id}`),
         ...disabledUiExtensions.map(id => `--disable-extension=${id}`),
+        testWorkspace,
       ],
     });
   } catch (err) {

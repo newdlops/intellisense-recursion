@@ -1,5 +1,140 @@
 # Renderer performance
 
+## Complete content delivery in patch 322 (2026-09-29)
+
+Performance limits must not shorten hover content. Removed the 10,000-line
+definition cap and 600-line value scan cap; builders now retain each resolved
+definition through its structural end. Eager navigation indexing splits only
+its first 24 lines into a temporary array, keeping the full display payload.
+The existing cache byte/entry budgets and expiry still apply to retention.
+
+Actual rendering exposed a second limit: VS Code 1.139.1 truncates each Markdown
+item after 100,000 UTF-16 code units and appends an ellipsis. The final provider
+boundary now delivers large Markdown in smaller items, reopening code fences
+with their language. Original Markdown stays whole in caches/history and small
+results pass through unchanged. Detached clones consolidate the rendered blocks
+into one page target so navigation and Back replace/restore every continuation.
+
+The shipping bundle passed ten targeted checks: four complete-source comparisons
+(Python/TypeScript classes beyond 10,000 lines and values beyond 600 lines, each
+through document and raw-file builders), four delivery/Unicode/metadata checks,
+a large-content rendering test, and the production startup regression. In the
+rendering test, a deterministic provider supplies the real builder's result to
+VS Code's native hover. Real wheel and drag input reaches the final source line
+in native and detached panels; a renderer navigation round trip replaces and
+restores all 10,025 numbered lines. The startup regression covers real source
+hovering, 1px borders, native resize and the production type-link bridge.
+
+Screenshots of the native tail, detached tail, Back-restored tail and resized
+native hover were inspected at 1440 × 900. Smaller viewports and whole-process
+resource usage were not measured in this correction. Build and JavaScript syntax
+checks passed. A large visible definition necessarily retains its full content;
+the cache budget is not a limit on the active panel's memory.
+
+```sh
+npm run bundle
+IR_TEST_PRODUCTION_INJECTION=1 IR_E2E_FILES=hover-content.test.js,preview-content.test.js,preview-content-renderer.test.js,renderer-startup.test.js TEST_FIXTURE=python node out/test/runTest.js
+```
+
+## Resource reduction in patch 321 (2026-09-29)
+
+The always-installed diagnostic event recorder was doing DOM searches and
+geometry reads before checking whether recording was enabled. Its 22 document
+listeners and body/attribute observers also survived patch cleanup.
+
+- Install diagnostic listeners, hover observers and the long-task observer only
+  while `window.__irHoverEventLogConfig.enabled` is true. Toggling that existing
+  flag works after startup. Disabling or replacing the patch disconnects every
+  diagnostic observer, cancels queued work and releases recorded DOM references.
+- Keep 128 recent audit entries in normal operation; full diagnostic recording
+  retains its configurable limit. Native mode uses one link-intent handler;
+  compatibility mouse events at the same position share the pointer work.
+- Cancel the markdown scan with the matching idle/animation/timer API, and stop
+  editor discovery retries during cleanup. Cleanup is safe to repeat.
+- Give the definition and position-preview caches a **4 MiB estimated retained
+  payload budget each**, in addition to their existing 200/100 entry limits.
+  Cache hits update recency without extending the existing 60/30 second TTLs.
+  One timeout per populated cache releases expired entries during idle periods;
+  empty caches have no timeout. Closed definition documents are released from
+  both source-keyed and destination-keyed cache entries.
+- Oversized preview results bypass retention and remain complete for the current
+  request. The cache limit never truncates displayed code. Repeated oversized
+  requests may need to rebuild their preview; the existing raw-file cache still
+  applies.
+
+### Measurements
+
+Same Python fixture in isolated VS Code 1.139.1 windows on macOS ARM64. Patch
+320 was saved before implementation. The pointer workload dispatches 1,000
+movement pairs (`pointermove` + compatibility `mousemove`) outside any hover.
+These are focused workload measurements, not whole-process CPU or RSS figures.
+
+| Workload | Patch 320 | Patch 321 |
+| --- | ---: | ---: |
+| Document-wide queries during pointer workload | 2,000 | 0 |
+| `closest()` calls during pointer workload | 22,000 | 4,000 |
+| Pointer workload duration | 75.2 ms | 9.4 ms (first run: 10.7 ms) |
+| DOM queries during 40 editor-paint batches | 2 | 2 |
+| Disposed editor probes retained, out of 64 | 0 | 0 |
+| Diagnostic listeners installed with recording disabled | 22 | 0 |
+
+Timing is diagnostic, not a CI threshold. The unchanged collection workload's
+median varied from 11.1 to 15.2 ms across these runs; no general CPU percentage
+is inferred. The new memory budgets estimate UTF-16 payloads plus per-entry
+overhead; they do not bound VS Code's total heap or the size of an open document.
+GPU usage, RSS and cold-start latency were not measured.
+
+Reports are `ir-renderer-perf-resources-before.json` and
+`ir-renderer-perf-resources-after-final.json` in the system temporary directory.
+The unbundled performance tests now establish their own isolated window marker:
+
+```sh
+npm run compile
+IR_PERF_LABEL=current IR_E2E_FILES=renderer-performance.test.js,preview-cache-budget.test.js TEST_FIXTURE=python node out/test/runTest.js
+```
+
+The three renderer performance tests and two preview-cache budget tests passed.
+They cover recording opt-in, actual event/attribute recording, repeated enable /
+disable, reinjection while recording, bounded LRU retention, oversized results,
+destination invalidation and expiry without lookups. The existing three raw-file
+cache tests also passed.
+
+### Functional and visual verification
+
+The minified renderer passed three real mouse drag tests (body, text and held
+type link), including two independent persistent panels, titlebar movement and
+closing only one panel. Automatic sizing above/below the token, two real
+forward/Back cycles, the flexible sash opt-in and seven preview file-link tests
+also passed in VS Code 1.139.1.
+
+The shipping bundle, with test injection commands removed, passed automatic
+production startup, all four 1px borders, real right-edge/corner sash drags,
+type navigation and persistent dragging. Screenshots were inspected at
+1440 × 900 for native, resized, drilled, restored and detached content. Smaller
+viewports and hardware GPU counters were not rechecked in this pass.
+
+This stronger startup check exposed a pre-existing combination failure:
+resizing then drilling shrank the native panel while its manual-size flag
+prevented automatic growth. The saved patch 320 reproduced it. Patch 321 saves
+the completed drag dimensions and restores them through the native widget after
+content replacement, within viewport/anchor limits. The shipping regression
+now waits for content to fit and asserts those dimensions survive navigation
+before detaching. It passed with the full preview visible in the final capture.
+
+The final production extension is 619,599 bytes; the renderer script is 346,983
+bytes after minification. The additional lifecycle bookkeeping slightly grows
+the bundle; this pass targets runtime work and retained memory. No cold-start
+speedup is claimed.
+
+```sh
+npm run bundle
+IR_TEST_PRODUCTION_INJECTION=1 IR_E2E_FILES=renderer-startup.test.js node out/test/runTest.js
+```
+
+After installing the new build, reload the VS Code window. Patch 320 did not
+keep handles for its diagnostic listeners/observers, so an in-place script
+replacement cannot retroactively remove those older handlers.
+
 ## Changes in renderer patch 317
 
 - Stop intercepting `Map`, `WeakMap`, `Set`, `Array` and `Reflect` once a native

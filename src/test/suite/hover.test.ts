@@ -5069,6 +5069,139 @@ suite('Hover Symbol Coverage E2E', () => {
 suite('Hover Renderer E2E', () => {
   const lang = getFixtureLang();
 
+  for (const grab of ['body', 'text', 'link']) {
+    test(`[${lang}] real native hover drag creates a persistent window (${grab})`, async function () {
+      if (lang !== 'python') { this.skip(); return; }
+      this.timeout(90000);
+      await ensureExtensionCommandsReady('intellisenseRecursion.runHoverRendererHarnessForTests');
+      const pages = JSON.parse(await httpGet(`http://127.0.0.1:${process.env.IR_TEST_REMOTE_DEBUGGING_PORT}/json/list`));
+      const page = pages.find((p: any) => p.type === 'page' && p.title.includes(process.env.IR_TEST_WINDOW_MARKER!));
+      assert.ok(page, 'The dedicated test renderer must be available');
+      const ws = new WebSocket(page.webSocketDebuggerUrl);
+      await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
+      const evaluate = async (expression: string) => {
+        const result = await cdpRequest(ws, 'Runtime.evaluate', { expression, returnByValue: true });
+        assert.ok(!result.exceptionDetails, JSON.stringify(result.exceptionDetails));
+        return result.result.value;
+      };
+      const snapshot = () => evaluate(`({
+        pin:window.__irTestHooks.clickPinnedHoverSnapshot(),
+        drag:window.__irTestHooks.hoverDragSnapshot(),
+        detached:window.__irTestHooks.detachedHoverSnapshot()
+      })`);
+      const drag = async (point: { x: number; y: number }, dx: number, dy: number, hold = false) => {
+        await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', ...point });
+        await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mousePressed', ...point, button: 'left', buttons: 1, clickCount: 1 });
+        try {
+          if (hold) {
+            await sleep(300);
+            assert.strictEqual((await getPatchStatus()).currentPreviewIdentifier, null,
+              'Holding a type link before a drag must not trigger its click fallback');
+          }
+          for (let step = 1; step <= 8; step++) {
+            await cdpRequest(ws, 'Input.dispatchMouseEvent', {
+              type: 'mouseMoved', x: point.x + dx * step / 8, y: point.y + dy * step / 8, button: 'left', buttons: 1,
+            });
+          }
+        } finally {
+          await cdpRequest(ws, 'Input.dispatchMouseEvent', {
+            type: 'mouseReleased', x: point.x + dx, y: point.y + dy, button: 'left', buttons: 0, clickCount: 1,
+          });
+        }
+        await sleep(150);
+      };
+      const capture = async (name: string) => {
+        if (!process.env.IR_DRAG_CAPTURE_DIR) { return; }
+        fs.mkdirSync(process.env.IR_DRAG_CAPTURE_DIR, { recursive: true });
+        const shot = await cdpRequest(ws, 'Page.captureScreenshot', { format: 'png' });
+        fs.writeFileSync(path.join(process.env.IR_DRAG_CAPTURE_DIR, `${name}.png`), Buffer.from(shot.data, 'base64'));
+      };
+      try {
+        await cdpRequest(ws, 'Page.bringToFront');
+        await cdpRequest(ws, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(
+          path.join(vscode.workspace.workspaceFolders![0].uri.fsPath, 'service.py')));
+        const editor = await vscode.window.showTextDocument(doc);
+        await waitForLanguageServer(doc, 'BaseModel');
+        await showNativeHoverAt(editor, findIdentifier(doc, 'BaseModel', 1)!, 'BaseModel', 'model: BaseModel', 'left', true);
+        await waitForHoverDomState(['save'], ['class BaseModel', 'def save'], 14000, true, true);
+        const start = await evaluate(`(function(){
+          var w=Array.from(document.querySelectorAll('.monaco-resizable-hover')).find(function(w){var r=w.getBoundingClientRect();return r.width>60&&r.height>20&&w.textContent.includes('def save')});
+          if(!w)return null;
+          var r=w.getBoundingClientRect(),o=window.__irTestHooks.hoverOwnerForWrapper(w);
+          var point={x:r.right-90,y:r.top+48},grab=${JSON.stringify(grab)};
+          if(grab==='link'){
+            var link=w.querySelector('.ir-type-link[data-type="BaseModel"]');
+            if(!link)return {error:'missing-link'};
+            var lr=link.getBoundingClientRect();point={x:lr.left+lr.width/2,y:lr.top+lr.height/2};
+          }else if(grab==='text'){
+            var walker=document.createTreeWalker(w,NodeFilter.SHOW_TEXT),node;
+            while(node=walker.nextNode())if(node.textContent.includes('Base model with common fields.'))break;
+            if(!node)return {error:'missing-text'};
+            var range=document.createRange();range.selectNodeContents(node);
+            var tr=range.getBoundingClientRect();point={x:tr.left+tr.width/2,y:tr.top+tr.height/2};
+          }
+          var hit=document.elementFromPoint(point.x,point.y);
+          return {point:point,rect:r.toJSON(),above:o.widget._positionPreference===1,hit:hit&&hit.className,
+            draggable:!!(hit&&w.contains(hit)&&!hit.closest('button,.monaco-sash,.scrollbar'))};
+        })()`);
+        assert.ok(start?.draggable, `Native hover body must be hittable: ${JSON.stringify(start)}`);
+        await cdpRequest(ws, 'Input.dispatchMouseEvent', {
+          type: 'mouseMoved', x: start.rect.left + 24, y: start.above ? start.rect.bottom - 12 : start.rect.top + 12,
+        });
+        await drag(start.point, -160, 48, grab === 'link');
+        const detached = await snapshot();
+        console.log('  native drag released: ' + JSON.stringify(detached));
+        assert.strictEqual(detached.detached.count, 1, `A real drag must detach the native hover: ${JSON.stringify(detached)}`);
+        assert.ok(detached.detached.windows[0].text.includes('class BaseModel'));
+        await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: 12, y: 12 });
+        await vscode.commands.executeCommand('editor.action.hideHover');
+        await sleep(1500);
+        assert.strictEqual((await snapshot()).detached.count, 1, 'The detached window must survive pointer leave and native hover dismissal');
+        await capture(`detached-${grab}`);
+        if (grab === 'body') {
+          const first = detached.detached.windows[0];
+          await drag({ x: first.rect.left + 60, y: first.rect.top + 14 }, -300, 370);
+          const moved = (await snapshot()).detached.windows[0];
+          assert.ok(moved.rect.left < first.rect.left - 100 && moved.rect.top > first.rect.top + 100,
+            'A detached panel must remain draggable by its titlebar');
+          await showNativeHoverAt(editor, findIdentifier(doc, 'LargeHoverModel', 1)!, 'LargeHoverModel', 'model: LargeHoverModel', 'left', true);
+          await waitForHoverDomState(['BaseModel'], ['class LargeHoverModel', 'field_070'], 14000, true, true);
+          const second = await evaluate(`(function(){
+            var w=Array.from(document.querySelectorAll('.monaco-resizable-hover')).find(function(w){var r=w.getBoundingClientRect();return r.width>60&&r.height>20&&w.textContent.includes('field_070')});
+            if(!w)return null;
+            var r=w.getBoundingClientRect(),o=window.__irTestHooks.hoverOwnerForWrapper(w);
+            return {x:r.right-90,y:r.top+48,entryX:r.left+24,entryY:o.widget._positionPreference===1?r.bottom-12:r.top+12};
+          })()`);
+          assert.ok(second, 'A new native hover must open while a detached panel persists');
+          await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: second.entryX, y: second.entryY });
+          await drag({ x: second.x, y: second.y }, -160, 48);
+          const two = (await snapshot()).detached;
+          assert.strictEqual(two.count, 2, 'Dragging the next native hover must create a second independent window');
+          assert.ok(two.windows.find((w: any) => w.id === first.id)?.text.includes('class BaseModel'), 'The first panel must retain its content');
+          await capture('two-persistent-panels');
+          const closePoint = await evaluate(`(function(){
+            var windows=window.__irDetachedHovers,button=windows[windows.length-1].el.querySelector('.ir-detached-hover-close');
+            var r=button.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;
+            return {x:x,y:y,hittable:button.contains(document.elementFromPoint(x,y))};
+          })()`);
+          assert.ok(closePoint.hittable, 'The second detached close button must be hittable');
+          await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: closePoint.x, y: closePoint.y });
+          await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: closePoint.x, y: closePoint.y, button: 'left', buttons: 1, clickCount: 1 });
+          await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: closePoint.x, y: closePoint.y, button: 'left', buttons: 0, clickCount: 1 });
+          const remaining = (await snapshot()).detached;
+          assert.strictEqual(remaining.count, 1);
+          assert.strictEqual(remaining.windows[0].id, first.id, 'Closing the second panel must leave the first one open');
+        }
+      } finally {
+        await evaluate('window.__irTestHooks.clearDetachedHovers()');
+        await cdpRequest(ws, 'Emulation.setFocusEmulationEnabled', { enabled: false });
+        ws.close();
+        await vscode.commands.executeCommand('editor.action.hideHover');
+      }
+    });
+  }
+
   test(`[${lang}] hover click pin supports draggable multiple windows`, async function () {
     if (lang !== 'python') { this.skip(); return; }
     this.timeout(120000);
@@ -5445,7 +5578,14 @@ suite('Hover Renderer E2E', () => {
     await waitForLanguageServer(doc, 'LargeHoverModel');
     const config = vscode.workspace.getConfiguration('editor');
     const previousAbove = config.inspect<boolean>('hover.above')?.globalValue;
+    const pages = JSON.parse(await httpGet(`http://127.0.0.1:${process.env.IR_TEST_REMOTE_DEBUGGING_PORT}/json/list`));
+    const page = pages.find((p: any) => p.type === 'page' && p.title.includes(process.env.IR_TEST_WINDOW_MARKER!));
+    assert.ok(page, 'The dedicated test renderer must be available');
+    const ws = new WebSocket(page.webSocketDebuggerUrl);
+    await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
     try {
+      await cdpRequest(ws, 'Page.bringToFront');
+      await cdpRequest(ws, 'Emulation.setFocusEmulationEnabled', { enabled: true });
       for (const above of [true, false]) {
         await config.update('hover.above', above, vscode.ConfigurationTarget.Global);
         await showNativeHoverAt(editor, anchor, 'LargeHoverModel', 'model: LargeHoverModel', 'left', true);
@@ -5495,69 +5635,61 @@ suite('Hover Renderer E2E', () => {
       }
       // Link bounds are collected after wrapping in one animation frame. The
       // actual native click path must still drill and return from the resized panel.
-      const pages = JSON.parse(await httpGet(`http://127.0.0.1:${process.env.IR_TEST_REMOTE_DEBUGGING_PORT}/json/list`));
-      const page = pages.find((p: any) => p.type === 'page' && p.title.includes(process.env.IR_TEST_WINDOW_MARKER!));
-      assert.ok(page, 'The dedicated test renderer must be available');
-      const ws = new WebSocket(page.webSocketDebuggerUrl);
-      await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
       const capture = async (name: string) => {
         if (!process.env.IR_DRILL_CAPTURE_DIR) { return; }
         fs.mkdirSync(process.env.IR_DRILL_CAPTURE_DIR, { recursive: true });
         const shot = await cdpRequest(ws, 'Page.captureScreenshot', { format: 'png' });
         fs.writeFileSync(path.join(process.env.IR_DRILL_CAPTURE_DIR, `${name}.png`), Buffer.from(shot.data, 'base64'));
       };
-      try {
-        await cdpRequest(ws, 'Page.bringToFront');
-        for (let cycle = 0; cycle < 2; cycle++) {
-          const clickRows = await vscode.commands.executeCommand<any[]>(
-            'intellisenseRecursion.runHoverLinkClickHarnessForTests', 'BaseModel');
-          const click = (clickRows || []).map(row => row?.value).find(value => value?.ok);
-          assert.ok(click, `The resized native hover must expose its type link. ${JSON.stringify(clickRows)}`);
-          assertStrictNativeHoverLinkClick(click, 'Content-aware hover type link');
-          await waitForPreviewIdentifier('BaseModel', 14000);
-          const drilled = await waitForHoverDomState([], ['class BaseModel', 'def save'], 14000, true, true, ['field_070']);
-          assertActualVsCodeHoverRoot(drilled, 'Drilled content-aware hover');
-          const geometry = await waitForNativeHoverGeometry({
-            symbol: 'LargeHoverModel', lineFragment: 'model: LargeHoverModel', expectedColumn: 'left',
-            expectedTextFragments: ['class BaseModel', 'def save'], absentTextFragments: ['field_070'],
-          });
-          assertNativeHoverGeometry(geometry, 'Drilled content-aware hover', 0, ['class BaseModel', 'def save']);
-          await sleep(300);
-          const sizing = await cdpRequest(ws, 'Runtime.evaluate', {
-            expression: `(function(){var h=window.__irActiveHoverEl,w=h&&h.closest('.monaco-resizable-hover'),s=h&&window.__irTestHooks.primaryHoverScroller(h);return {height:w&&w.getBoundingClientRect().height,scrollRange:s&&s.scrollHeight-s.clientHeight};})()`, returnByValue: true,
-          });
-          assert.ok(sizing.result?.value?.height > 200 && sizing.result.value.scrollRange < 10,
-            `The short drilled page should grow to fit its content after layout. ${JSON.stringify(sizing)}`);
-          if (cycle === 0) { await capture('drilled-BaseModel'); }
+      for (let cycle = 0; cycle < 2; cycle++) {
+        const clickRows = await vscode.commands.executeCommand<any[]>(
+          'intellisenseRecursion.runHoverLinkClickHarnessForTests', 'BaseModel');
+        const click = (clickRows || []).map(row => row?.value).find(value => value?.ok);
+        assert.ok(click, `The resized native hover must expose its type link. ${JSON.stringify(clickRows)}`);
+        assertStrictNativeHoverLinkClick(click, 'Content-aware hover type link');
+        await waitForPreviewIdentifier('BaseModel', 14000);
+        const drilled = await waitForHoverDomState([], ['class BaseModel', 'def save'], 14000, true, true, ['field_070']);
+        assertActualVsCodeHoverRoot(drilled, 'Drilled content-aware hover');
+        const geometry = await waitForNativeHoverGeometry({
+          symbol: 'LargeHoverModel', lineFragment: 'model: LargeHoverModel', expectedColumn: 'left',
+          expectedTextFragments: ['class BaseModel', 'def save'], absentTextFragments: ['field_070'],
+        });
+        assertNativeHoverGeometry(geometry, 'Drilled content-aware hover', 0, ['class BaseModel', 'def save']);
+        await sleep(300);
+        const sizing = await cdpRequest(ws, 'Runtime.evaluate', {
+          expression: `(function(){var h=window.__irActiveHoverEl,w=h&&h.closest('.monaco-resizable-hover'),s=h&&window.__irTestHooks.primaryHoverScroller(h);return {height:w&&w.getBoundingClientRect().height,scrollRange:s&&s.scrollHeight-s.clientHeight};})()`, returnByValue: true,
+        });
+        assert.ok(sizing.result?.value?.height > 200 && sizing.result.value.scrollRange < 10,
+          `The short drilled page should grow to fit its content after layout. ${JSON.stringify(sizing)}`);
+        if (cycle === 0) { await capture('drilled-BaseModel'); }
 
-          // Press the painted Back button through CDP, including hit testing.
-          const back = await cdpRequest(ws, 'Runtime.evaluate', { expression: `(function(){
-            var root=window.__irActiveHoverEl;
-            var button=root&&root.querySelector('.ir-back-btn,a[href*="intellisenseRecursion.previewBack"],a[data-href*="intellisenseRecursion.previewBack"]');
-            if(!button)return null;
-            var r=button.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;
-            var hit=document.elementFromPoint(x,y);
-            return {x:x,y:y,hittable:r.width>0&&r.height>0&&(hit===button||button.contains(hit))};
-          })()`, returnByValue: true });
-          const point = back.result?.value;
-          assert.ok(point?.hittable, `The real Back button must be hittable. ${JSON.stringify(back)}`);
-          await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y });
-          await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: point.x, y: point.y, button: 'left', buttons: 1, clickCount: 1 });
-          await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: point.x, y: point.y, button: 'left', buttons: 0, clickCount: 1 });
-          await waitForPreviewIdentifier(null, 14000);
-          const restored = await waitForHoverDomState(['BaseModel'], ['class LargeHoverModel', 'field_070'], 14000, true, true, ['def save']);
-          assertActualVsCodeHoverRoot(restored, 'Restored content-aware hover');
-          const restoredGeometry = await waitForNativeHoverGeometry({
-            symbol: 'LargeHoverModel', lineFragment: 'model: LargeHoverModel', expectedColumn: 'left',
-            expectedTextFragments: ['class LargeHoverModel', 'field_070'], absentTextFragments: ['def save'],
-          });
-          assertNativeHoverGeometry(restoredGeometry, 'Restored content-aware hover', 0, ['class LargeHoverModel']);
-          if (cycle === 0) { await capture('restored-LargeHoverModel'); }
-        }
-      } finally {
-        ws.close();
+        // Press the painted Back button through CDP, including hit testing.
+        const back = await cdpRequest(ws, 'Runtime.evaluate', { expression: `(function(){
+          var root=window.__irActiveHoverEl;
+          var button=root&&root.querySelector('.ir-back-btn,a[href*="intellisenseRecursion.previewBack"],a[data-href*="intellisenseRecursion.previewBack"]');
+          if(!button)return null;
+          var r=button.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;
+          var hit=document.elementFromPoint(x,y);
+          return {x:x,y:y,hittable:r.width>0&&r.height>0&&(hit===button||button.contains(hit))};
+        })()`, returnByValue: true });
+        const point = back.result?.value;
+        assert.ok(point?.hittable, `The real Back button must be hittable. ${JSON.stringify(back)}`);
+        await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseMoved', x: point.x, y: point.y });
+        await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mousePressed', x: point.x, y: point.y, button: 'left', buttons: 1, clickCount: 1 });
+        await cdpRequest(ws, 'Input.dispatchMouseEvent', { type: 'mouseReleased', x: point.x, y: point.y, button: 'left', buttons: 0, clickCount: 1 });
+        await waitForPreviewIdentifier(null, 14000);
+        const restored = await waitForHoverDomState(['BaseModel'], ['class LargeHoverModel', 'field_070'], 14000, true, true, ['def save']);
+        assertActualVsCodeHoverRoot(restored, 'Restored content-aware hover');
+        const restoredGeometry = await waitForNativeHoverGeometry({
+          symbol: 'LargeHoverModel', lineFragment: 'model: LargeHoverModel', expectedColumn: 'left',
+          expectedTextFragments: ['class LargeHoverModel', 'field_070'], absentTextFragments: ['def save'],
+        });
+        assertNativeHoverGeometry(restoredGeometry, 'Restored content-aware hover', 0, ['class LargeHoverModel']);
+        if (cycle === 0) { await capture('restored-LargeHoverModel'); }
       }
     } finally {
+      await cdpRequest(ws, 'Emulation.setFocusEmulationEnabled', { enabled: false });
+      ws.close();
       await config.update('hover.above', previousAbove, vscode.ConfigurationTarget.Global);
       await vscode.commands.executeCommand('editor.action.hideHover');
     }
@@ -5582,6 +5714,7 @@ suite('Hover Renderer E2E', () => {
       await new Promise<void>((resolve, reject) => { ws.once('open', resolve); ws.once('error', reject); });
       try {
         await cdpRequest(ws, 'Page.bringToFront');
+        await cdpRequest(ws, 'Emulation.setFocusEmulationEnabled', { enabled: true });
         const doc = await vscode.workspace.openTextDocument(vscode.Uri.file(
           path.join(vscode.workspace.workspaceFolders![0].uri.fsPath, 'service.py')));
         const editor = await vscode.window.showTextDocument(doc);
@@ -5722,6 +5855,7 @@ suite('Hover Renderer E2E', () => {
             'Short-content height must grow beyond its natural size');
         }
       } finally {
+        await cdpRequest(ws, 'Emulation.setFocusEmulationEnabled', { enabled: false });
         ws.close();
         await vscode.commands.executeCommand('editor.action.hideHover');
         await sleep(1500);

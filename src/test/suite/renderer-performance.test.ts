@@ -7,10 +7,12 @@ import { cdpRequest, withRendererInputCdpSessionForTests } from '../../cdp-eval'
 import { getHoverPatchScript } from '../../renderer-patch';
 
 suite('Renderer performance', () => {
-  suiteSetup(function () {
+  suiteSetup(async function () {
     if (path.basename(vscode.workspace.workspaceFolders?.[0]?.uri.fsPath || '') !== 'python') {
       this.skip();
     }
+    await vscode.workspace.getConfiguration('window').update('title',
+      `${process.env.IR_TEST_WINDOW_MARKER} — \${rootName}`, vscode.ConfigurationTarget.Global);
   });
 
   test('measures collection hooks and unrelated workbench updates', async function () {
@@ -24,6 +26,8 @@ suite('Renderer performance', () => {
     await vscode.commands.executeCommand('intellisenseRecursion.runHoverRendererHarnessForTests', 'performance');
     console.log('  performance: renderer initialized');
     const report = await withRendererInputCdpSessionForTests(async ws => {
+      await cdpRequest(ws, 'Page.bringToFront');
+      await cdpRequest(ws, 'Emulation.setFocusEmulationEnabled', { enabled: true });
       await cdpRequest(ws, 'Performance.enable');
       const evaluate = async (expression: string) => {
         const result = await cdpRequest(ws, 'Runtime.evaluate', {
@@ -35,6 +39,33 @@ suite('Renderer performance', () => {
       // Give startup observers a chance to settle before both baseline and
       // optimized runs. Wall-clock numbers are diagnostic, not CI thresholds.
       await new Promise(resolve => setTimeout(resolve, 2500));
+      const pointerMotion = await evaluate(`(function() {
+        var mount = document.createElement('div');
+        mount.className = 'ir-perf-pointer-target';
+        document.body.appendChild(mount);
+        var queries = 0, geometryReads = 0, closestCalls = 0;
+        var originalQuery = Document.prototype.querySelector;
+        var originalRect = Element.prototype.getBoundingClientRect;
+        var originalClosest = Element.prototype.closest;
+        Document.prototype.querySelector = function() { queries++; return originalQuery.apply(this, arguments); };
+        Element.prototype.getBoundingClientRect = function() { geometryReads++; return originalRect.apply(this, arguments); };
+        Element.prototype.closest = function() { closestCalls++; return originalClosest.apply(this, arguments); };
+        var start = performance.now();
+        try {
+          for (var i = 0; i < 1000; i++) {
+            var init = {bubbles:true, clientX:100+i%200, clientY:100+i%50};
+            mount.dispatchEvent(new PointerEvent('pointermove', init));
+            mount.dispatchEvent(new MouseEvent('mousemove', init));
+          }
+          return {moves:1000, elapsedMs:performance.now()-start, queries:queries,
+            geometryReads:geometryReads, closestCalls:closestCalls};
+        } finally {
+          Document.prototype.querySelector = originalQuery;
+          Element.prototype.getBoundingClientRect = originalRect;
+          Element.prototype.closest = originalClosest;
+          mount.remove();
+        }
+      })()`);
       const collections = await evaluate(`(function() {
         var records = Array.from({length: 50000}, function(_, i) { return {index: i}; });
         var samples = [];
@@ -121,7 +152,8 @@ suite('Renderer performance', () => {
         if (captured.indexOf(window.__irCapturedEditor) >= 0) window.__irCapturedEditor = null;
         return {created: captured.length, retainedBeforeDispose: before, retainedAfterDispose: after};
       })()`);
-      return {collections, mutations, metrics, retention};
+      await cdpRequest(ws, 'Emulation.setFocusEmulationEnabled', { enabled: false });
+      return {pointerMotion, collections, mutations, metrics, retention};
     });
     const label = process.env.IR_PERF_LABEL || 'current';
     const output = path.join(os.tmpdir(), `ir-renderer-perf-${label}.json`);
@@ -129,6 +161,10 @@ suite('Renderer performance', () => {
     fs.writeFileSync(output, JSON.stringify(payload, null, 2));
     console.log(`Renderer performance: ${JSON.stringify(payload)}\nReport: ${output}`);
     assert.strictEqual(report.mutations.batches, 40);
+    assert.strictEqual(report.pointerMotion.queries, 0,
+      'Pointer movement outside hovers must not query the document');
+    assert.strictEqual(report.pointerMotion.geometryReads, 0,
+      'Pointer movement outside hovers must not measure layout');
     assert.ok(report.mutations.queries < 100,
       `Ordinary editor painting must not scan every added token row: ${JSON.stringify(report.mutations)}`);
     assert.strictEqual(report.retention.retainedAfterDispose, 0,
@@ -164,5 +200,62 @@ suite('Renderer performance', () => {
     } finally {
       await vscode.commands.executeCommand('workbench.action.closeGroup');
     }
+  });
+
+  test('diagnostics release listeners and observers on disable and reinjection', async function () {
+    this.timeout(30000);
+    await vscode.extensions.getExtension('newdlops.intellisense-recursion')!.activate();
+    await vscode.commands.executeCommand('intellisenseRecursion.runHoverRendererHarnessForTests', 'performance');
+    await withRendererInputCdpSessionForTests(async ws => {
+      await cdpRequest(ws, 'Page.bringToFront');
+      await cdpRequest(ws, 'Emulation.setFocusEmulationEnabled', { enabled: true });
+      const evaluate = async (expression: string) => {
+        const result = await cdpRequest(ws, 'Runtime.evaluate', {
+          expression, returnByValue: true, awaitPromise: true, includeCommandLineAPI: true,
+        });
+        assert.ok(!result.exceptionDetails, JSON.stringify(result.exceptionDetails));
+        return result.result.value;
+      };
+      const countListeners = 'Object.values(getEventListeners(document)).reduce((n,list)=>n+list.length,0)';
+      try {
+        const baseline = await evaluate(countListeners);
+        const initiallyOff = await evaluate('window.__irHoverEventLogConfig.enabled===false&&!window.__irLongTaskObs');
+        assert.ok(initiallyOff, 'Diagnostic instrumentation must stay dormant at startup');
+        for (let cycle = 0; cycle < 3; cycle++) {
+          await evaluate('window.__irHoverEventLogConfig.enabled=true');
+          assert.strictEqual(await evaluate(countListeners), baseline + 22);
+          const recorded = await evaluate(`(async function(){
+            var probe=document.createElement('div');
+            probe.className='monaco-hover';
+            document.body.appendChild(probe);
+            await new Promise(requestAnimationFrame);
+            await new Promise(requestAnimationFrame);
+            probe.dispatchEvent(new MouseEvent('mousemove',{bubbles:true,clientX:10,clientY:10}));
+            probe.setAttribute('aria-hidden','true');
+            await Promise.resolve();
+            var kinds=window.__irHEDrain().events.map(e=>e.kind);
+            probe.remove();
+            return {event:kinds.includes('evt'),attribute:kinds.includes('attr')};
+          })()`);
+          assert.deepStrictEqual(recorded, { event: true, attribute: true });
+          if (cycle === 1) {
+            // Upgrade while diagnostics are enabled. Cleanup must remove the
+            // old closures before another patch installs its own listeners.
+            await evaluate('window.__irCleanup("resource-test")');
+            await evaluate(getHoverPatchScript());
+            assert.strictEqual(await evaluate(countListeners), baseline + 22);
+          }
+          const disabled = await evaluate('window.__irSetHoverEventLogging(false)');
+          assert.deepStrictEqual(disabled, {
+            enabled: false, listeners: 0, observedHovers: 0, bodyObserver: false, longTaskObserver: false,
+          });
+          assert.strictEqual(await evaluate(countListeners), baseline);
+          assert.strictEqual(await evaluate('window.__irHoverEventLog.length'), 0);
+        }
+      } finally {
+        await evaluate('window.__irSetHoverEventLogging(false)').catch(() => undefined);
+        await cdpRequest(ws, 'Emulation.setFocusEmulationEnabled', { enabled: false });
+      }
+    });
   });
 });
