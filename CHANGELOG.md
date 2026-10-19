@@ -5,6 +5,21 @@ All notable changes to the IntelliSense Recursion extension.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.6052] - 2026-10-20
+
+### Added
+- Pin a native hover from a visible button or the **IR: Pin Hover at Cursor**
+  command, with no dragging required. The action remains reachable while
+  scrolling and reuses the complete, independent detached-preview session.
+- Close a focused pinned window with Escape, or Enter on Close, and return
+  keyboard focus to its connected editor. Other pinned windows stay open.
+
+### Fixed
+- Wait for native code highlighting before explicitly pinning a hover, so the
+  snapshot cannot freeze an unfinished asynchronous code block.
+- Keep saved scroll offsets through delayed layout and focus changes. Stop
+  pending restoration when the user scrolls, interacts or starts new navigation.
+
 ## [0.2.6051] - 2026-10-20
 
 ### Added

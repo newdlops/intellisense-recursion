@@ -1,5 +1,73 @@
 # Renderer performance
 
+## Explicit Pin release 0.2.6052 / patch 325
+
+2026-10-20. Native hovers now offer a sticky Pin action and the
+`IR: Pin Hover at Cursor` command. Both reuse complete detached snapshots and
+isolated preview sessions. The command uses normal native Show Hover when the
+palette dismissed the tooltip; missing hover/editor states create no empty
+window, and concurrent invocations share one operation. Native wrapper sizing
+and resize sashes remain owned by VS Code.
+
+Pin waits for native asynchronous code-block highlighting. A cloned unfinished
+placeholder would not inherit the callback that replaces it. The action shows a
+preparing status while disabled, and the command waits briefly before returning
+an informative native notification. A focused pinned window closes with Enter
+on Close or Escape, returning focus to its connected editor. When Back hides,
+focus moves to Close instead of disappearing with the button.
+
+Rendered tests exposed two independent scroll hazards: browser anchoring while
+Markdown blocks are consolidated, and offsets clamped against temporary layout
+heights. Detached scrollers disable browser anchoring, and Pin/Back share a
+restoration bounded to four animation frames. New navigation, closing or direct
+scroll/pointer/key input invalidates pending restoration. No source lines,
+comments, docstrings, token classes or history pages are removed by this change.
+
+### Functional and visual verification
+
+The final shipping bundle passed 18 checks in VS Code 1.142.0 on macOS ARM64.
+The existing 16 content/candidate/startup/recovery checks and two Pin checks
+cover real pointer Pin, wheel scrolling with a reachable sticky action, the
+public command, actual command-palette keyboard input, coalesced invocations,
+Shift+Tab/Enter on Back, Enter on Close, Escape and editor focus restoration.
+The Pin test compares all rendered source text and ordered token classes for
+10,025 source detail lines, then verifies the exact saved offset after Pin and
+Back. Independent panels and missing hover/editor guards are included.
+
+Fourteen additional development-build checks passed for renderer performance,
+cache budgets, preview file links, real detached preview transport/session
+isolation and repeated native sizing/forward/Back behavior. The pointer workload
+performed zero document queries and zero geometry reads for 1,000 movement pairs
+(9.3 ms in this run). Forty editor paint batches used two queries and zero
+geometry reads; none of 64 disposed probes remained retained. These are existing
+regression checks, not general CPU/GPU, memory or interaction-speed claims.
+[Release measurements](../reports/ui-audit-2026-10-20/renderer-release-6052.json)
+retain the complete workload report.
+
+Screenshots were inspected at 1440 × 900 for initial and scrolled native Pin,
+the new detached panel, two independent pinned panels and a 250px-wide panel.
+The prior long-source final-line highlighting, native sash and Retry cases
+remain part of the release checks. This is desktop/panel QA; whole mobile and
+tablet viewports, other operating systems, light/high-contrast themes and screen
+readers were not checked. The focused-document fallback was exercised by the
+isolated Electron tests; multiple OS-level workbench windows were not tested.
+
+Impeccable's detector completed without findings. Source review against the
+Web Interface Guidelines checked button semantics and names, decorative icon
+labels, focus-visible styling, live preparing/error status, sticky focus padding
+and the keyboard alternative to dragging. This is a scoped review, not a claim
+that the existing product's remaining keyboard type-navigation gap is resolved.
+
+```sh
+npm run bundle
+IR_VSCODE_VERSION=1.142.0 IR_TEST_PRODUCTION_INJECTION=1 IR_E2E_FILES=renderer-startup.test.js,hover-link-candidates.test.js,hover-content.test.js,preview-content.test.js,preview-content-renderer.test.js,detached-preview-recovery.test.js,pin-hover.test.js TEST_FIXTURE=python node out/test/runTest.js
+
+npm run compile
+IR_VSCODE_VERSION=1.142.0 IR_PERF_LABEL=release-6052-final IR_E2E_FILES=renderer-performance.test.js,preview-cache-budget.test.js,preview-file-link.test.js,hover.test.js IR_E2E_GREP='Renderer performance|Preview cache resource budgets|Preview file path links|detached hover links use an isolated end-to-end preview protocol|content-aware native hover stays adjacent' TEST_FIXTURE=python node out/test/runTest.js
+
+npm run bundle
+```
+
 ## Preview recovery release 0.2.6051 / patch 324
 
 2026-10-20. Failed detached previews now retain the current complete source and

@@ -1,0 +1,27 @@
+{
+  "version": "0.2.6052",
+  "rendererPatch": 325,
+  "environment": {
+    "vscode": "1.142.0",
+    "platform": "darwin",
+    "architecture": "arm64"
+  },
+  "checks": {
+    "productionBundlePassed": 18,
+    "compatibilityAndPerformancePassed": 14,
+    "sourceDetailLinesPreserved": 10025,
+    "desktopCapture": { "width": 1440, "height": 900 },
+    "narrowDetachedPanelWidth": 250,
+    "interactions": ["mouse Pin", "public Pin command", "command-palette keyboard Pin", "concurrent command coalescing", "Shift+Tab and Enter Back", "Enter Close", "Escape Close", "editor focus restoration", "missing hover", "missing editor"],
+    "reviewedStates": ["native Pin", "scrolled sticky Pin", "independent pinned windows", "narrow panel", "restored highlighted tail", "native resize"]
+  },
+  "artifact": {
+    "name": "intellisense-recursion-0.2.6052.vsix",
+    "files": 19,
+    "bytes": 1923414,
+    "sha256": "ff7d6d218d0674ee771cfb119ce52df8ae9cdecdf697c7df64251a904fb0b88b",
+    "extensionSha256": "232a29cee024ecbe20830a3062764a8f480c5f43d8e1a6dd8d144c871bd608f7",
+    "sidecarSha256": "b0aa881933ee4cff32e903cf21538f9ae5439983278eec041adfe8e1d57de620"
+  },
+  "limitations": ["Other operating systems", "Whole mobile or tablet viewports", "Light and high-contrast themes", "Screen readers", "Multiple OS-level workbench windows", "Whole-process CPU/GPU and memory measurements"]
+}

@@ -135,10 +135,12 @@
 //   source, syntax highlighting and on-demand links beyond that budget stay whole.
 // v324: explain detached preview failures and retry within the same window,
 //   retaining the complete source, scroll position and navigation history.
+// v325: expose explicit Pin and a keyboard command without changing source
+//   rendering, and return focus to the editor when closing a focused panel.
 // If the running window still logs v<300, the new build is NOT loaded yet.
 import { parsePreviewFileLink } from './preview-file-link';
 
-export const RENDERER_PATCH_VERSION = 324;
+export const RENDERER_PATCH_VERSION = 325;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -354,6 +356,8 @@ window.__irCleanup=function(reason){
     if(window.__irCancelScan)window.__irCancelScan();
     if(window.__irPatchEditorRetryTimer){clearTimeout(window.__irPatchEditorRetryTimer);window.__irPatchEditorRetryTimer=null;}
     window.irRefireNativeHoverAtAnchor=null;
+    window.irPinVisibleHover=null;
+    try{irRemoveNativePinActions();}catch(_){}
     try{irClearClickPinnedHover('patch-cleanup',false);}catch(_){}
     try{irClearDetachedHovers('patch-cleanup');}catch(_){}
     try{
@@ -541,6 +545,13 @@ style.textContent=[
   '.monaco-resizable-hover .monaco-hover,.monaco-resizable-hover .monaco-editor-hover{display:flex !important;flex-direction:column !important;width:min(max-content,680px) !important;height:100% !important;min-width:0 !important;min-height:0 !important;max-width:680px !important;max-height:48vh !important;visibility:visible !important}',
   '.monaco-resizable-hover .monaco-hover .monaco-scrollable-element,.monaco-resizable-hover .monaco-editor-hover .monaco-scrollable-element{flex:1 1 auto !important;width:calc(100% - 2px) !important;height:auto !important;max-width:calc(100% - 2px) !important;max-height:none !important;min-width:0 !important;min-height:0 !important;overflow:auto !important;overscroll-behavior:contain !important;margin:1px !important}',
   '.monaco-resizable-hover .monaco-hover .monaco-hover-content,.monaco-resizable-hover .monaco-hover .hover-row,.monaco-resizable-hover .monaco-hover .hover-row-contents,.monaco-resizable-hover .monaco-hover .markdown-hover,.monaco-resizable-hover .monaco-hover .rendered-markdown{width:auto !important;height:auto !important;max-width:100% !important;max-height:none !important;min-width:0 !important;min-height:0 !important;overflow:visible !important}',
+  '.monaco-resizable-hover .ir-native-hover-actions{position:sticky !important;top:0 !important;z-index:8 !important;display:flex !important;align-items:center !important;justify-content:flex-end !important;box-sizing:border-box !important;width:100% !important;height:28px !important;min-height:28px !important;padding:1px 5px !important;background:var(--vscode-editorHoverWidget-statusBarBackground,var(--vscode-editorHoverWidget-background)) !important;border-bottom:1px solid var(--vscode-editorHoverWidget-border,var(--vscode-focusBorder)) !important}',
+  '.monaco-resizable-hover .monaco-scrollable-element:has(.ir-native-hover-actions){scroll-padding-top:28px !important}',
+  '.ir-native-hover-status{flex:1 1 auto !important;min-width:0 !important;overflow:hidden !important;text-overflow:ellipsis !important;white-space:nowrap !important;color:var(--vscode-descriptionForeground,var(--vscode-foreground)) !important;font:400 12px/1.2 var(--vscode-font-family,sans-serif) !important}',
+  '.ir-native-hover-pin{display:inline-flex !important;align-items:center !important;justify-content:center !important;gap:4px !important;box-sizing:border-box !important;height:24px !important;min-height:24px !important;min-width:48px !important;padding:0 6px !important;border:1px solid var(--vscode-contrastBorder,var(--vscode-focusBorder)) !important;border-radius:4px !important;background:var(--vscode-button-secondaryBackground,var(--vscode-toolbar-hoverBackground)) !important;color:var(--vscode-button-secondaryForeground,var(--vscode-foreground)) !important;font:600 12px/1.2 var(--vscode-font-family,sans-serif) !important;cursor:pointer !important;pointer-events:auto !important}',
+  '.ir-native-hover-pin:hover{background:var(--vscode-toolbar-hoverBackground) !important}',
+  '.ir-native-hover-pin:focus-visible{outline:2px solid var(--vscode-focusBorder) !important;outline-offset:-2px !important}',
+  '.ir-native-hover-pin:disabled{opacity:.6 !important;cursor:default !important}',
   // The drilled hover's wrapper transiently grows to viewport size
   // (e.g., 1800×1069) during content swap before settling. Log
   // analysis showed 63+ "visible" frames at that size. Hard-clamp
@@ -681,6 +692,9 @@ style.textContent=[
   '.ir-detached-hover-title{flex:1 1 auto !important;min-width:0 !important;overflow:hidden !important;text-overflow:ellipsis !important;white-space:nowrap !important;font:600 12px/1.2 var(--vscode-font-family,sans-serif) !important;pointer-events:auto !important}',
   '.ir-detached-hover.ir-detached-hover > .ir-detached-hover-root.ir-detached-hover-root,.ir-detached-hover.ir-detached-hover .monaco-hover.ir-detached-hover-root,.ir-detached-hover.ir-detached-hover .monaco-editor-hover.ir-detached-hover-root{position:static !important;inset:auto !important;z-index:auto !important;display:flex !important;flex:1 1 auto !important;flex-direction:column !important;box-sizing:border-box !important;width:100% !important;height:auto !important;min-width:0 !important;min-height:0 !important;max-width:100% !important;max-height:100% !important;margin:0 !important;transform:none !important;overflow:hidden !important;visibility:visible !important;opacity:1 !important;pointer-events:auto !important;cursor:text !important;user-select:text !important;-webkit-user-select:text !important;border:0 !important;border-radius:0 !important;outline:0 !important;box-shadow:none !important}',
   '.ir-detached-hover.ir-detached-hover .monaco-hover .monaco-scrollable-element,.ir-detached-hover.ir-detached-hover .monaco-editor-hover .monaco-scrollable-element{position:static !important;inset:auto !important;top:auto !important;left:auto !important;right:auto !important;bottom:auto !important;transform:none !important;display:block !important;flex:1 1 auto !important;box-sizing:border-box !important;width:calc(100% - 2px) !important;height:auto !important;min-width:0 !important;min-height:0 !important;max-width:calc(100% - 2px) !important;max-height:calc(100% - 2px) !important;margin:1px !important;overflow:auto !important;overscroll-behavior:contain !important;scrollbar-width:auto !important;scrollbar-color:auto !important;visibility:visible !important;pointer-events:auto !important;cursor:text !important;user-select:text !important;-webkit-user-select:text !important}',
+  // Saved viewport restoration owns this scroller. Browser anchoring during
+  // Markdown consolidation must not replace that offset with another block.
+  '.ir-detached-hover .monaco-scrollable-element{overflow-anchor:none !important}',
   '.ir-detached-hover.ir-detached-hover .monaco-hover-content,.ir-detached-hover.ir-detached-hover .hover-row,.ir-detached-hover.ir-detached-hover .hover-row-contents,.ir-detached-hover.ir-detached-hover .markdown-hover,.ir-detached-hover.ir-detached-hover .rendered-markdown{width:auto !important;height:auto !important;min-width:0 !important;min-height:0 !important;max-width:100% !important;max-height:none !important;overflow:visible !important;visibility:visible !important}',
   '.ir-detached-hover.ir-detached-hover .monaco-hover-content{position:static !important;inset:auto !important;top:auto !important;left:auto !important;right:auto !important;bottom:auto !important;transform:none !important}',
   '.ir-detached-hover.ir-detached-hover .hover-row{display:flex !important}',
@@ -5335,6 +5349,9 @@ function irRemoveDetachedHover(stateOrEl,reason){
   try{
     var state=stateOrEl&&stateOrEl.el?stateOrEl:irDetachedHoverStateFromElement(stateOrEl);
     if(!state)return false;
+    var restoreFocus=!!(/^(close-button|close-pointerdown|keyboard-escape)$/.test(String(reason||''))
+      &&state.el&&state.el.contains(document.activeElement));
+    var originEditor=state.originEditor||state.tokenizationEditor;
     if(window.__irHoverDragActive&&window.__irHoverDragActive.state===state)window.__irHoverDragActive=null;
     if(window.__irHoverDragCandidate&&window.__irHoverDragCandidate.state===state){
       irReleaseHoverDragPointerCapture(window.__irHoverDragCandidate);
@@ -5363,9 +5380,16 @@ function irRemoveDetachedHover(stateOrEl,reason){
     state.pageStack=null;
     state.currentPage=null;
     state.tokenizationEditor=null;
+    state.originEditor=null;
     state.linkScrollTarget=null;
     state.linkScrollListener=null;
     irHERecord('hover-detached-closed',{reason:String(reason||'close'),remaining:list.length});
+    if(restoreFocus&&originEditor){
+      try{
+        var originDom=typeof originEditor.getDomNode==='function'?originEditor.getDomNode():null;
+        if(originDom&&originDom.isConnected&&typeof originEditor.focus==='function')originEditor.focus();
+      }catch(_){ }
+    }
     return true;
   }catch(_){return false}
 }
@@ -5436,7 +5460,7 @@ function irCreateDetachedHoverSnapshot(pin){
     for(var hi=deadHandles.length-1;hi>=0;hi--){
       try{if(deadHandles[hi].parentNode)deadHandles[hi].parentNode.removeChild(deadHandles[hi]);}catch(_){ }
     }
-    var deadActions=clone.querySelectorAll?clone.querySelectorAll('.hover-copy-button,.verbosity-actions,.verbosity-actions-container,.hover-row > .actions,.hover-row .action-container'):[];
+    var deadActions=clone.querySelectorAll?clone.querySelectorAll('.ir-native-hover-actions,.hover-copy-button,.verbosity-actions,.verbosity-actions-container,.hover-row > .actions,.hover-row .action-container'):[];
     for(var ai=deadActions.length-1;ai>=0;ai--){
       try{if(deadActions[ai].parentNode)deadActions[ai].parentNode.removeChild(deadActions[ai]);}catch(_){ }
     }
@@ -5575,6 +5599,7 @@ function irCreateDetachedHoverSnapshot(pin){
       currentPage:{kind:'live',typeName:'',md:null},
       pageStack:[],
       tokenizationEditor:pin.editor||(pin.widget&&pin.widget._editor)||null,
+      originEditor:pin.editor||(pin.widget&&pin.widget._editor)||null,
       createdAt:Date.now(),
       capturedScrollTop:(function(){
         for(var si=0;si<scrollOffsets.length;si++)if(scrollOffsets[si].top)return scrollOffsets[si].top;
@@ -5599,8 +5624,9 @@ function irCreateDetachedHoverSnapshot(pin){
       if(primaryScrollLeft)clonePrimaryScroller.scrollLeft=primaryScrollLeft;
     }
     for(var vr=0;vr<vtailRenders.length;vr++)try{vtailRenders[vr]();}catch(_){ }
+    var capturedScrollEpoch=Number(state.scrollRestoreEpoch)||0;
     try{requestAnimationFrame(function(){
-      if(!state.el||!state.root)return;
+      if(!state.el||!state.root||(Number(state.scrollRestoreEpoch)||0)!==capturedScrollEpoch)return;
       irRestoreHoverScrollOffsets(state.el,scrollOffsets);
       var delayedScroller=irPrimaryHoverScroller(state.root);
       if(delayedScroller){
@@ -5693,6 +5719,25 @@ function irRestoreDetachedPageScroll(state,scroll){
     sc.scrollLeft=Math.max(0,Number(scroll&&scroll.left)||0);
   }catch(_){ }
 }
+function irCancelDetachedScrollRestore(state){
+  if(state)state.scrollRestoreEpoch=(Number(state.scrollRestoreEpoch)||0)+1;
+}
+function irRestoreDetachedPageScrollAfterLayout(state,scroll,requestId){
+  try{
+    irCancelDetachedScrollRestore(state);
+    var epoch=state.scrollRestoreEpoch,attempts=0;
+    var restore=function(){
+      if(!state.el||Number(state.previewRequestSeq)!==requestId||state.scrollRestoreEpoch!==epoch)return;
+      irRestoreDetachedPageScroll(state,scroll);
+      var sc=irPrimaryHoverScroller(state.root);
+      // Wait through a painted frame even if the first offset happened to
+      // fit: newly restored blocks can still be using intrinsic heights.
+      if(sc&&++attempts<4&&(attempts<2||Math.abs(sc.scrollTop-Number(scroll&&scroll.top||0))>1
+        ||Math.abs(sc.scrollLeft-Number(scroll&&scroll.left||0))>1))requestAnimationFrame(restore);
+    };
+    requestAnimationFrame(restore);
+  }catch(_){ }
+}
 function irDetachedPreviewFailureLabel(failure){
   var name=String(failure&&failure.typeName||'definition');
   var reason=String(failure&&failure.reason||'');
@@ -5721,6 +5766,7 @@ function irUpdateDetachedHoverChrome(state){
     if(state.backButton){
       var visible=!!(state.pageStack&&state.pageStack.length);
       var enabled=visible&&!state.previewBusy;
+      if(!visible&&document.activeElement===state.backButton&&state.closeButton)state.closeButton.focus({preventScroll:true});
       state.backButton.classList.toggle('ir-detached-hover-back-visible',visible);
       state.backButton.disabled=!enabled;
       state.backButton.setAttribute('aria-disabled',enabled?'false':'true');
@@ -5929,17 +5975,7 @@ function irDetachedHoverBack(state){
     // paint (content-visibility). Retry a few frames instead of accepting an
     // offset clamped against their temporary intrinsic height. A newer
     // navigation must never inherit this page's delayed scroll restoration.
-    try{
-      var restoreAttempts=0;
-      var restoreBackScroll=function(){
-        if(!state.el||Number(state.previewRequestSeq)!==nextRequestId)return;
-        irRestoreDetachedPageScroll(state,previous.scroll);
-        var sc=irPrimaryHoverScroller(state.root);
-        if(sc&&++restoreAttempts<4&&(Math.abs(sc.scrollTop-Number(previous.scroll&&previous.scroll.top||0))>1
-          ||Math.abs(sc.scrollLeft-Number(previous.scroll&&previous.scroll.left||0))>1))requestAnimationFrame(restoreBackScroll);
-      };
-      requestAnimationFrame(restoreBackScroll);
-    }catch(_){ }
+    irRestoreDetachedPageScrollAfterLayout(state,previous.scroll,nextRequestId);
     irUpdateDetachedHoverChrome(state);
     irHERecord('hover-detached-preview-back',{id:state.id,depth:state.pageStack.length,requestId:state.previewRequestSeq});
     return true;
@@ -6513,6 +6549,169 @@ function irPinNativeHoverRoot(root,controllerOverride){
     return pin;
   }catch(_){return null}
 }
+function irRemoveNativePinActions(){
+  var actions=document.querySelectorAll('.ir-native-hover-actions');
+  for(var i=0;i<actions.length;i++){
+    var root=actions[i].closest('.monaco-hover,.monaco-editor-hover');
+    if(root)root.__irPinToolbar=null;
+    actions[i].remove();
+  }
+}
+function irNativePinRenderingReady(root){
+  // Native Markdown briefly paints escaped code as text while its async
+  // renderer prepares the highlighted element. A clone cannot inherit that
+  // pending callback, so do not freeze an unfinished code block.
+  var blocks=root.querySelectorAll('.rendered-markdown .code[data-code]');
+  for(var i=0;i<blocks.length;i++)if(!blocks[i].childElementCount)return false;
+  return true;
+}
+function irRefreshNativePinAction(toolbar,root){
+  var ready=irNativePinRenderingReady(root);
+  toolbar.__irPinPending=!ready;
+  var button=toolbar.querySelector('.ir-native-hover-pin');
+  if(button)button.disabled=!ready;
+  toolbar.setAttribute('aria-busy',ready?'false':'true');
+  toolbar.title=ready?'':'Preparing source highlighting…';
+  var status=toolbar.querySelector('.ir-native-hover-status');
+  if(status&&status.textContent!==toolbar.title)status.textContent=toolbar.title;
+}
+function irEnsureNativePinAction(root){
+  try{
+    if(!IR_HOVER_NATIVE_ONLY||!root||irIsDetachedHoverRoot(root)||!root.closest('.monaco-resizable-hover'))return;
+    var toolbar=root.__irPinToolbar;
+    var source=toolbar&&toolbar.__irPinSource;
+    if(toolbar&&toolbar.isConnected&&source&&source.isConnected&&root.contains(source)&&source.hasChildNodes()){
+      if(toolbar.__irPinPending)irRefreshNativePinAction(toolbar,root);
+      return;
+    }
+    var block=root.querySelector('.rendered-markdown');
+    var content=root.querySelector('.monaco-hover-content');
+    if(!block||!block.hasChildNodes()||!content){
+      if(toolbar)toolbar.remove();
+      root.__irPinToolbar=null;
+      return;
+    }
+    if(toolbar)toolbar.remove();
+    toolbar=document.createElement('div');
+    toolbar.className='ir-native-hover-actions';
+    toolbar.setAttribute('role','group');
+    toolbar.setAttribute('aria-label','Hover actions');
+    var status=document.createElement('span');
+    status.className='ir-native-hover-status';
+    status.setAttribute('role','status');
+    status.setAttribute('aria-live','polite');
+    status.setAttribute('aria-atomic','true');
+    toolbar.appendChild(status);
+    var button=document.createElement('button');
+    button.className='ir-native-hover-pin';
+    button.type='button';
+    button.setAttribute('aria-label','Pin hover in a separate window');
+    button.title='Keep this hover open in a separate window';
+    var icon=document.createElement('span');
+    icon.className='codicon codicon-pin';
+    icon.setAttribute('aria-hidden','true');
+    var label=document.createElement('span');label.textContent='Pin';
+    button.appendChild(icon);button.appendChild(label);toolbar.appendChild(button);
+    toolbar.__irPinSource=block;
+    root.__irPinToolbar=toolbar;
+    content.insertBefore(toolbar,content.firstChild);
+    irRefreshNativePinAction(toolbar,root);
+    irScheduleContentAwareHoverSize(root);
+  }catch(_){ }
+}
+function irDetachNativeHoverExplicitly(root){
+  if(!root)return {ok:false,reason:'no-native-hover'};
+  var source=root.querySelector('.rendered-markdown');
+  if(!source||!String(source.textContent||'').trim())return {ok:false,reason:'no-native-hover'};
+  if(!irNativePinRenderingReady(root))return {ok:false,reason:'rendering-pending'};
+  var previous=window.__irClickPinnedHover;
+  var sc=irPrimaryHoverScroller(root);
+  var top=sc?sc.scrollTop:0,left=sc?sc.scrollLeft:0;
+  var pin=irPinNativeHoverRoot(root,null);
+  if(!pin||!irNativeHoverPinSourceIsVisible(pin))return {ok:false,reason:'no-native-hover'};
+  if(sc){sc.scrollTop=top;sc.scrollLeft=left;}
+  var state=irCreateDetachedHoverSnapshot(pin);
+  if(!state){
+    if(pin!==previous)irClearClickPinnedHover('pin-failed',false);
+    return {ok:false,reason:'snapshot-failed'};
+  }
+  irCancelHoverDragCandidate();
+  irReleaseNativeHoverAfterDetach(pin);
+  if(state.closeButton)state.closeButton.focus({preventScroll:true});
+  // Native dismissal and the focus hand-off can run their own scroll work.
+  // Apply the captured viewport after both have finished, to the new panel.
+  irRestoreDetachedPageScroll(state,{top:top,left:left});
+  irRestoreDetachedPageScrollAfterLayout(state,{top:top,left:left},Number(state.previewRequestSeq)||0);
+  return {ok:true,id:state.id,sessionKey:state.sessionKey};
+}
+window.irPinVisibleHover=function(expectedUri,expectedPosition){
+  try{
+    if(expectedUri&&!document.hasFocus())return {ok:false,reason:'window-not-focused'};
+    var wrappers=document.querySelectorAll('.monaco-resizable-hover');
+    for(var i=0;i<wrappers.length;i++){
+      var wrapper=wrappers[i],root=wrapper.querySelector('.monaco-hover,.monaco-editor-hover');
+      if(!root||!irNativeHoverPinSourceIsVisible({wrapper:wrapper,root:root}))continue;
+      var source=root.querySelector('.rendered-markdown');
+      if(!source||!String(source.textContent||'').trim())continue;
+      if(expectedUri){
+        var owner=irHoverPinOwnerForWrapper(wrapper),editor=owner.editor;
+        var model=editor&&typeof editor.getModel==='function'?editor.getModel():null;
+        if(!model||!model.uri||String(model.uri)!==String(expectedUri))continue;
+        var position=editor&&typeof editor.getPosition==='function'?editor.getPosition():null;
+        if(expectedPosition&&(!position||position.lineNumber!==expectedPosition.lineNumber||position.column!==expectedPosition.column))continue;
+      }
+      return irDetachNativeHoverExplicitly(root);
+    }
+    return {ok:false,reason:'no-native-hover'};
+  }catch(error){return {ok:false,reason:String(error&&error.message||error)}}
+};
+function irPinHoverControlClick(e){
+  var target=irEventElement(e&&e.target);
+  var button=target&&target.closest?target.closest('.ir-native-hover-pin'):null;
+  if(!button||button.disabled)return;
+  var root=button.closest('.monaco-hover,.monaco-editor-hover');
+  if(!root||!root.closest('.monaco-resizable-hover'))return;
+  e.preventDefault();e.stopImmediatePropagation();
+  button.disabled=true;
+  var result=irDetachNativeHoverExplicitly(root);
+  if(!result.ok){
+    var toolbar=button.closest('.ir-native-hover-actions');
+    if(result.reason==='rendering-pending'&&toolbar)irRefreshNativePinAction(toolbar,root);
+    else{
+      button.disabled=false;
+      var status=toolbar&&toolbar.querySelector('.ir-native-hover-status');
+      if(status)status.textContent='Could not pin. Try again.';
+    }
+  }
+}
+function irPinHoverControlPointerDown(e){
+  if(window.PointerEvent&&e.type==='mousedown')return;
+  if(typeof e.button==='number'&&e.button!==0)return;
+  var target=irEventElement(e.target);
+  var button=target&&target.closest?target.closest('.ir-native-hover-pin'):null;
+  if(!button||button.disabled)return;
+  var root=button.closest('.monaco-hover,.monaco-editor-hover');
+  if(!root)return;
+  var sc=irPrimaryHoverScroller(root),top=sc?sc.scrollTop:0,left=sc?sc.scrollLeft:0;
+  irPinNativeHoverRoot(root,null);
+  button.focus({preventScroll:true});
+  if(sc){sc.scrollTop=top;sc.scrollLeft=left;}
+  e.preventDefault();e.stopImmediatePropagation();
+}
+function irDetachedHoverEscape(e){
+  if(!e)return;
+  var scrollKey=/^(ArrowUp|ArrowDown|ArrowLeft|ArrowRight|PageUp|PageDown|Home|End| )$/.test(e.key);
+  if(e.key!=='Escape'&&!scrollKey)return;
+  var state=irDetachedHoverStateFromElement(e.target);
+  if(!state)return;
+  if(scrollKey){irCancelDetachedScrollRestore(state);return;}
+  if(e.ctrlKey||e.metaKey||e.altKey||e.shiftKey)return;
+  e.preventDefault();e.stopImmediatePropagation();
+  irRemoveDetachedHover(state,'keyboard-escape');
+}
+function irDetachedHoverWheel(e){
+  irCancelDetachedScrollRestore(irDetachedHoverStateFromElement(e&&e.target));
+}
 function irClearClickPinnedHover(reason,requestHide){
   try{
     var pin=window.__irClickPinnedHover;
@@ -6552,6 +6751,7 @@ function irClickPinPointerDown(e){
     var target=irEventElement(e.target);
     var detached=irDetachedHoverStateFromElement(target);
     if(detached){
+      irCancelDetachedScrollRestore(detached);
       irCancelHoverDragCandidate();
       irBringDetachedHoverToFront(detached);
       if(target&&target.closest&&target.closest('.ir-detached-hover-close')){
@@ -6656,6 +6856,11 @@ track(window,'pointerdown',irPreviewFileLinkPointerDown,true);
 track(window,'mousedown',irPreviewFileLinkPointerDown,true);
 track(window,'click',irPreviewFileLinkClick,true);
 track(window,'keydown',irPreviewFileLinkClick,true);
+track(window,'pointerdown',irPinHoverControlPointerDown,true);
+track(window,'mousedown',irPinHoverControlPointerDown,true);
+track(window,'click',irPinHoverControlClick,true);
+track(window,'keydown',irDetachedHoverEscape,true);
+track(window,'wheel',irDetachedHoverWheel,true);
 track(window,'pointerdown',irClickPinPointerDown,true);
 track(window,'mousedown',irClickPinPointerDown,true);
 track(window,'pointermove',irDetachedHoverResizeMove,true);
@@ -9373,6 +9578,7 @@ function irActivateHoverRoot(root,reason){
   if(!root||irIsStaleHoverRoot(root)||irIsDetachedHoverRoot(root))return false;
   if(irIsWorkbenchHoverRoot(root))return false;
   try{
+    irEnsureNativePinAction(root);
     try{
       var ownedReleased=root.getAttribute&&root.getAttribute('data-ir-native-released-hover')==='1';
       var releasedChanged=false;
@@ -12723,6 +12929,7 @@ function irScanRenderedMarkdown(){
   try{var __vs=window.__irPreviewStash;var __vk=__vs?Object.keys(__vs).length:-1;if(__vk>=1&&window.__irVtailStashLogN!==__vk){window.__irVtailStashLogN=__vk;irHERecord('vtail-stash-visible',{keys:__vk});}}catch(_){}
   irDiagnoseUnwrappedHovers();
   irAlignResizableHoverToChild();
+  if(window.__irActiveHoverEl)irEnsureNativePinAction(window.__irActiveHoverEl);
   var containers=document.querySelectorAll('.monaco-hover .rendered-markdown, .monaco-editor-hover .rendered-markdown, .ij-find-hover-tooltip .rendered-markdown');
   if(containers.length!==irLastContainerCount) irLastContainerCount=containers.length;
   for(var pre=0;pre<containers.length;pre++){
@@ -12731,6 +12938,7 @@ function irScanRenderedMarkdown(){
       if(!document.body.contains(preBlock))continue;
       var preHost=preBlock.closest('.monaco-hover, .monaco-editor-hover');
       if(preHost&&irIsDetachedHoverRoot(preHost))continue;
+      if(preHost)irEnsureNativePinAction(preHost);
       // L32 viewport gate before the expensive textContent read.
       if(preHost&&!irIsBlockVisibleInHover(preBlock,preHost))continue;
       var preText=preBlock.textContent||'';

@@ -176,6 +176,10 @@ suite('Production renderer startup', () => {
       assert.strictEqual(await evaluate("getComputedStyle(document.querySelector('.ir-detached-hover')).borderTopWidth"), '1px');
       await capture('persistent-drag');
       console.log('  production border and drag: ' + JSON.stringify({ border: initial.border, detached: detached.count }));
+    } catch (error) {
+      await capture('startup-failure');
+      console.log('  startup hover failure: ' + JSON.stringify(await evaluate(`Array.from(document.querySelectorAll('.monaco-resizable-hover')).map(w=>({rect:w.getBoundingClientRect().toJSON(),class:w.className,text:w.textContent.slice(0,400),html:w.innerHTML.slice(0,1000)}))`)));
+      throw error;
     } finally {
       await evaluate('window.__irTestHooks&&window.__irTestHooks.clearDetachedHovers()');
       await cdpRequest(ws, 'Emulation.setFocusEmulationEnabled', { enabled: false });

@@ -372,6 +372,47 @@ placeholder. Native multi-block hovers retain `content-visibility: auto`.
 Back retries a clamped scroll restoration for at most four animation frames;
 closing the window or starting another navigation makes those callbacks inert.
 
+## Explicit Pin contract
+
+Patch 325 adds a small sticky action row inside the native hover's existing
+scroll content. It uses VS Code's status-bar background, secondary button tokens
+and pin codicon. Pin stays reachable while scrolling; the Markdown source and
+native copy actions remain separate from the control. VS Code continues to own
+the wrapper's position and size, and the primary scroller still fills its box.
+
+Pin uses the same complete snapshot, isolated session registration and native
+release path as dragging. The snapshot removes the native action row and keeps
+the source, token classes and current scroll offset. Native code blocks still
+waiting for their asynchronous highlighted element disable Pin; cloning an
+unfinished placeholder would lose its pending renderer callback.
+
+`IR: Pin Hover at Cursor` provides the keyboard entry point. It first pins an
+already-visible hover for the active document. If opening the palette dismissed
+it, the command uses VS Code's normal Show Hover action at the cursor and waits
+briefly for the result. Concurrent commands share one operation. A changed
+editor/cursor, missing hover or unavailable renderer cannot create an empty or
+unrelated window. No default global shortcut is installed.
+
+The command targets the focused BrowserWindow. If native focus is unavailable,
+exactly one patched document must report focus; ambiguous focus fails without
+pinning. The visible hover's owning document URI must also match the command's
+editor. Pointer Pin operates directly on the hover the user clicked.
+
+Focus moves to the new panel's existing Close button. When Back hides after
+returning to the first page, its keyboard focus also moves to Close. Enter on
+Close or Escape
+inside a focused detached panel closes only that panel and returns focus to its
+connected origin editor. Background cleanup and window-cap removal do not move
+focus. Native resize, complete-source scrolling, Back, Retry, file links and
+independent windows remain release acceptance checks. Keyboard type selection
+and a different window-cap policy remain separate candidates.
+
+Pin and Back share a bounded restoration after layout. Browser scroll anchoring
+is disabled in detached scrollers so it cannot select a different source block
+while the active page is consolidated. Wheel, pointer or navigation-key input
+cancels pending restoration; a newer request or closed panel also invalidates
+its callbacks. The native source scroller keeps its existing behavior.
+
 ## Box-corner contract (what the golden E2E checks)
 
 For each captured hover sample we check:

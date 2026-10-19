@@ -246,6 +246,7 @@ import {
   RENDERER_PATCH_VERSION,
   getHoverPatchScript,
 } from './renderer-patch';
+import { createPinHoverCommand, PIN_HOVER_COMMAND } from './pin-hover-command';
 
 const log = vscode.window.createOutputChannel('IntelliSense Recursion', { log: true });
 setHoverDeliverLogger(log);
@@ -1179,6 +1180,40 @@ export async function activate(context: vscode.ExtensionContext) {
     vscode.commands.registerCommand('intellisenseRecursion.drillDown', previewTypeCommandHandler),
     vscode.commands.registerCommand('intellisenseRecursion.previewBack', previewBackHandler),
     vscode.commands.registerCommand(OPEN_PREVIEW_FILE_COMMAND, openPreviewFileHandler),
+    vscode.commands.registerCommand(PIN_HOVER_COMMAND, createPinHoverCommand({
+      ensureRenderer: async () => {
+        if (rendererInjectInFlight) { await rendererInjectInFlight; }
+        if (!mainWsRef || mainWsRef.readyState !== WebSocket.OPEN) {
+          await runRendererInjection(injectRenderer);
+        }
+      },
+      evaluate: async expression => {
+        if (mainWsRefIsRendererTarget || isTestRendererDebugMode()) {
+          return evaluateInMainProcess(expression, 5000);
+        }
+        // A user command belongs only to the focused workbench. Do not use
+        // hover-presence scoring, which could select another open window.
+        const mainExpression = `(async function(){try{
+          var BW=require('electron').BrowserWindow,w=BW.getFocusedWindow();
+          if(!w){
+            // If Electron reports no focused window, accept only one focused
+            // patched workbench document. Never choose a window by its hover.
+            var candidates=BW.getAllWindows().filter(w=>!w.isDestroyed()&&w.webContents&&!w.webContents.isDestroyed());
+            var focused=await Promise.all(candidates.map(async candidate=>{try{
+              var ready=await candidate.webContents.executeJavaScript("document.hasFocus()&&typeof window.irPinVisibleHover==='function'",true);
+              return ready?candidate:null;
+            }catch(_){return null;}}));
+            focused=focused.filter(Boolean);
+            if(focused.length!==1)return {ok:false,reason:'window-not-focused'};
+            w=focused[0];
+          }
+          if(!w||w.isDestroyed()||!w.webContents||w.webContents.isDestroyed())return {ok:false,reason:'window-not-focused'};
+          return await w.webContents.executeJavaScript(${jsonStringifyAscii(expression)},true);
+        }catch(e){return {ok:false,reason:String(e&&e.message||e)};}})()`;
+        return evaluateInMainProcess(mainExpression, 5000);
+      },
+      warn: message => log.warn(message),
+    })),
     vscode.commands.registerCommand('intellisenseRecursion.getPatchStatus', () => ({
       hoverPatchActive,
       hoverRecursionDepth,

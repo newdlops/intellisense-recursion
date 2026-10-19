@@ -11,6 +11,7 @@ VS Code's hover tooltips show type information but the text is static. This exte
 - **Language-agnostic**: Works with any language that has a VS Code language server (Python, TypeScript, JavaScript, Java, C/C++, Go, Rust, etc.)
 - **Recursive navigation**: Types in the definition preview are also clickable — keep drilling down.
 - **Preview recovery**: Detached previews explain lookup failures and offer Retry while keeping the current source and scroll position visible.
+- **Pin without dragging**: Use Pin in a hover or run **IR: Pin Hover at Cursor** from the Command Palette. Close a focused pinned window with Escape to return to the editor.
 
 ## How It Works
 
