@@ -1,5 +1,151 @@
 # Renderer performance
 
+## Preview recovery release 0.2.6051 / patch 324
+
+2026-10-20. Failed detached previews now retain the current complete source and
+scroll position while showing a specific status and a native Retry button.
+Retries share the existing isolated request protocol; older apply, failure and
+commit responses cannot overwrite or unlock a newer request. Back retains the
+original source DOM and waits a bounded number of frames for its scroll layout.
+
+Rendered verification also exposed a titlebar painted behind cloned content.
+The titlebar now owns a stacking context, and its full status is available in a
+tooltip and a polite live region. A detached window's consolidated active page
+keeps its full layout height after restoration and resizing. Native multi-block
+hovers retain their existing content-visibility optimization. Displayed source,
+syntax highlighting and navigation history are not shortened.
+
+### Release verification
+
+VS Code 1.142.0 on macOS ARM64, Python fixture:
+
+- Shipping minified bundle: 16 passed, covering the 15 content/candidate/startup
+  checks below plus detached error and recovery. Actual mouse Retry, Tab and
+  Shift+Tab, Enter, Back and Close preserve 10,025 source detail lines, exact
+  source markup and the saved scroll offset. Duplicate retries and stale
+  apply/failure/commit messages are rejected. A second window remains intact.
+- Development build: 14 passed, covering renderer performance, cache budgets,
+  source-file navigation, actual detached preview transport and independent
+  sessions, and repeated native sizing/forward/Back behavior.
+- Actual screenshots were inspected at 1440 × 900: failure and disabled loading
+  states, a 250px-wide detached panel with a long Korean/Latin name, highlighted
+  complete-source tails after native scrolling, drag and Back, and native sash
+  resizing. Retry and Close remain visible in the narrow titlebar; the source
+  remains visible at its restored offset.
+
+The recovery test controls the binding only to produce deterministic errors and
+delayed replies. The separate detached-protocol test uses the real extension
+transport. Geometry/readiness checks precede the final narrow screenshot.
+Light/high-contrast themes, screen readers, other operating systems and whole
+mobile/tablet viewports were not checked. A live region is implemented; no
+screen-reader certification is inferred.
+
+The final pointer workload used zero document queries and zero geometry reads
+for 1,000 movement pairs (6.4 ms in this run). Forty editor paint batches used
+two queries and zero geometry reads. These are regression checks, not a general
+CPU/GPU, memory or interaction-latency claim. The
+[release measurements](../reports/ui-audit-2026-10-20/renderer-release-6051.json)
+are retained alongside the patch 323 candidate microbenchmark below.
+
+```sh
+npm run bundle
+IR_VSCODE_VERSION=1.142.0 IR_TEST_PRODUCTION_INJECTION=1 IR_E2E_FILES=hover-link-candidates.test.js,hover-content.test.js,preview-content.test.js,preview-content-renderer.test.js,renderer-startup.test.js,detached-preview-recovery.test.js TEST_FIXTURE=python node out/test/runTest.js
+
+npm run compile
+IR_VSCODE_VERSION=1.142.0 IR_PERF_LABEL=release-6051-final IR_E2E_FILES=renderer-performance.test.js,preview-cache-budget.test.js,preview-file-link.test.js,hover.test.js IR_E2E_GREP='Renderer performance|Preview cache resource budgets|Preview file path links|detached hover links use an isolated end-to-end preview protocol|content-aware native hover stays adjacent' TEST_FIXTURE=python node out/test/runTest.js
+
+npm run bundle
+```
+
+## Complete source preserving cleanup in patch 323
+
+2026-10-20. Complete original code is the primary product requirement. This
+cleanup changes only a temporary candidate array and the test launchers. It
+does not cap displayed lines or characters, remove syntax highlighting, shorten
+comments, change native layout, or prune navigation history.
+
+`irCollectTypeShapedCandidates` now supplies its existing line budget to
+`String.split`. Previously it allocated an array for the entire definition
+before scanning its bounded prefix. Candidate order, constant slots, skip words
+and the complete last scanned line remain the same. On-demand type links still
+work after the eagerly indexed prefix.
+
+Five new generated-renderer checks cover those rules, including a long first
+line and names beyond 900 lines when an unrestricted scan is requested. The
+existing full-content renderer test now also requires syntax highlighting on
+the final source line and creates a real pointer-driven type link after 10,025
+source detail lines. Native scrolling, drag-to-detach and Back restore the whole
+definition as before.
+
+### Candidate collection measurement
+
+Node VM function microbenchmark, seven samples of ten calls each. The current
+limited split is compared with the original full split and the earlier manual
+line-reader experiment. All eight comparison inputs produce identical candidate
+lists. This does not measure Electron interaction latency or whole-process RSS.
+
+| Source lines | Original full split | Manual line reader | Limited split in patch 323 |
+| --- | ---: | ---: | ---: |
+| 1,002 | 0.061 ms | 0.119 ms | 0.056 ms |
+| 10,002 | 0.174 ms | 0.105 ms | 0.033 ms |
+| 100,002 | 2.091 ms | 0.090 ms | 0.037 ms |
+
+[Raw candidate measurements](../reports/ui-audit-2026-10-20/candidate-after-cleanup.json)
+and the [benchmark](../reports/ui-audit-2026-10-20/candidate-benchmark.cjs) are retained.
+The existing pointer workload still performs zero document queries and zero
+geometry reads outside hovers. The verification run took 7.7 ms for 1,000
+pointer/mouse movement pairs; timings vary with workbench activity. Forty editor
+paint batches used six DOM queries and zero geometry reads, and none of 64
+disposed editor probes remained retained. These pass the existing regression
+thresholds; no general CPU or GPU improvement is inferred.
+[Renderer measurements](../reports/ui-audit-2026-10-20/renderer-after-cleanup.json)
+record the full workload.
+
+### Functional and visual verification
+
+The unchanged patch 322 first passed nine content checks in VS Code 1.142.0 on
+macOS ARM64. Patch 323 then passed 29 checks in two runs:
+
+- Shipping minified bundle: five candidate checks, four native delivery checks,
+  four Python/TypeScript document-versus-file source comparisons, the strengthened
+  long-content renderer test, and production startup: 15 passed.
+- Development build: three renderer performance checks, two cache budget checks,
+  seven file-link checks, detached-session isolation, and content-aware native
+  sizing with repeated forward/Back navigation: 14 passed.
+
+The long source, native resize and persistent-drag captures were inspected at
+1440 × 900, including the highlighted final line, late type link and Back-restored
+detached content. The preview retains every numbered source line. Native sash
+growth, preserved manual dimensions after a type click, the production click
+bridge, native/detached source-file click and detached Enter all passed. The
+independent-window test confirms that navigating or closing one window leaves
+the second window and native hover state intact.
+
+Smaller viewports, light/high-contrast themes, screen readers, other operating
+systems and whole-process memory were not rechecked in this cleanup. Native
+history retention is unchanged because a new limit must first preserve the
+existing Back behavior. Impeccable's detector reported no findings; the source
+diff changes no CSS, token, control, displayed-source or highlighting path.
+
+### Reproduction
+
+All three test launchers now share `testVSCodeExecutablePath`. Set
+`IR_VSCODE_VERSION` to pin a downloaded version, or `IR_VSCODE_EXECUTABLE_PATH`
+to use an executable already installed. The helper supports both the old macOS
+`Electron` filename and the current `Code` filename. The cached 1.142.0 path was
+resolved and both test runs completed without a temporary wrapper.
+
+```sh
+npm run bundle
+IR_VSCODE_VERSION=1.142.0 IR_TEST_PRODUCTION_INJECTION=1 IR_E2E_FILES=hover-link-candidates.test.js,hover-content.test.js,preview-content.test.js,preview-content-renderer.test.js,renderer-startup.test.js TEST_FIXTURE=python node out/test/runTest.js
+
+npm run compile
+IR_VSCODE_VERSION=1.142.0 IR_PERF_LABEL=cleanup-323 IR_E2E_FILES=renderer-performance.test.js,preview-cache-budget.test.js,preview-file-link.test.js,hover.test.js IR_E2E_GREP='Renderer performance|Preview cache resource budgets|Preview file path links|detached hover links use an isolated end-to-end preview protocol|content-aware native hover stays adjacent' TEST_FIXTURE=python node out/test/runTest.js
+
+node reports/ui-audit-2026-10-20/candidate-benchmark.cjs reports/ui-audit-2026-10-20/candidate-after-cleanup.json
+npm run bundle
+```
+
 ## Complete content delivery in patch 322 (2026-09-29)
 
 Performance limits must not shorten hover content. Removed the 10,000-line

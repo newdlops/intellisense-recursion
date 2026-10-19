@@ -1,0 +1,31 @@
+{
+  "scope": "Node utility microbenchmark of the current renderer function; not browser latency or RSS",
+  "candidateLimit": {
+    "chars": 50000,
+    "lines": 900
+  },
+  "equivalenceCases": 8,
+  "rows": [
+    {
+      "lines": 1002,
+      "chars": 63040,
+      "baselineMs": 0.061262500000000844,
+      "boundedMs": 0.11896660000000167,
+      "limitedMs": 0.05593330000000094
+    },
+    {
+      "lines": 10002,
+      "chars": 630040,
+      "baselineMs": 0.1742791000000011,
+      "boundedMs": 0.10507910000000038,
+      "limitedMs": 0.03311249999999859
+    },
+    {
+      "lines": 100002,
+      "chars": 6300040,
+      "baselineMs": 2.0913250000000003,
+      "boundedMs": 0.08989169999999831,
+      "limitedMs": 0.03747500000000059
+    }
+  ]
+}

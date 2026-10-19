@@ -5,6 +5,27 @@ All notable changes to the IntelliSense Recursion extension.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.6051] - 2026-10-20
+
+### Added
+- Show why a detached definition preview failed and offer Retry in its titlebar.
+  Mouse and Enter retries keep the existing source, scroll position and Back
+  history until the new definition is ready. Loading and failure states are
+  announced to assistive technology.
+
+### Fixed
+- Keep the detached titlebar visible above cloned native content, with a full
+  tooltip for long status text.
+- Preserve the complete restored page and saved scroll position after Back and
+  narrow-window resizing, while retaining native hover rendering optimizations.
+- Ignore delayed responses and commit acknowledgements from older preview
+  requests, keeping each detached window independent.
+- Avoid allocating a full line array for bounded type-name candidate scans.
+  Complete long source and syntax highlighting remain available through the
+  final line, including after dragging and Back navigation.
+- Share VS Code test executable selection across the test launchers, supporting
+  current macOS executable names and explicitly selected versions.
+
 ## [0.2.6040] - 2026-09-07
 
 ### Fixed

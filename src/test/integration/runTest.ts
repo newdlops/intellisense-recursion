@@ -1,6 +1,7 @@
 import * as path from 'path';
 import * as os from 'os';
 import { runTests } from '@vscode/test-electron';
+import { testVSCodeExecutablePath } from '../vscode-runtime';
 
 async function main() {
   try {
@@ -17,6 +18,7 @@ async function main() {
     console.log(`  extensions: ${userExtensionsDir}`);
 
     await runTests({
+      vscodeExecutablePath: await testVSCodeExecutablePath(extensionDevelopmentPath),
       extensionDevelopmentPath,
       extensionTestsPath,
       launchArgs: [

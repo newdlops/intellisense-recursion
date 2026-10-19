@@ -28,6 +28,13 @@ only provide the automatic and user-resize upper bounds described below.
 
 ## Complete source content
 
+Reading the complete original definition is this tool's primary purpose.
+Optimization must preserve every source line, comments, docstrings, syntax
+highlighting and access to the final line in native and detached panels,
+including after Back. Do not trade those behaviors for lower memory or latency.
+Candidate indexing, temporary allocations and cache retention are separate
+budgets; none is permission to shorten or replace displayed source.
+
 Definition previews retain the whole resolved source block, including comments,
 docstrings and the final line. Do not replace offscreen source with `...`, an
 excerpt, or a “more lines” summary. Long blocks use the native scrollbar and
@@ -53,6 +60,13 @@ Patch 322 consolidates those rendered roots inside a detached clone, in source
 order, before establishing its single navigation/history target. This prevents
 continuation blocks from being left behind when drilling and ensures Back
 restores the complete page. Native hover rows are not reorganized.
+
+Patch 323 limits only the temporary line array used by the existing type-name
+candidate scan. Its candidate budget, ordering and whole-last-scanned-line
+behavior stay the same. The original source remains untouched, and identifiers
+at the end of a long definition still become links on pointer movement. The
+long-content regression checks that late link and syntax highlighting on the
+final line in the native, detached and Back-restored pages.
 
 ## DOM hierarchy
 
@@ -328,6 +342,35 @@ validated `intellisenseRecursion.openPreviewFile` link. File links open the
 source tab without changing the detached window's page or back stack. Other
 cloned command links and form controls stay disabled. At most 12 detached
 windows are retained, and large virtualized tails keep their own scroll renderer.
+
+## Detached preview recovery
+
+Patch 324 adds a Retry button to a failed detached preview's existing titlebar.
+The status identifies a missing definition, timeout, unreadable source or lost
+connection without replacing the current code. The complete body, scroll offset,
+Back stack and other windows remain available. Long status text is visually
+ellipsized in the titlebar and remains complete in its tooltip and accessible
+status text; displayed source is never ellipsized by this control.
+
+Retry uses the same isolated preview path as a type-link click and allocates a
+new request ID. A retry in progress keeps the action disabled. Successful content
+delivery hides it; when the button held keyboard focus, focus moves to the
+window's existing close control without moving the source scroll position.
+Enter activates the native button. The title is a polite live status outside
+the code container's busy state.
+
+An older response, failure or commit acknowledgement cannot clear or overwrite
+a newer request. A repeated acknowledgement for the current applied request
+remains idempotent. Closing the window cancels its timers, and subsequent
+responses find no session. None of these states shortens the original source or
+prunes navigation history.
+
+The titlebar has its own stacking context above the cloned body. A detached
+window consolidates native Markdown blocks into one active history page, so
+that page keeps its full layout height instead of using an offscreen 80px
+placeholder. Native multi-block hovers retain `content-visibility: auto`.
+Back retries a clamped scroll restoration for at most four animation frames;
+closing the window or starting another navigation makes those callbacks inert.
 
 ## Box-corner contract (what the golden E2E checks)
 

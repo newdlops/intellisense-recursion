@@ -10,6 +10,7 @@ VS Code's hover tooltips show type information but the text is static. This exte
 - **Definition preview**: Hover tooltips are enriched with scrollable source previews of referenced definitions.
 - **Language-agnostic**: Works with any language that has a VS Code language server (Python, TypeScript, JavaScript, Java, C/C++, Go, Rust, etc.)
 - **Recursive navigation**: Types in the definition preview are also clickable — keep drilling down.
+- **Preview recovery**: Detached previews explain lookup failures and offer Retry while keeping the current source and scroll position visible.
 
 ## How It Works
 

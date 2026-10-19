@@ -1,0 +1,42 @@
+{
+  "label": "ui-audit-20261020",
+  "rendererBytes": 747618,
+  "pointerMotion": {
+    "moves": 1000,
+    "elapsedMs": 10.600000023841858,
+    "queries": 0,
+    "geometryReads": 0,
+    "closestCalls": 4000
+  },
+  "collections": {
+    "medianMs": 25,
+    "samplesMs": [
+      18.90000009536743,
+      19.09999990463257,
+      21.5,
+      25,
+      25.700000047683716,
+      33,
+      37
+    ]
+  },
+  "mutations": {
+    "elapsedMs": 11.5,
+    "queries": 2,
+    "geometryReads": 0,
+    "batches": 40
+  },
+  "metrics": {
+    "TaskDuration": 0.012691000000000008,
+    "ScriptDuration": 0.0015280000000000016,
+    "LayoutDuration": 0.0006399999999999999,
+    "RecalcStyleDuration": 0.0008249999999999993,
+    "LayoutCount": 1,
+    "RecalcStyleCount": 2
+  },
+  "retention": {
+    "created": 64,
+    "retainedBeforeDispose": 64,
+    "retainedAfterDispose": 0
+  }
+}

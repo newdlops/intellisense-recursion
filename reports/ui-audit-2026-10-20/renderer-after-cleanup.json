@@ -1,0 +1,42 @@
+{
+  "label": "cleanup-323",
+  "rendererBytes": 747707,
+  "pointerMotion": {
+    "moves": 1000,
+    "elapsedMs": 7.700000047683716,
+    "queries": 0,
+    "geometryReads": 0,
+    "closestCalls": 4000
+  },
+  "collections": {
+    "medianMs": 14.899999976158142,
+    "samplesMs": [
+      13.799999952316284,
+      13.799999952316284,
+      14.700000047683716,
+      14.899999976158142,
+      14.899999976158142,
+      17.399999976158142,
+      18.700000047683716
+    ]
+  },
+  "mutations": {
+    "elapsedMs": 11.5,
+    "queries": 6,
+    "geometryReads": 0,
+    "batches": 40
+  },
+  "metrics": {
+    "TaskDuration": 0.020763999999999977,
+    "ScriptDuration": 0.0058449999999999995,
+    "LayoutDuration": 0.001201,
+    "RecalcStyleDuration": 0.0014249999999999992,
+    "LayoutCount": 7,
+    "RecalcStyleCount": 7
+  },
+  "retention": {
+    "created": 64,
+    "retainedBeforeDispose": 64,
+    "retainedAfterDispose": 0
+  }
+}

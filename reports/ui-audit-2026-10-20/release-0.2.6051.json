@@ -1,0 +1,26 @@
+{
+  "version": "0.2.6051",
+  "rendererPatch": 324,
+  "environment": {
+    "vscode": "1.142.0",
+    "platform": "darwin",
+    "architecture": "arm64"
+  },
+  "checks": {
+    "productionBundlePassed": 16,
+    "compatibilityAndPerformancePassed": 14,
+    "sourceDetailLinesPreserved": 10025,
+    "desktopCapture": { "width": 1440, "height": 900 },
+    "narrowDetachedPanelWidth": 250,
+    "reviewedStates": ["error", "loading-disabled", "keyboard-retry", "native-complete-tail", "detached-restored-tail", "native-resize"]
+  },
+  "artifact": {
+    "name": "intellisense-recursion-0.2.6051.vsix",
+    "files": 19,
+    "bytes": 1920353,
+    "sha256": "008f0f67697cf82ffcede44f1e19bfe219dd87a8eb2f10b73a6b1c2906fc9362",
+    "extensionSha256": "f6c260618b2172428513e75b27cf9783f28c7e4d07f29ce20fc20670b3ebd01a",
+    "sidecarSha256": "b0aa881933ee4cff32e903cf21538f9ae5439983278eec041adfe8e1d57de620"
+  },
+  "limitations": ["Other operating systems", "Whole mobile or tablet viewports", "Light and high-contrast themes", "Screen readers", "Whole-process CPU/GPU and memory measurements"]
+}

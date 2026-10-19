@@ -3,6 +3,7 @@ import * as os from 'os';
 import * as fs from 'fs';
 import * as net from 'net';
 import { runTests } from '@vscode/test-electron';
+import { testVSCodeExecutablePath } from './vscode-runtime';
 
 function discoverInstalledExtensionIds(extensionsDir: string): string[] {
   if (!fs.existsSync(extensionsDir)) { return []; }
@@ -94,6 +95,7 @@ async function main() {
     console.log(`  disabled user extensions: ${disabledUiExtensions.join(', ') || '(none)'}`);
 
     await runTests({
+      vscodeExecutablePath: await testVSCodeExecutablePath(extensionDevelopmentPath),
       extensionDevelopmentPath,
       extensionTestsPath,
       extensionTestsEnv: {

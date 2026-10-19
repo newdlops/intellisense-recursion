@@ -59,6 +59,7 @@ suite('Complete preview rendering', () => {
         'class CompleteDefinition:',
         '    """Full description ... preserved."""',
         ...Array.from({ length: 10_025 }, (_, i) => `    # source detail ${i}`),
+        '    final_owner: TailReference',
         '    final_value = "IR_PREVIEW_COMPLETE"',
       ].join('\n');
       const uri = vscode.Uri.file(path.join(directory, 'complete.py'));
@@ -103,13 +104,19 @@ suite('Complete preview rendering', () => {
           if(!node.textContent.includes('IR_PREVIEW_COMPLETE'))continue;
           var range=document.createRange();range.selectNodeContents(node);
           var r=range.getBoundingClientRect(),b=root.getBoundingClientRect();
-          if(r.height>0&&r.top>=b.top&&r.bottom<=b.bottom)return {line:node.textContent,rect:r.toJSON()};
+          if(r.height>0&&r.top>=b.top&&r.bottom<=b.bottom)return {
+            line:node.textContent,rect:r.toJSON(),tokenized:!!node.parentElement.closest('[class*="mtk"]')
+          };
         }
         return null;
       })()`;
       const scrollToTail = async (selector: string) => {
         for (let attempt = 0; attempt < 12; attempt++) {
-          if (await evaluate(visibleTail(selector))) { return; }
+          const tail = await evaluate(visibleTail(selector));
+          if (tail) {
+            assert.ok(tail.tokenized, 'The final source line must retain syntax highlighting');
+            return;
+          }
           const rect = await evaluate(`document.querySelector(${JSON.stringify(selector)}).getBoundingClientRect().toJSON()`);
           const point = { x: rect.right - 50, y: rect.top + 70 };
           await mouse('mouseMoved', point.x, point.y);
@@ -118,9 +125,27 @@ suite('Complete preview rendering', () => {
           // as the later blocks acquire their final height.
           await pause(300);
         }
-        assert.ok(await evaluate(visibleTail(selector)), 'The last source line must be visible after scrolling');
+        const tail = await evaluate(visibleTail(selector));
+        assert.ok(tail, 'The last source line must be visible after scrolling');
+        assert.ok(tail.tokenized, 'The final source line must retain syntax highlighting');
       };
       await scrollToTail('.monaco-resizable-hover');
+      // Eager candidate indexing has a budget. Source beyond that budget must
+      // remain both visible and navigable through normal pointer movement.
+      const tailLinkPoint = await waitFor(`(function(){
+        var root=document.querySelector('.monaco-resizable-hover');if(!root)return null;
+        var walker=document.createTreeWalker(root,NodeFilter.SHOW_TEXT),node;
+        while(node=walker.nextNode()){
+          var index=node.textContent.indexOf('TailReference');if(index<0)continue;
+          var range=document.createRange();range.setStart(node,index);range.setEnd(node,index+13);
+          var r=range.getBoundingClientRect(),x=r.left+r.width/2,y=r.top+r.height/2;
+          if(r.width&&root.contains(document.elementFromPoint(x,y)))return {x:x,y:y};
+        }
+        return null;
+      })()`, 'The identifier beyond the eager scan budget must be visible');
+      await mouse('mouseMoved', tailLinkPoint.x, tailLinkPoint.y);
+      await waitFor("!!document.querySelector('.monaco-resizable-hover .ir-type-link[data-type=\"TailReference\"]')",
+        'Types at the end of long source must still become links');
       await capture('native-complete-tail');
       // Drag unused space in the body so the content survives native dismissal.
       const rect = await evaluate("document.querySelector('.monaco-resizable-hover').getBoundingClientRect().toJSON()");

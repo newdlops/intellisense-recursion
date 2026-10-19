@@ -82,11 +82,15 @@ suite('Production renderer startup', () => {
       const position = new vscode.Position(line, doc.lineAt(line).text.indexOf('BaseModel') + 3);
       editor.selection = new vscode.Selection(position, position);
       editor.revealRange(new vscode.Range(position, position), vscode.TextEditorRevealType.InCenter);
-      for (let attempt = 0; attempt < 40; attempt++) {
+      let previewReady = false;
+      for (let attempt = 0; attempt < 80; attempt++) {
         const hovers = await vscode.commands.executeCommand<vscode.Hover[]>('vscode.executeHoverProvider', doc.uri, position);
-        if (hovers?.length) { break; }
+        previewReady = !!hovers?.some(hover => hover.contents.some(content =>
+          (typeof content === 'string' ? content : 'value' in content ? content.value : '').includes('def save')));
+        if (previewReady) { break; }
         await pause(250);
       }
+      assert.ok(previewReady, 'The definition preview provider must be ready before opening its native hover');
       await vscode.commands.executeCommand('editor.action.showHover');
       await waitFor(`Array.from(document.querySelectorAll('.monaco-resizable-hover')).some(w=>w.getBoundingClientRect().height>20&&w.textContent.includes('def save'))`, 'Native hover did not appear');
       await waitForContentFit();

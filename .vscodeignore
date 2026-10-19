@@ -17,6 +17,7 @@ tsconfig.json
 esbuild.js
 
 # ── docs / design notes kept out of the vsix ──
+docs/**
 memory/**
 spec.md
 handover.md

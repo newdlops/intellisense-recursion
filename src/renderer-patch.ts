@@ -129,10 +129,16 @@
 //   dragging from a link must detach the panel just like dragging its body.
 // v321: make diagnostic observers/listeners opt-in, cancel scheduled work on
 //   cleanup, share one pointer-intent path, and retain manual size across drill.
+// v322: deliver complete native Markdown and retain every continuation when
+//   cloning, navigating and restoring long previews.
+// v323: allocate only the existing candidate scan's line budget. Displayed
+//   source, syntax highlighting and on-demand links beyond that budget stay whole.
+// v324: explain detached preview failures and retry within the same window,
+//   retaining the complete source, scroll position and navigation history.
 // If the running window still logs v<300, the new build is NOT loaded yet.
 import { parsePreviewFileLink } from './preview-file-link';
 
-export const RENDERER_PATCH_VERSION = 322;
+export const RENDERER_PATCH_VERSION = 324;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -670,9 +676,9 @@ style.textContent=[
   // restore the sizing that the pre-adoption .monaco-hover rule zeros out.
   '.ir-detached-hover-layer{position:fixed !important;inset:0 !important;width:100vw !important;height:100vh !important;overflow:visible !important;pointer-events:none !important;z-index:2147483646 !important}',
   '.ir-detached-hover.ir-detached-hover{position:absolute !important;box-sizing:border-box !important;display:flex !important;flex-direction:column !important;visibility:visible !important;overflow:hidden !important;transform:none !important;margin:0 !important;padding:0 !important;pointer-events:auto !important;cursor:default !important;background:var(--vscode-editorHoverWidget-background,var(--vscode-editor-background,Canvas)) !important;color:var(--vscode-editorHoverWidget-foreground,var(--vscode-editor-foreground,CanvasText)) !important;border:1px solid var(--vscode-focusBorder,var(--vscode-editorHoverWidget-border,rgba(128,128,128,0.85))) !important;border-radius:5px !important;box-shadow:0 6px 18px rgba(0,0,0,0.36) !important;z-index:var(--ir-detached-hover-z,1) !important}',
-  '.ir-detached-hover-titlebar{display:flex !important;align-items:center !important;gap:5px !important;box-sizing:border-box !important;flex:0 0 28px !important;width:100% !important;height:28px !important;min-height:28px !important;padding:2px 3px 2px 7px !important;overflow:hidden !important;cursor:grab !important;touch-action:none !important;user-select:none !important;-webkit-user-select:none !important;background:var(--vscode-titleBar-activeBackground,var(--vscode-editorGroupHeader-tabsBackground,rgba(128,128,128,0.22))) !important;color:var(--vscode-titleBar-activeForeground,var(--vscode-foreground,CanvasText)) !important;border-bottom:1px solid var(--vscode-editorHoverWidget-border,var(--vscode-focusBorder,rgba(128,128,128,0.75))) !important}',
+  '.ir-detached-hover-titlebar{position:relative !important;z-index:1 !important;display:flex !important;align-items:center !important;gap:5px !important;box-sizing:border-box !important;flex:0 0 28px !important;width:100% !important;height:28px !important;min-height:28px !important;padding:2px 3px 2px 7px !important;overflow:hidden !important;cursor:grab !important;touch-action:none !important;user-select:none !important;-webkit-user-select:none !important;background:var(--vscode-titleBar-activeBackground,var(--vscode-editorGroupHeader-tabsBackground,rgba(128,128,128,0.22))) !important;color:var(--vscode-titleBar-activeForeground,var(--vscode-foreground,CanvasText)) !important;border-bottom:1px solid var(--vscode-editorHoverWidget-border,var(--vscode-focusBorder,rgba(128,128,128,0.75))) !important}',
   '.ir-detached-hover-titlebar-grip{flex:0 0 auto !important;opacity:.72 !important;font:700 12px/1 var(--vscode-font-family,sans-serif) !important;letter-spacing:-2px !important;pointer-events:none !important}',
-  '.ir-detached-hover-title{flex:1 1 auto !important;min-width:0 !important;overflow:hidden !important;text-overflow:ellipsis !important;white-space:nowrap !important;font:600 12px/1.2 var(--vscode-font-family,sans-serif) !important;pointer-events:none !important}',
+  '.ir-detached-hover-title{flex:1 1 auto !important;min-width:0 !important;overflow:hidden !important;text-overflow:ellipsis !important;white-space:nowrap !important;font:600 12px/1.2 var(--vscode-font-family,sans-serif) !important;pointer-events:auto !important}',
   '.ir-detached-hover.ir-detached-hover > .ir-detached-hover-root.ir-detached-hover-root,.ir-detached-hover.ir-detached-hover .monaco-hover.ir-detached-hover-root,.ir-detached-hover.ir-detached-hover .monaco-editor-hover.ir-detached-hover-root{position:static !important;inset:auto !important;z-index:auto !important;display:flex !important;flex:1 1 auto !important;flex-direction:column !important;box-sizing:border-box !important;width:100% !important;height:auto !important;min-width:0 !important;min-height:0 !important;max-width:100% !important;max-height:100% !important;margin:0 !important;transform:none !important;overflow:hidden !important;visibility:visible !important;opacity:1 !important;pointer-events:auto !important;cursor:text !important;user-select:text !important;-webkit-user-select:text !important;border:0 !important;border-radius:0 !important;outline:0 !important;box-shadow:none !important}',
   '.ir-detached-hover.ir-detached-hover .monaco-hover .monaco-scrollable-element,.ir-detached-hover.ir-detached-hover .monaco-editor-hover .monaco-scrollable-element{position:static !important;inset:auto !important;top:auto !important;left:auto !important;right:auto !important;bottom:auto !important;transform:none !important;display:block !important;flex:1 1 auto !important;box-sizing:border-box !important;width:calc(100% - 2px) !important;height:auto !important;min-width:0 !important;min-height:0 !important;max-width:calc(100% - 2px) !important;max-height:calc(100% - 2px) !important;margin:1px !important;overflow:auto !important;overscroll-behavior:contain !important;scrollbar-width:auto !important;scrollbar-color:auto !important;visibility:visible !important;pointer-events:auto !important;cursor:text !important;user-select:text !important;-webkit-user-select:text !important}',
   '.ir-detached-hover.ir-detached-hover .monaco-hover-content,.ir-detached-hover.ir-detached-hover .hover-row,.ir-detached-hover.ir-detached-hover .hover-row-contents,.ir-detached-hover.ir-detached-hover .markdown-hover,.ir-detached-hover.ir-detached-hover .rendered-markdown{width:auto !important;height:auto !important;min-width:0 !important;min-height:0 !important;max-width:100% !important;max-height:none !important;overflow:visible !important;visibility:visible !important}',
@@ -683,13 +689,16 @@ style.textContent=[
   '.ir-detached-hover.ir-detached-hover .ir-type-link,.ir-detached-hover.ir-detached-hover .ir-type-link *,.ir-detached-hover.ir-detached-hover a[data-ir-detached-safe-link="1"]{pointer-events:auto !important;cursor:pointer !important}',
   '.monaco-hover a:is([href^="command:intellisenseRecursion.openPreviewFile?"],[data-href^="command:intellisenseRecursion.openPreviewFile?"]){cursor:pointer !important;overflow-wrap:anywhere;text-decoration:underline}',
   '.monaco-hover a:is([href^="command:intellisenseRecursion.openPreviewFile?"],[data-href^="command:intellisenseRecursion.openPreviewFile?"]):focus-visible{outline:2px solid var(--vscode-focusBorder);outline-offset:2px}',
-  '.ir-detached-hover.ir-detached-hover button:not(.ir-detached-hover-close):not(.ir-detached-hover-back),.ir-detached-hover.ir-detached-hover input,.ir-detached-hover.ir-detached-hover textarea,.ir-detached-hover.ir-detached-hover select,.ir-detached-hover.ir-detached-hover [contenteditable="true"],.ir-detached-hover.ir-detached-hover [role="button"]:not(.ir-detached-hover-close):not(.ir-detached-hover-back){pointer-events:none !important}',
-  '.ir-detached-hover-back,.ir-detached-hover-close{position:static !important;display:flex !important;align-items:center !important;justify-content:center !important;flex:0 0 24px !important;width:24px !important;height:24px !important;min-width:24px !important;min-height:24px !important;padding:0 !important;border:1px solid var(--vscode-contrastBorder,var(--vscode-focusBorder,rgba(255,255,255,0.48))) !important;border-radius:4px !important;background:var(--vscode-button-secondaryBackground,var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.42))) !important;color:var(--vscode-button-secondaryForeground,var(--vscode-foreground,CanvasText)) !important;font:700 17px/1 var(--vscode-font-family,sans-serif) !important;cursor:pointer !important;pointer-events:auto !important;opacity:1 !important;z-index:7 !important}',
+  '.ir-detached-hover.ir-detached-hover button:not(.ir-detached-hover-close):not(.ir-detached-hover-back):not(.ir-detached-hover-retry),.ir-detached-hover.ir-detached-hover input,.ir-detached-hover.ir-detached-hover textarea,.ir-detached-hover.ir-detached-hover select,.ir-detached-hover.ir-detached-hover [contenteditable="true"],.ir-detached-hover.ir-detached-hover [role="button"]:not(.ir-detached-hover-close):not(.ir-detached-hover-back):not(.ir-detached-hover-retry){pointer-events:none !important}',
+  '.ir-detached-hover-back,.ir-detached-hover-close,.ir-detached-hover-retry{position:static !important;display:flex !important;align-items:center !important;justify-content:center !important;flex:0 0 24px !important;width:24px !important;height:24px !important;min-width:24px !important;min-height:24px !important;padding:0 !important;border:1px solid var(--vscode-contrastBorder,var(--vscode-focusBorder,rgba(255,255,255,0.48))) !important;border-radius:4px !important;background:var(--vscode-button-secondaryBackground,var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.42))) !important;color:var(--vscode-button-secondaryForeground,var(--vscode-foreground,CanvasText)) !important;font:700 17px/1 var(--vscode-font-family,sans-serif) !important;cursor:pointer !important;pointer-events:auto !important;opacity:1 !important;z-index:7 !important}',
   '.ir-detached-hover-back{display:none !important;font-size:15px !important}',
   '.ir-detached-hover-back.ir-detached-hover-back-visible{display:flex !important}',
-  '.ir-detached-hover-back:hover{background:var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.58)) !important}',
+  '.ir-detached-hover-retry{display:none !important;flex:0 0 auto !important;width:auto !important;min-width:42px !important;padding:0 6px !important;font-size:12px !important}',
+  '.ir-detached-hover-retry.ir-detached-hover-retry-visible{display:flex !important}',
+  '.ir-detached-hover-retry:disabled{opacity:.6 !important;cursor:default !important}',
+  '.ir-detached-hover-back:hover,.ir-detached-hover-retry:hover{background:var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.58)) !important}',
   '.ir-detached-hover-close:hover{background:var(--vscode-inputValidation-errorBackground,#c42b1c) !important;color:var(--vscode-button-foreground,#fff) !important}',
-  '.ir-detached-hover-back:focus-visible,.ir-detached-hover-close:focus-visible{outline:2px solid var(--vscode-focusBorder,#007fd4) !important;outline-offset:-2px !important}',
+  '.ir-detached-hover-back:focus-visible,.ir-detached-hover-close:focus-visible,.ir-detached-hover-retry:focus-visible{outline:2px solid var(--vscode-focusBorder,#007fd4) !important;outline-offset:-2px !important}',
   '.ir-detached-hover-resize-handle{position:absolute !important;display:block !important;box-sizing:border-box !important;pointer-events:auto !important;touch-action:none !important;user-select:none !important;-webkit-user-select:none !important;z-index:6 !important}',
   '.ir-detached-hover-resize-right{top:28px !important;right:0 !important;bottom:10px !important;width:6px !important;cursor:ew-resize !important}',
   '.ir-detached-hover-resize-bottom{left:0 !important;right:10px !important;bottom:0 !important;height:6px !important;cursor:ns-resize !important}',
@@ -709,6 +718,12 @@ style.textContent=[
   // hovers — brower no-ops fast when the block fits in view anyway,
   // so there is no measurable cost on small hovers.
   '.monaco-hover .rendered-markdown,.monaco-editor-hover .rendered-markdown{content-visibility:auto;contain-intrinsic-size:0 80px}',
+  // A detached window consolidates its source into one active history page.
+  // Keep that page's full height stable when restoring or resizing it: an
+  // offscreen 80px placeholder can otherwise clamp the saved scroll position
+  // and leave the restored viewport blank. Native multi-block hovers keep
+  // their existing content-visibility optimization.
+  '.ir-detached-hover .rendered-markdown.ir-primary-preview-target{content-visibility:visible !important;contain-intrinsic-size:none !important}',
   // L48: also virtualize the syntax-highlighted code blocks. These are
   // the dominant cost for large class hovers — many tokenized spans
   // per line × many lines = the biggest layout work. Intrinsic height
@@ -5479,6 +5494,15 @@ function irCreateDetachedHoverSnapshot(pin){
     var title=document.createElement('span');
     title.className='ir-detached-hover-title';
     title.textContent='Pinned hover';
+    title.setAttribute('role','status');
+    title.setAttribute('aria-live','polite');
+    title.setAttribute('aria-atomic','true');
+    var retry=document.createElement('button');
+    retry.className='ir-detached-hover-retry';
+    retry.type='button';
+    retry.textContent='Retry';
+    retry.disabled=true;
+    retry.setAttribute('aria-label','Retry preview');
     var close=document.createElement('button');
     close.className='ir-detached-hover-close';
     close.type='button';
@@ -5488,6 +5512,7 @@ function irCreateDetachedHoverSnapshot(pin){
     titlebar.appendChild(grip);
     titlebar.appendChild(back);
     titlebar.appendChild(title);
+    titlebar.appendChild(retry);
     titlebar.appendChild(close);
     clone.insertBefore(titlebar,clone.firstChild||null);
     var resizeEdges=['right','bottom','corner'];
@@ -5535,9 +5560,13 @@ function irCreateDetachedHoverSnapshot(pin){
       titlebar:titlebar,
       titleLabel:title,
       backButton:back,
+      retryButton:retry,
+      closeButton:close,
       previewTarget:previewTarget,
       previewRequestSeq:0,
       previewBusy:false,
+      previewError:null,
+      requestedTypeName:'',
       previewAwaitingCommit:0,
       previewCommitTimer:null,
       previewRequestTimer:null,
@@ -5587,6 +5616,11 @@ function irCreateDetachedHoverSnapshot(pin){
     back.addEventListener('click',function(e){
       try{e.preventDefault();e.stopImmediatePropagation();}catch(_){ }
       irDetachedHoverBack(state);
+    });
+    retry.addEventListener('click',function(e){
+      try{e.preventDefault();e.stopImmediatePropagation();}catch(_){ }
+      var failure=state.previewError;
+      if(failure&&!state.previewBusy)irRunDetachedTypeNameAction(state,failure.typeName,null);
     });
     var list=window.__irDetachedHovers||[];
     list.push(state);
@@ -5659,13 +5693,31 @@ function irRestoreDetachedPageScroll(state,scroll){
     sc.scrollLeft=Math.max(0,Number(scroll&&scroll.left)||0);
   }catch(_){ }
 }
+function irDetachedPreviewFailureLabel(failure){
+  var name=String(failure&&failure.typeName||'definition');
+  var reason=String(failure&&failure.reason||'');
+  if(reason==='definition-not-found')return 'No definition found for '+name;
+  if(/time(?:d out|out)/i.test(reason))return 'Preview timed out for '+name;
+  if(reason==='open-document-failed')return 'Could not read source for '+name;
+  if(/binding|disconnected|missing-anchor|renderer-window-missing/i.test(reason))return 'Preview connection lost for '+name;
+  return 'Could not preview '+name;
+}
 function irUpdateDetachedHoverChrome(state){
   try{
     if(!state)return;
     var label=state.previewBusy&&state.pendingTypeName
       ? 'Loading '+state.pendingTypeName+'…'
-      :(state.currentTypeName||'Pinned hover');
-    if(state.titleLabel)state.titleLabel.textContent=label;
+      :(state.previewError?irDetachedPreviewFailureLabel(state.previewError):(state.currentTypeName||'Pinned hover'));
+    if(state.titleLabel){state.titleLabel.textContent=label;state.titleLabel.setAttribute('title',label);}
+    if(state.root)state.root.setAttribute('aria-busy',state.previewBusy?'true':'false');
+    if(state.retryButton){
+      var retryVisible=!!(state.previewError&&state.previewError.typeName)
+        ||(state.previewBusy&&state.retryButton.classList.contains('ir-detached-hover-retry-visible'));
+      if(!retryVisible&&document.activeElement===state.retryButton&&state.closeButton)state.closeButton.focus({preventScroll:true});
+      state.retryButton.classList.toggle('ir-detached-hover-retry-visible',retryVisible);
+      state.retryButton.disabled=!retryVisible||state.previewBusy;
+      state.retryButton.setAttribute('aria-label','Retry preview'+(retryVisible?' of '+String(state.previewError&&state.previewError.typeName||state.requestedTypeName||'definition'):''));
+    }
     if(state.backButton){
       var visible=!!(state.pageStack&&state.pageStack.length);
       var enabled=visible&&!state.previewBusy;
@@ -5775,10 +5827,10 @@ function irApplyDetachedPreview(sessionKey,requestId,typeName,md){
   var state=irDetachedHoverStateForSessionKey(sessionKey);
   if(!state||!state.el)return {ok:false,reason:'missing-session'};
   requestId=Number(requestId)||0;
+  if(requestId!==Number(state.previewRequestSeq))return {ok:false,reason:'stale-request',latest:Number(state.previewRequestSeq)||0};
   if(state.lastAppliedPreview&&Number(state.lastAppliedPreview.requestId)===requestId){
     return {ok:true,id:state.id,typeName:String(state.lastAppliedPreview.typeName||''),depth:Number(state.lastAppliedPreview.depth)||0,idempotent:true};
   }
-  if(requestId!==Number(state.previewRequestSeq))return {ok:false,reason:'stale-request',latest:Number(state.previewRequestSeq)||0};
   if(state.previewRequestTimer){irClearTimer(state.previewRequestTimer);state.previewRequestTimer=null;}
   var target=irDetachedPreviewTarget(state);
   if(!target)return {ok:false,reason:'missing-target'};
@@ -5787,6 +5839,7 @@ function irApplyDetachedPreview(sessionKey,requestId,typeName,md){
     previous=irDetachedCurrentPageHistoryEntry(state,target);
     if(previous.kind!=='fragment')while(target.firstChild)target.removeChild(target.firstChild);
     if(!irRenderDetachedPreviewPage(state,target,typeName,md))throw new Error('render-failed');
+    state.previewError=null;
     state.pageStack=state.pageStack||[];
     state.pageStack.push(previous);
     if(state.pageStack.length>20)state.pageStack.splice(0,state.pageStack.length-20);
@@ -5814,9 +5867,7 @@ function irApplyDetachedPreview(sessionKey,requestId,typeName,md){
       else if(previous&&previous.kind==='md')irRenderDetachedPreviewPage(state,target,previous.typeName,previous.md);
       if(previous)irRestoreDetachedPageScroll(state,previous.scroll);
     }catch(_){ }
-    state.previewBusy=false;
-    state.pendingTypeName='';
-    irUpdateDetachedHoverChrome(state);
+    irFailDetachedPreview(sessionKey,requestId,String(error&&error.message||error));
     return {ok:false,reason:String(error&&error.message||error)};
   }
 }
@@ -5824,12 +5875,14 @@ function irCommitDetachedPreview(sessionKey,requestId){
   var state=irDetachedHoverStateForSessionKey(sessionKey);
   if(!state||!state.el)return {ok:false,reason:'missing-session'};
   requestId=Number(requestId)||0;
+  if(requestId!==Number(state.previewRequestSeq))return {ok:false,reason:'stale-request',latest:Number(state.previewRequestSeq)||0};
   if(!state.lastAppliedPreview||Number(state.lastAppliedPreview.requestId)!==requestId)return {ok:false,reason:'not-applied'};
   if(state.previewCommitTimer){irClearTimer(state.previewCommitTimer);state.previewCommitTimer=null;}
   if(state.previewRequestTimer){irClearTimer(state.previewRequestTimer);state.previewRequestTimer=null;}
   state.previewAwaitingCommit=0;
   state.previewBusy=false;
   state.pendingTypeName='';
+  state.previewError=null;
   irUpdateDetachedHoverChrome(state);
   return {ok:true,id:state.id,requestId:requestId,depth:Number(state.lastAppliedPreview.depth)||0};
 }
@@ -5840,6 +5893,7 @@ function irFailDetachedPreview(sessionKey,requestId,reason){
   if(state.previewRequestTimer){irClearTimer(state.previewRequestTimer);state.previewRequestTimer=null;}
   state.previewAwaitingCommit=0;
   state.previewBusy=false;
+  state.previewError={typeName:String(state.pendingTypeName||state.requestedTypeName||''),reason:String(reason||'failed')};
   state.pendingTypeName='';
   irUpdateDetachedHoverChrome(state);
   irHERecord('hover-detached-preview-failed',{id:state.id,requestId:Number(requestId)||0,reason:String(reason||'failed')});
@@ -5860,6 +5914,7 @@ function irDetachedHoverBack(state){
     state.previewRequestSeq=nextRequestId;
     state.previewBusy=false;
     state.pendingTypeName='';
+    state.previewError=null;
     var previous=state.pageStack.pop();
     while(target.firstChild)target.removeChild(target.firstChild);
     if(previous.kind==='fragment'&&previous.fragment){
@@ -5870,22 +5925,42 @@ function irDetachedHoverBack(state){
       irRenderDetachedPreviewPage(state,target,previous.typeName,previous.md);
     }
     irRestoreDetachedPageScroll(state,previous.scroll);
-    try{requestAnimationFrame(function(){if(state.el)irRestoreDetachedPageScroll(state,previous.scroll);});}catch(_){ }
+    // Restored native blocks can acquire their real height after the first
+    // paint (content-visibility). Retry a few frames instead of accepting an
+    // offset clamped against their temporary intrinsic height. A newer
+    // navigation must never inherit this page's delayed scroll restoration.
+    try{
+      var restoreAttempts=0;
+      var restoreBackScroll=function(){
+        if(!state.el||Number(state.previewRequestSeq)!==nextRequestId)return;
+        irRestoreDetachedPageScroll(state,previous.scroll);
+        var sc=irPrimaryHoverScroller(state.root);
+        if(sc&&++restoreAttempts<4&&(Math.abs(sc.scrollTop-Number(previous.scroll&&previous.scroll.top||0))>1
+          ||Math.abs(sc.scrollLeft-Number(previous.scroll&&previous.scroll.left||0))>1))requestAnimationFrame(restoreBackScroll);
+      };
+      requestAnimationFrame(restoreBackScroll);
+    }catch(_){ }
     irUpdateDetachedHoverChrome(state);
     irHERecord('hover-detached-preview-back',{id:state.id,depth:state.pageStack.length,requestId:state.previewRequestSeq});
     return true;
   }catch(_){return false}
 }
 function irRunDetachedTypeLinkAction(state,link,e){
+  if(!state||!link)return false;
+  return irRunDetachedTypeNameAction(state,String(link.getAttribute&&link.getAttribute('data-type')||''),e);
+}
+function irRunDetachedTypeNameAction(state,typeName,e){
   try{
-    if(!state||!link)return false;
-    var typeName=String(link.getAttribute&&link.getAttribute('data-type')||'');
+    if(!state||!state.el)return false;
+    typeName=String(typeName||'');
     if(!typeName||typeName.length<=2)return false;
     if(e){try{e.preventDefault();e.stopImmediatePropagation();}catch(_){ }}
     if(state.previewBusy)return true;
     if(String(state.currentTypeName||'')===typeName)return true;
     var requestId=(Number(state.previewRequestSeq)||0)+1;
     state.previewRequestSeq=requestId;
+    state.previewError=null;
+    state.requestedTypeName=typeName;
     if(e&&(e.metaKey||e.ctrlKey)){
       state.previewBusy=false;
       state.pendingTypeName='';
@@ -10460,7 +10535,8 @@ function irDecoratorNamesInLine(line){
 }
 function irCollectTypeShapedCandidates(text,skip,types,seen,maxChars,maxLines){
   var src=String(text||'');
-  var lines=src.split(/\\n/);
+  // Limit temporary candidate indexing only; never slice the displayed source.
+  var lines=src.split(/\\n/,maxLines);
   var used=0;
   var re=/\\b[A-Z_][A-Za-z0-9_]{2,}\\b/g;
   var constants=[],constantSeen={},deferred=[],deferredSeen={};
