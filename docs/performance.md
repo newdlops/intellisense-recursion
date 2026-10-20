@@ -1,5 +1,94 @@
 # Renderer performance
 
+## Symbols search release 0.2.6054 / patch 327
+
+2026-10-20. Typed identifier searches in long pinned definitions now filter
+whole matching identifiers in the native regexp engine before classifying
+them in JavaScript. Searches still cover the entire original page. Bounded
+262,144-character slices yield and reject stale work; crossing identifiers
+remain whole and context checks use original offsets. Empty queries, queries
+with non-identifier characters and queries longer than 64 characters use the
+existing scanner. Result order, seed priority, matching rules and the
+200-result/more indicator are preserved.
+No source, comments, docstrings, tokens, scrolling or history are shortened,
+and no retained index, dependency, control or style is added.
+
+Published 0.2.6053 and the new generated scanner were measured in the same
+VS Code 1.142.0 renderer on macOS 26.4 ARM64. These are interleaved medians
+of seven samples after two warm-ups, with native timers and a mock page/session.
+They **exclude** DOM access, the existing 100ms debounce, Quick Pick, definition
+providers and transport, and are not end-to-end interaction or process CPU/RSS
+measurements.
+
+| Scan workload | Published | Optimized | Timer yields |
+| --- | ---: | ---: | ---: |
+| 10,025 detail lines, tail type | 56.9ms | 9.9ms | 12 → 2 |
+| Same source, tail lowercase callable | 56.3ms | 10.0ms | 12 → 2 |
+| Same source, absent name | 55.3ms | 9.9ms | 12 → 2 |
+| Same source, empty query | 59.5ms | 59.2ms | 12 → 12 |
+| 300,000-character identifier | 5.0ms | 5.1ms | 1 → 1 |
+| Dense early matches | 4.6ms | 4.7ms | 1 → 1 |
+
+The targeted long-source typed searches took about 82% less scan time in this
+workload. Short, empty and dense searches are effectively unchanged; the long
+single-identifier case is slightly slower. The [renderer results](../reports/optimization-2026-10-20/search-renderer.json)
+include all eight workloads. The [Node VM report](../reports/optimization-2026-10-20/search-node.json)
+excludes timer delays and contains **3,560 exact result comparisons** against a
+checked-in frozen published scanner. Cases cover ordered results and overflow,
+Unicode/special/long queries, numeric prefixes, prototype-like names, callable
+contexts, chunk boundaries, huge identifiers, late names and cancellation.
+The frozen fixture works without Git history and is excluded from VSIX output.
+
+### Verification and limits
+
+The minified 0.2.6054 bundle passed **21 production checks** with capture enabled, including
+complete text/token/scroll preservation, source-tail selection, Pin, Back,
+independent panels, cancellation, stale callbacks, errors, recovery and startup.
+The same three symbol checks passed at 1024 × 768 with screenshots. Fifteen
+development checks passed for the scan comparison, renderer resource budgets,
+cache budgets, file links, isolated previews and native sizing. The existing
+pointer workload performed zero document queries and geometry reads for 1,000
+movement pairs; 40 paint batches used two queries and zero geometry reads;
+none of 64 disposed editor probes remained retained. [Raw resource results](../reports/optimization-2026-10-20/renderer-regression.json)
+record the scoped workloads, not a whole-process resource claim.
+
+Earlier capture runs exposed a second Pin returning `no-native-hover`. A trace
+showed the matching native widget with complete source and positive geometry,
+but opacity zero during its `fade-in`. Pin's retry could hide it just as its
+first frame became visible, restarting that animation on every attempt.
+Pin now treats this matching, natively visible, non-hidden source as rendering
+in progress and waits within the existing deadline. Other lifecycle visibility
+checks still reject transparent sources; no opacity or animation is forced.
+The Pin regression holds the real native frame transparent for 900ms, after
+an intentionally empty provider response, and requires no refires during that
+hold. This check fails on the published 0.2.6053 bundle and passes on the fix.
+The final full capture run and compact symbol run both pass. This verifies the
+observed fade-in race rather than claiming every native hover race is fixed.
+
+Screenshots were inspected at 1440 × 900 and 1024 × 768 for the dense native
+picker, tail result, restored highlighted final line, error, empty state and
+two independent panels including a 250px panel. Keyboard Pin and its narrow
+independent window were also inspected. The existing dark theme,
+tokens, layout, controls and keyboard focus treatment are preserved.
+Impeccable's scoped detector returned no findings. CDP viewport/document-focus
+emulation does not certify physical OS focus routing. Other VS Code versions,
+operating systems, themes, screen readers and mobile/tablet devices were not
+checked. [Validation record](../reports/optimization-2026-10-20/validation.json)
+retains source and bundle fingerprints and run outcomes.
+
+```sh
+node scripts/benchmark-hover-symbol-search.cjs /tmp/ir-symbol-search.json
+
+npm run bundle
+IR_VSCODE_VERSION=1.142.0 IR_TEST_PRODUCTION_INJECTION=1 IR_E2E_FILES=renderer-startup.test.js,hover-link-candidates.test.js,hover-content.test.js,preview-content.test.js,preview-content-renderer.test.js,detached-preview-recovery.test.js,pin-hover.test.js,hover-symbol-picker.test.js TEST_FIXTURE=python node out/test/runTest.js
+IR_VSCODE_VERSION=1.142.0 IR_TEST_PRODUCTION_INJECTION=1 IR_SYMBOL_VIEWPORT=compact IR_E2E_FILES=hover-symbol-picker.test.js TEST_FIXTURE=python node out/test/runTest.js
+
+npm run compile
+IR_VSCODE_VERSION=1.142.0 IR_PERF_LABEL=release-6054 IR_E2E_FILES=renderer-performance.test.js,hover-symbol-search-performance.test.js,preview-cache-budget.test.js,preview-file-link.test.js,hover.test.js IR_E2E_GREP='Renderer performance|Hover symbol search performance|Preview cache resource budgets|Preview file path links|detached hover links use an isolated end-to-end preview protocol|content-aware native hover stays adjacent' TEST_FIXTURE=python node out/test/runTest.js
+
+npm run bundle
+```
+
 ## Keyboard symbols release 0.2.6053 / patch 326
 
 2026-10-20. Pinned hovers offer a named Symbols button using the existing native

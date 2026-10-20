@@ -1,0 +1,89 @@
+{
+  "baselineCommit": "6b7d3c6e5862d3f466ce91c734ffc13eaab3bc47",
+  "baselineFactorySha256": "9090268ced7eff1f448be89ed642da72770ac6244fb890740f36cc4e160507c9",
+  "currentRendererSha256": "c0361440129006b2d49ad1fc3c59f4ce3fcac494a8bf024d0b2c5bdbfa0e1450",
+  "scope": "Node VM scan microbenchmark; timer delay excluded; not UI latency, CPU utilization or RSS",
+  "equivalenceCases": 3560,
+  "rows": [
+    {
+      "name": "short-preview",
+      "chars": 56,
+      "baselineMs": 0.003499999999917236,
+      "currentMs": 0.004000000000019099,
+      "yields": {
+        "baseline": 1,
+        "current": 1
+      }
+    },
+    {
+      "name": "10025-lines-tail-type",
+      "chars": 361004,
+      "baselineMs": 2.2773750000000064,
+      "currentMs": 0.8591249999999491,
+      "yields": {
+        "baseline": 12,
+        "current": 2
+      }
+    },
+    {
+      "name": "10025-lines-tail-callable",
+      "chars": 361004,
+      "baselineMs": 1.8813749999999345,
+      "currentMs": 0.8462919999999485,
+      "yields": {
+        "baseline": 12,
+        "current": 2
+      }
+    },
+    {
+      "name": "10025-lines-absent",
+      "chars": 361004,
+      "baselineMs": 1.9325840000000198,
+      "currentMs": 0.8419159999999692,
+      "yields": {
+        "baseline": 12,
+        "current": 2
+      }
+    },
+    {
+      "name": "10025-lines-empty",
+      "chars": 361004,
+      "baselineMs": 12.83791599999995,
+      "currentMs": 10.78300000000013,
+      "yields": {
+        "baseline": 12,
+        "current": 12
+      }
+    },
+    {
+      "name": "300000-character-identifier",
+      "chars": 300027,
+      "baselineMs": 0.34950000000003456,
+      "currentMs": 0.57162500000004,
+      "yields": {
+        "baseline": 1,
+        "current": 1
+      }
+    },
+    {
+      "name": "dense-early-matches",
+      "chars": 34889,
+      "baselineMs": 0.04370899999980793,
+      "currentMs": 0.05733300000019881,
+      "yields": {
+        "baseline": 1,
+        "current": 1
+      }
+    },
+    {
+      "name": "long-near-miss-query",
+      "chars": 200000,
+      "baselineMs": 0.23158300000000054,
+      "currentMs": 0.2472499999998945,
+      "yields": {
+        "baseline": 1,
+        "current": 1
+      }
+    }
+  ]
+}

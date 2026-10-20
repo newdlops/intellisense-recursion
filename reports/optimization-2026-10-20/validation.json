@@ -1,0 +1,104 @@
+{
+  "createdAt": "2026-10-20 04:54:08 UTC",
+  "status": "verified 0.2.6054 build",
+  "packageVersion": "0.2.6054",
+  "rendererPatchVersion": 327,
+  "environment": {
+    "platform": "macOS 26.4 ARM64",
+    "vscode": "1.142.0",
+    "node": "22.22.2"
+  },
+  "baselineCommit": "6b7d3c6e5862d3f466ce91c734ffc13eaab3bc47",
+  "baselineFactorySha256": "9090268ced7eff1f448be89ed642da72770ac6244fb890740f36cc4e160507c9",
+  "currentRendererSha256": "c0361440129006b2d49ad1fc3c59f4ce3fcac494a8bf024d0b2c5bdbfa0e1450",
+  "shippingBundleSha256": "fa84ff1e45f8287914799e8cf84d6ccaf47e74d5e1c4e31e17ef2882264bef49",
+  "publishedBaselineBundleSha256": "688936beca2fd15196c469227afb41be044e034d388ce01a0e0a65fd09e4e331",
+  "artifact": {
+    "name": "intellisense-recursion-0.2.6054.vsix",
+    "version": "0.2.6054",
+    "files": 19,
+    "bytes": 1926989,
+    "sha256": "e17b739d8a1317f65584e7f07a98b0b9c7c65ed76d0177ab915da6e087944070",
+    "extensionSha256": "fa84ff1e45f8287914799e8cf84d6ccaf47e74d5e1c4e31e17ef2882264bef49",
+    "sidecarSha256": "b0aa881933ee4cff32e903cf21538f9ae5439983278eec041adfe8e1d57de620"
+  },
+  "equivalenceCases": 3560,
+  "finalUniqueChecksPassed": 36,
+  "compactRepeatedChecksPassed": 3,
+  "runs": [
+    {
+      "name": "initial-optimized-capture-before-Pin-fix",
+      "passed": 20,
+      "failed": 1,
+      "exitCode": 1,
+      "failure": "Second Pin returned no-native-hover."
+    },
+    {
+      "name": "published-0.2.6053-forced-paint-hold",
+      "passed": 1,
+      "failed": 1,
+      "exitCode": 1,
+      "expectedFailure": true,
+      "failure": "Treat a native fade-in as rendering in progress."
+    },
+    {
+      "name": "fixed-forced-paint-hold",
+      "passed": 2,
+      "failed": 0,
+      "exitCode": 0
+    },
+    {
+      "name": "release-6054-production-full-capture",
+      "passed": 21,
+      "failed": 0,
+      "exitCode": 0
+    },
+    {
+      "name": "release-6054-production-compact-capture",
+      "passed": 3,
+      "failed": 0,
+      "exitCode": 0
+    },
+    {
+      "name": "release-6054-development-performance-compatibility",
+      "passed": 15,
+      "failed": 0,
+      "exitCode": 0
+    }
+  ],
+  "nativePinRegression": {
+    "diagnosis": "The matching native widget had complete source, positive geometry and native isVisible=true but computed opacity=0 during fade-in. The command classified it as absent and its retry hid it just as its first frame became visible, restarting the animation.",
+    "fix": "Only for a matching, natively visible, non-hidden, laid-out source with fade-in, report rendering-pending until opacity becomes visible. Existing URI/cursor/deadline and ordinary lifecycle visibility guards remain.",
+    "test": "Hold an actual native source transparent for 900ms after one intentionally empty provider response; require successful concurrent Pin and zero refires during the hold.",
+    "forcedTransparentMs": 900,
+    "claimsEveryNativeTimingRaceFixed": false
+  },
+  "visualInspection": {
+    "viewports": [
+      "1440x900",
+      "1024x768"
+    ],
+    "panelWidthPx": 250,
+    "theme": "existing dark theme",
+    "method": "Electron CDP keyboard/pointer input; viewport and document focus emulation",
+    "inspectedCaptures": [
+      "pin-keyboard-and-narrow",
+      "detached-restored-tail",
+      "symbols-tail-match",
+      "symbols-connection-error",
+      "compact/symbols-narrow-and-independent",
+      "compact/symbols-no-matches"
+    ],
+    "findings": "No introduced layout or state defects observed in the inspected captures."
+  },
+  "review": {
+    "skill": "Impeccable optimize/polish",
+    "detectorExitCode": 0,
+    "findings": []
+  },
+  "limitations": [
+    "Scan measurements use actual generated functions with native timers and mock page/session. They exclude DOM, debounce, providers, transport and Quick Pick latency.",
+    "No whole-process CPU/GPU, RSS or whole-UI latency claims.",
+    "Other OS/VS Code versions, themes, screen readers, mobile/tablet devices and physical OS focus routing were not tested."
+  ]
+}

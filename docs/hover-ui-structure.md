@@ -56,6 +56,16 @@ stale selection after navigation/close, two independent panels, a 250px panel
 and full text/token/scroll preservation. Visual checks target real VS Code
 desktop windows at 1440 × 900 and 1024 × 768.
 
+Patch 327 keeps that contract while filtering ordinary typed identifier queries
+inside the native regexp engine. Long pages are searched in 262,144-character
+slices, extended through a crossing identifier; a remaining tail of at most
+32,768 characters joins the final slice. Each slice yields and rechecks picker,
+query, page and request identity. Context checks retain original source offsets.
+Empty, non-identifier and queries longer than 64 characters retain the original
+scanner. These are execution budgets, never content or query limits. Ordered
+seed priority, matching rules and the 200-result/more indicator stay unchanged.
+The search does not walk or mutate token nodes and adds no retained index.
+
 Reading the complete original definition is this tool's primary purpose.
 Optimization must preserve every source line, comments, docstrings, syntax
 highlighting and access to the final line in native and detached panels,
@@ -424,6 +434,16 @@ be requested again every 500ms during the existing three-second wait; a source
 already highlighting is left to finish. Concurrent commands share one operation. A changed
 editor/cursor, missing hover or unavailable renderer cannot create an empty or
 unrelated window. No default global shortcut is installed.
+
+Patch 327 also waits for a matching native hover's first visible frame. A
+native widget can report visible with complete source and positive geometry
+while its `fade-in` still has opacity zero. This is rendering in progress,
+not an absent result: reopening it can restart the animation on every poll.
+The command waits within its existing deadline without forcing opacity or
+cloning a transparent source. Native widget visibility, connected geometry,
+display/visibility, document and cursor guards still apply. Other lifecycle
+visibility checks continue to reject transparent sources. A regression holds
+the native frame transparent for 900ms and requires zero refires during it.
 
 The command targets the focused BrowserWindow. If native focus is unavailable,
 exactly one patched document must report focus; ambiguous focus fails without

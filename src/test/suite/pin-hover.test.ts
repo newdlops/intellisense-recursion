@@ -136,11 +136,33 @@ suite('Explicit hover pinning', () => {
       await evaluate(`(function(){var s=window.__irPinTest.first;s.left=48;s.top=100;s.width=s.naturalWidth=250;s.el.style.setProperty('left','48px','important');s.el.style.setProperty('top','100px','important');['width','min-width','max-width'].forEach(p=>s.el.style.setProperty(p,'250px','important'));})()`);
       await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
       suppressNextHover = true;
+      // Hold the native fade-in's transparent frame after source arrives.
+      // Pin must wait for paint instead of repeatedly hiding/reopening it.
+      await evaluate(`(function(){
+        var t=window.__irPinTest,style=document.createElement('style');
+        style.textContent='.monaco-resizable-hover .monaco-hover.fade-in{opacity:0 !important}';document.head.appendChild(style);
+        var refire=window.irRefireNativeHoverAtAnchor,read=window.irPinVisibleHover;
+        t.paintHeld=false;t.refiresDuringPaint=0;t.pendingPaintReads=0;
+        window.irRefireNativeHoverAtAnchor=function(){if(t.paintHeld)t.refiresDuringPaint++;return refire.apply(this,arguments);};
+        window.irPinVisibleHover=function(){var r=read.apply(this,arguments);if(t.paintHeld&&r.reason==='rendering-pending')t.pendingPaintReads++;return r;};
+        var release=0,watch=setInterval(function(){
+          var root=document.querySelector('.monaco-resizable-hover .monaco-hover'),r=root&&root.getBoundingClientRect();
+          if(!r||r.width<60||r.height<20||!root.textContent.includes('PIN_COMPLETE_TAIL'))return;
+          clearInterval(watch);t.paintHeld=true;t.paintWasHeld=true;
+          release=setTimeout(function(){t.paintHeld=false;style.remove();},900);
+        },20);
+        t.restorePaint=function(){clearInterval(watch);clearTimeout(release);style.remove();window.irRefireNativeHoverAtAnchor=refire;window.irPinVisibleHover=read;};
+      })()`);
       const [a, b] = await Promise.all([
         vscode.commands.executeCommand<any>(PIN_HOVER_COMMAND), vscode.commands.executeCommand<any>(PIN_HOVER_COMMAND),
       ]);
       assert.ok(a?.ok, JSON.stringify(a));
       assert.strictEqual(suppressNextHover, false, 'Pin must recover after the first native provider result is empty');
+      const paint = await evaluate('(function(){var t=window.__irPinTest;return {held:t.paintWasHeld,refires:t.refiresDuringPaint,pendingReads:t.pendingPaintReads};})()');
+      assert.strictEqual(paint.held, true, 'Exercise a real native source held at opacity zero');
+      assert.strictEqual(paint.refires, 0, 'Do not restart a native hover that is waiting to paint: ' + JSON.stringify(paint));
+      assert.ok(paint.pendingReads > 0, 'Treat a native fade-in as rendering in progress: ' + JSON.stringify(paint));
+      await evaluate('window.__irPinTest.restorePaint();delete window.__irPinTest.restorePaint;');
       assert.strictEqual(b?.id, a.id, 'Concurrent commands must share one Pin operation');
       assert.notStrictEqual(a.id, first.id);
       assert.strictEqual(await evaluate('(window.__irDetachedHovers||[]).length'), 2);
@@ -166,7 +188,7 @@ suite('Explicit hover pinning', () => {
       throw error;
     } finally {
       provider?.dispose();
-      await evaluate('window.__irTestHooks.clearDetachedHovers(\'pin-test-finally\');delete window.__irPinTest;');
+      await evaluate('if(window.__irPinTest&&window.__irPinTest.restorePaint)window.__irPinTest.restorePaint();window.__irTestHooks.clearDetachedHovers(\'pin-test-finally\');delete window.__irPinTest;');
       await vscode.commands.executeCommand('editor.action.hideHover');
       await vscode.commands.executeCommand('workbench.action.revertAndCloseActiveEditor');
       await fs.rm(directory, { recursive: true, force: true });

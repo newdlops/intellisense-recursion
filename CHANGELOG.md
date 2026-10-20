@@ -5,6 +5,18 @@ All notable changes to the IntelliSense Recursion extension.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.6054] - 2026-10-20
+
+### Changed
+
+- Reduce scan work for typed symbol searches in long pinned definitions while
+  preserving complete source, result ordering, matching rules and cancellation.
+
+### Fixed
+
+- Wait for a native hover's first visible frame when pinning, so retries do not
+  repeatedly restart its fade-in while the source is ready but still transparent.
+
 ## [0.2.6053] - 2026-10-20
 
 ### Added

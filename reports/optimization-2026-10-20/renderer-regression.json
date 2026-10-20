@@ -1,0 +1,42 @@
+{
+  "label": "release-6054",
+  "rendererBytes": 776674,
+  "pointerMotion": {
+    "moves": 1000,
+    "elapsedMs": 7.5,
+    "queries": 0,
+    "geometryReads": 0,
+    "closestCalls": 4000
+  },
+  "collections": {
+    "medianMs": 13.600000023841858,
+    "samplesMs": [
+      12.5,
+      12.699999928474426,
+      13.100000023841858,
+      13.600000023841858,
+      14.5,
+      18.100000023841858,
+      18.200000047683716
+    ]
+  },
+  "mutations": {
+    "elapsedMs": 14.100000023841858,
+    "queries": 2,
+    "geometryReads": 0,
+    "batches": 40
+  },
+  "metrics": {
+    "TaskDuration": 0.014571,
+    "ScriptDuration": 0.0010650000000000034,
+    "LayoutDuration": 0.0004609999999999996,
+    "RecalcStyleDuration": 0.0006709999999999997,
+    "LayoutCount": 1,
+    "RecalcStyleCount": 2
+  },
+  "retention": {
+    "created": 64,
+    "retainedBeforeDispose": 64,
+    "retainedAfterDispose": 0
+  }
+}

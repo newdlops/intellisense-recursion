@@ -140,7 +140,7 @@
 // If the running window still logs v<300, the new build is NOT loaded yet.
 import { parsePreviewFileLink } from './preview-file-link';
 
-export const RENDERER_PATCH_VERSION = 326;
+export const RENDERER_PATCH_VERSION = 327;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -6157,22 +6157,44 @@ window.irReadDetachedHoverSymbols=async function(sessionKey,pickerId,queryId,que
   }
   var seeds=picker.target.__irDetachedLinkTypes||[];
   for(var si=0;si<seeds.length;si++)add(seeds[si]);
-  var text=picker.text,re=/[A-Za-z_$][A-Za-z0-9_$]*/g,m,chunkEnd=0;
+  var text=picker.text,filtered=!!(text.length>IR_HOVER_EAGER_WRAP_MAX_TEXT&&query&&query.length<=64&&/^[a-z0-9_$]+$/.test(query));
+  // Filter whole ASCII identifiers in the native regexp engine instead of
+  // returning every word to JS for every keystroke. The consumed boundary
+  // prevents retrying a failed lookahead at each character of a long token.
+  // Empty, long or non-identifier queries retain the original literal filter;
+  // the query-length crossover limits regexp work, never searchable content.
+  var re=filtered?new RegExp('(?:^|[^A-Za-z0-9_$])(?=[A-Za-z0-9_$]*'+irEscapeHoverLinkRegex(query)+')([A-Za-z_$][A-Za-z0-9_$]*)','gi'):/[A-Za-z_$][A-Za-z0-9_$]*/g;
+  var m,yieldEnd=0,wordTail=filtered?/[A-Za-z0-9_$]*/y:null;
   // Selection is explicit, so scan the complete page, including the tail beyond
   // pointer indexing's prefix. Yield without walking/measuring/mutating tokens.
-  while(!more&&(m=re.exec(text))!==null){
-    if(re.lastIndex>chunkEnd){
+  for(var chunkStart=0;!more&&chunkStart<text.length;chunkStart=sliceEnd){
+    var sliceEnd=text.length,scanText=text;
+    if(filtered){
+      sliceEnd=Math.min(text.length,chunkStart+262144);
+      // Keep an identifier crossing the budget whole. This is only a search
+      // slice; source display, context checks and results use original offsets.
+      if(sliceEnd<text.length){wordTail.lastIndex=sliceEnd;var tail=wordTail.exec(text);if(tail)sliceEnd+=tail[0].length;}
+      if(text.length-sliceEnd<=32768)sliceEnd=text.length;
+      scanText=text.slice(chunkStart,sliceEnd);
       await new Promise(function(resolve){setTimeout(resolve,0);});
       if(!irDetachedSymbolPickerIsCurrent(state,picker)||picker.queryId!==queryId)return {ok:false,reason:'stale-picker'};
-      chunkEnd=re.lastIndex+32768;
     }
-    var name=m[0],before=m.index?text.charAt(m.index-1):'';
-    if(/[A-Za-z0-9_$]/.test(before))continue;
-    if(query&&name.toLowerCase().indexOf(query)<0)continue;
-    var callable=irLowerCallableName(name)&&(/^\\s*\\(/.test(text.slice(re.lastIndex,re.lastIndex+32))
-      ||/@\\s*$/.test(text.slice(Math.max(0,m.index-16),m.index))
-      ||/(?:^|\\s)(?:def|function)\\s+$/.test(text.slice(Math.max(0,m.index-48),m.index)));
-    if(known[name]||irTypeShapedName(name)||irConstantHoverLinkName(name)||callable)add(name);
+    re.lastIndex=0;
+    while(!more&&(m=re.exec(scanText))!==null){
+      if(!filtered&&re.lastIndex>yieldEnd){
+        await new Promise(function(resolve){setTimeout(resolve,0);});
+        if(!irDetachedSymbolPickerIsCurrent(state,picker)||picker.queryId!==queryId)return {ok:false,reason:'stale-picker'};
+        yieldEnd=re.lastIndex+32768;
+      }
+      var name=filtered?m[1]:m[0],end=chunkStart+re.lastIndex,index=end-name.length,before=index?text.charAt(index-1):'';
+      if(/[A-Za-z0-9_$]/.test(before))continue;
+      if(seen[name]||name.length<=2||IR_HOVER_LINK_SKIP[name]||name===state.currentTypeName)continue;
+      if(query&&name.toLowerCase().indexOf(query)<0)continue;
+      var callable=irLowerCallableName(name)&&(/^\\s*\\(/.test(text.slice(end,end+32))
+        ||/@\\s*$/.test(text.slice(Math.max(0,index-16),index))
+        ||/(?:^|\\s)(?:def|function)\\s+$/.test(text.slice(Math.max(0,index-48),index)));
+      if(known[name]||irTypeShapedName(name)||irConstantHoverLinkName(name)||callable)add(name);
+    }
   }
   if(!irDetachedSymbolPickerIsCurrent(state,picker)||picker.queryId!==queryId)return {ok:false,reason:'stale-picker'};
   picker.names=names;
@@ -6210,7 +6232,7 @@ window.irFinishDetachedHoverSymbols=function(sessionKey,pickerId,queryId,selecte
   }
   return {ok:true};
 };
-function irNativeHoverPinSourceIsVisible(pin){
+function irNativeHoverPinSourceIsVisible(pin,allowTransparent){
   try{
     if(!pin||!pin.wrapper||!document.body||!document.body.contains(pin.wrapper))return false;
     var wrapperRect=pin.wrapper.getBoundingClientRect?pin.wrapper.getBoundingClientRect():null;
@@ -6219,7 +6241,8 @@ function irNativeHoverPinSourceIsVisible(pin){
     if(!wrapperRect||wrapperRect.width<2||wrapperRect.height<2||!rootRect||rootRect.width<2||rootRect.height<2)return false;
     var ws=window.getComputedStyle?window.getComputedStyle(pin.wrapper):null;
     var rs=root&&window.getComputedStyle?window.getComputedStyle(root):null;
-    if((ws&&(ws.display==='none'||ws.visibility==='hidden'||Number(ws.opacity)===0))||(rs&&(rs.display==='none'||rs.visibility==='hidden'||Number(rs.opacity)===0)))return false;
+    if((ws&&(ws.display==='none'||ws.visibility==='hidden'))||(rs&&(rs.display==='none'||rs.visibility==='hidden')))return false;
+    if(!allowTransparent&&((ws&&Number(ws.opacity)===0)||(rs&&Number(rs.opacity)===0)))return false;
     return true;
   }catch(_){return false}
 }
@@ -6838,22 +6861,34 @@ function irDetachNativeHoverExplicitly(root){
 window.irPinVisibleHover=function(expectedUri,expectedPosition){
   try{
     if(expectedUri&&!document.hasFocus())return {ok:false,reason:'window-not-focused'};
+    var painting=false;
     var wrappers=document.querySelectorAll('.monaco-resizable-hover');
     for(var i=0;i<wrappers.length;i++){
       var wrapper=wrappers[i],root=wrapper.querySelector('.monaco-hover,.monaco-editor-hover');
-      if(!root||!irNativeHoverPinSourceIsVisible({wrapper:wrapper,root:root}))continue;
+      if(!root)continue;
+      var pinSource={wrapper:wrapper,root:root},visible=irNativeHoverPinSourceIsVisible(pinSource),owner=null;
+      if(!visible){
+        // Native fade-in can still be transparent after source/layout are
+        // ready. Reopening here restarts the animation before the next poll
+        // can observe its first paint, especially for a large definition.
+        if(!root.classList.contains('fade-in')||!irNativeHoverPinSourceIsVisible(pinSource,true))continue;
+        owner=irHoverPinOwnerForWrapper(wrapper);
+        if(!irNativeHoverWidgetSourceIsVisible(owner.widget,pinSource))continue;
+      }
       var source=root.querySelector('.rendered-markdown');
       if(!source||!String(source.textContent||'').trim())continue;
       if(expectedUri){
-        var owner=irHoverPinOwnerForWrapper(wrapper),editor=owner.editor;
+        owner=owner||irHoverPinOwnerForWrapper(wrapper);
+        var editor=owner.editor;
         var model=editor&&typeof editor.getModel==='function'?editor.getModel():null;
         if(!model||!model.uri||String(model.uri)!==String(expectedUri))continue;
         var position=editor&&typeof editor.getPosition==='function'?editor.getPosition():null;
         if(expectedPosition&&(!position||position.lineNumber!==expectedPosition.lineNumber||position.column!==expectedPosition.column))continue;
       }
+      if(!visible){painting=true;continue;}
       return irDetachNativeHoverExplicitly(root);
     }
-    return {ok:false,reason:'no-native-hover'};
+    return {ok:false,reason:painting?'rendering-pending':'no-native-hover'};
   }catch(error){return {ok:false,reason:String(error&&error.message||error)}}
 };
 function irPinHoverControlClick(e){
