@@ -5,6 +5,26 @@ All notable changes to the IntelliSense Recursion extension.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.6053] - 2026-10-20
+
+### Added
+- Browse symbols in a pinned hover with VS Code's native Quick Pick. Search
+  reaches the complete source, including names beyond the eager link prefix,
+  and Enter previews the selected symbol in the originating window. Escape
+  returns focus to the Symbols button; Back restores the full original page.
+- Keep selection lists to 200 unique matches with a prompt to narrow the
+  query. Debounce typing, yield between source chunks and reject stale query
+  or selection results after navigation, cancellation or closing the panel.
+
+### Fixed
+- Keep native Quick Pick and Command Palette controls above pinned panels.
+  Replacing the symbol picker with another native input preserves its focus.
+- Release the temporary symbol source and re-enable the action after missing
+  connection acknowledgements or failed reads, keeping current source visible.
+- Reopen Pin's hover through the owning editor's native actions and retry
+  temporarily empty results within the existing wait. A changed cursor stops
+  the operation, and highlighting already in progress is not restarted.
+
 ## [0.2.6052] - 2026-10-20
 
 ### Added

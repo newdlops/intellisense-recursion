@@ -247,6 +247,7 @@ import {
   getHoverPatchScript,
 } from './renderer-patch';
 import { createPinHoverCommand, PIN_HOVER_COMMAND } from './pin-hover-command';
+import { HoverSymbolPicker } from './hover-symbol-picker';
 
 const log = vscode.window.createOutputChannel('IntelliSense Recursion', { log: true });
 setHoverDeliverLogger(log);
@@ -1175,6 +1176,7 @@ export async function activate(context: vscode.ExtensionContext) {
   registerOpenDocIndexListeners(context);
 
   context.subscriptions.push(
+    hoverSymbolPicker,
     vscode.commands.registerCommand('intellisenseRecursion.goToType', goToTypeHandler),
     vscode.commands.registerCommand('intellisenseRecursion.previewType', previewTypeCommandHandler),
     vscode.commands.registerCommand('intellisenseRecursion.drillDown', previewTypeCommandHandler),
@@ -2894,6 +2896,7 @@ interface DetachedPreviewRequestContext {
 }
 
 const detachedPreviewSessions = new Map<string, DetachedPreviewSession>();
+const hoverSymbolPicker = new HoverSymbolPicker();
 const DETACHED_PREVIEW_SESSION_TTL_MS = 30 * 60 * 1000;
 const DETACHED_PREVIEW_SESSION_MAX = 36;
 
@@ -2963,7 +2966,7 @@ function registerDetachedPreviewSession(key: string, ws: any): DetachedPreviewSe
 
 async function evaluateDetachedPreviewRendererCall(
   ws: any,
-  method: 'irApplyDetachedPreview' | 'irCommitDetachedPreview' | 'irFailDetachedPreview',
+  method: 'irApplyDetachedPreview' | 'irCommitDetachedPreview' | 'irFailDetachedPreview' | 'irReadDetachedHoverSymbols' | 'irFinishDetachedHoverSymbols',
   args: unknown[],
 ): Promise<any> {
   if (!ws || ws.readyState !== WebSocket.OPEN) { return { ok: false, reason: 'renderer-disconnected' }; }
@@ -2985,7 +2988,7 @@ async function evaluateDetachedPreviewRendererCall(
       expression: rendererExpression,
       returnByValue: true,
       includeCommandLineAPI: true,
-      awaitPromise: false,
+      awaitPromise: true,
     }, 5000);
     return response?.result?.value ?? response?.result ?? { ok: false, reason: 'empty-renderer-result' };
   } catch (error) {
@@ -3021,13 +3024,25 @@ async function handleDetachedPreviewBinding(raw: string, ws: any): Promise<void>
     return;
   }
   if (op === 'dispose') {
+    hoverSymbolPicker.dismiss(key);
     detachedPreviewSessions.delete(key);
+    return;
+  }
+  if (op === 'symbols-dismiss') {
+    hoverSymbolPicker.dismiss(key, Number(message.pickerId));
     return;
   }
   const session = detachedPreviewSessions.get(key) ?? registerDetachedPreviewSession(key, ws);
   if (!session) { return; }
   session.lastUsed = Date.now();
   session.ws = ws;
+  if (op === 'symbols') {
+    const pickerId = Number(message.pickerId);
+    if (Number.isSafeInteger(pickerId) && pickerId > 0) {
+      hoverSymbolPicker.show(key, pickerId, (method, args) => evaluateDetachedPreviewRendererCall(ws, method, args));
+    }
+    return;
+  }
   const requestId = Math.max(0, Number(message.requestId) || 0);
   const rawPageDepth = Number(message.pageDepth);
   const pageDepth = Number.isInteger(rawPageDepth) && rawPageDepth >= 0 && rawPageDepth <= 20
@@ -12565,6 +12580,7 @@ function esc(s: string) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
 export async function deactivate() {
   extensionDeactivated = true;
+  hoverSymbolPicker.dispose();
   if (reinjectTimer) {
     clearInterval(reinjectTimer);
     reinjectTimer = undefined;

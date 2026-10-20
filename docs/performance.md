@@ -1,5 +1,87 @@
 # Renderer performance
 
+## Keyboard symbols release 0.2.6053 / patch 326
+
+2026-10-20. Pinned hovers offer a named Symbols button using the existing native
+tokens and codicon. It opens VS Code's Quick Pick: type part of a name, choose
+with arrows/Enter and preview in the originating panel. The picker searches
+the complete original page, including types and lowercase callables beyond
+the eager link prefix. Only its result list is limited to 200 unique matches;
+the source, comments, description, token nodes and history are not shortened.
+Queries debounce for 100ms and yield between matched source chunks. A temporary
+source snapshot is released on cancellation, navigation, close or failure.
+
+Picker, query, page and preview-request identities reject stale results and
+selections. A delayed dismissal of an older picker cannot close its successor.
+An unacknowledged open releases the disabled button after five seconds; read
+failures keep the page and offer another attempt through the same action.
+Native Quick Pick/Command Palette controls paint above the detached portal.
+
+Rendered tests exposed native focus work arriving after picker hide and
+definition delivery. Focus returns after bounded animation frames; keyboard,
+pointer or wheel input cancels that return. Another visible native input or
+unfocused document prevents it. Pin also reuses the native refire path bound
+to the document editor, checks the cursor before/after hide, and uses no native
+autofocus. An absent result can be requested again within the existing wait;
+highlighting in progress is not restarted. This avoids a global Show Hover
+targeting another input or delayed native hover focus disrupting the picker.
+
+### Functional and visual verification
+
+The shipping minified bundle passed **21 checks** in VS Code 1.142.0 on macOS
+ARM64: the existing 18 content/candidate/startup/recovery/Pin checks and three
+keyboard-symbol checks. Normal key/pointer events cover Pin → Symbols → query
+→ real definition delivery → Back → Close, no matches, a lowercase callable
+and type after 10,025 source-detail lines, rapid queries, cancellation, native
+command-palette replacement, independent panels, stale accepts after page/close,
+stale dismissal, missing acknowledgement, delayed reads and read errors. A late
+delivery after an actual editor click does not steal focus. Whole source text,
+ordered token classes and the exact saved scroll offset survive Back. Pin's
+provider intentionally returns empty once, then the normal command recovers.
+
+The symbol tests use deterministic language providers for a freshly created
+large file, plus the real preview builder, native renderer, public Pin command,
+Quick Pick, binding transport and definition delivery. Error/late cases control
+the binding only to reproduce failures and delays. Native startup, resize,
+source-file links and detached session isolation have separate existing checks.
+
+The final bundle passed the same three symbol checks at a 1024 × 768 desktop
+viewport. Screenshots were inspected at 1440 × 900 and 1024 × 768, including a
+250px-wide panel, a dense list, empty and delayed query states, errors, keyboard
+focus, successful preview, full highlighted tail after Back, native resize and
+Retry. The smaller viewport uses Electron CDP metrics emulation. Document focus
+emulation isolates the test host; this does not certify physical OS focus routing.
+
+Fourteen development-build compatibility/performance checks also passed. For
+1,000 pointer movement pairs, the workload used zero document queries and zero
+geometry reads (8.2ms). Forty editor paint batches used two queries and zero
+geometry reads (8.8ms); none of 64 disposed probes remained retained. The
+[raw measurements](../reports/ui-audit-2026-10-20/renderer-release-6053.json) and
+[release record](../reports/ui-audit-2026-10-20/release-0.2.6053.json) retain the
+evidence. These are workload regressions, not whole-process CPU/GPU, memory or
+general speedup claims.
+
+Impeccable's scoped detector returned no findings during implementation. Final
+source review against the [Web Interface Guidelines](https://raw.githubusercontent.com/vercel-labs/web-interface-guidelines/main/command.md)
+checked button names/semantics, decorative icons, focus-visible and disabled
+states, polite failure status, large-list handling, keyboard alternatives and
+native layering. Quick Pick is provided through the [VS Code API](https://code.visualstudio.com/api/references/vscode-api#QuickPick).
+Other operating systems, VS Code versions, physical multiple-window focus,
+light/high-contrast themes, screen readers, touch and mobile/tablet viewports
+were not checked. Source copy, body-text search and the window-cap policy
+remain separate future candidates.
+
+```sh
+npm run bundle
+IR_VSCODE_VERSION=1.142.0 IR_TEST_PRODUCTION_INJECTION=1 IR_E2E_FILES=renderer-startup.test.js,hover-link-candidates.test.js,hover-content.test.js,preview-content.test.js,preview-content-renderer.test.js,detached-preview-recovery.test.js,pin-hover.test.js,hover-symbol-picker.test.js TEST_FIXTURE=python node out/test/runTest.js
+IR_VSCODE_VERSION=1.142.0 IR_TEST_PRODUCTION_INJECTION=1 IR_SYMBOL_VIEWPORT=compact IR_E2E_FILES=hover-symbol-picker.test.js TEST_FIXTURE=python node out/test/runTest.js
+
+npm run compile
+IR_VSCODE_VERSION=1.142.0 IR_PERF_LABEL=release-6053-final IR_E2E_FILES=renderer-performance.test.js,preview-cache-budget.test.js,preview-file-link.test.js,hover.test.js IR_E2E_GREP='Renderer performance|Preview cache resource budgets|Preview file path links|detached hover links use an isolated end-to-end preview protocol|content-aware native hover stays adjacent' TEST_FIXTURE=python node out/test/runTest.js
+
+npm run bundle
+```
+
 ## Explicit Pin release 0.2.6052 / patch 325
 
 2026-10-20. Native hovers now offer a sticky Pin action and the

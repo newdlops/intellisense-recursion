@@ -28,6 +28,34 @@ only provide the automatic and user-resize upper bounds described below.
 
 ## Complete source content
 
+### Keyboard symbol selection contract (patch 326)
+
+The pinned titlebar offers a named Symbols button using the existing native
+button tokens and codicon system. From `IR: Pin Hover at Cursor`, Shift+Tab
+reaches Symbols on the first page. Enter opens VS Code's native Quick Pick;
+typing searches the complete page, arrows select and Enter previews in the
+originating panel. Escape cancels the picker and returns focus to Symbols;
+Escape in the panel still closes it and returns to the editor. Back, Retry and
+Close retain their existing behavior and focus order.
+
+The list returns at most 200 unique matches and invites a narrower query when
+there are more. This bounds selection UI only: a query can reach names after
+the eager candidate prefix, and displayed source, token nodes, scroll and
+history remain untouched. Explicit searches yield between chunks, debounce
+typing, cancel stale work and release their temporary source snapshot on hide.
+Panel/page/request identity is rechecked before accepting a selection. Closing,
+Back or another navigation dismisses the picker. Loading, empty, disconnected,
+cancelled and successful states use the native picker and existing title status.
+Definition delivery restores panel focus after the native input finishes its
+own focus work. Pointer, keyboard or wheel input cancels that deferred return,
+and another visible native input or unfocused workbench prevents it.
+
+Acceptance checks cover keyboard Pin → Symbols → selection → Back → Close,
+pointer opening, a symbol after 10,000 source lines, no matches, rapid queries,
+stale selection after navigation/close, two independent panels, a 250px panel
+and full text/token/scroll preservation. Visual checks target real VS Code
+desktop windows at 1440 × 900 and 1024 × 768.
+
 Reading the complete original definition is this tool's primary purpose.
 Optimization must preserve every source line, comments, docstrings, syntax
 highlighting and access to the final line in native and detached panels,
@@ -388,8 +416,12 @@ unfinished placeholder would lose its pending renderer callback.
 
 `IR: Pin Hover at Cursor` provides the keyboard entry point. It first pins an
 already-visible hover for the active document. If opening the palette dismissed
-it, the command uses VS Code's normal Show Hover action at the cursor and waits
-briefly for the result. Concurrent commands share one operation. A changed
+it, the command uses VS Code's native actions at the cursor and waits briefly
+for the result. Patch 326 reuses the editor-bound native refire path: global
+commands can otherwise target another input editor. Pin checks the current
+cursor before and after native hide and does not move it. An absent hover can
+be requested again every 500ms during the existing three-second wait; a source
+already highlighting is left to finish. Concurrent commands share one operation. A changed
 editor/cursor, missing hover or unavailable renderer cannot create an empty or
 unrelated window. No default global shortcut is installed.
 
@@ -404,8 +436,9 @@ Close or Escape
 inside a focused detached panel closes only that panel and returns focus to its
 connected origin editor. Background cleanup and window-cap removal do not move
 focus. Native resize, complete-source scrolling, Back, Retry, file links and
-independent windows remain release acceptance checks. Keyboard type selection
-and a different window-cap policy remain separate candidates.
+independent windows remain release acceptance checks. Patch 326's keyboard
+symbol-selection contract appears above. A different window-cap policy remains
+a separate candidate.
 
 Pin and Back share a bounded restoration after layout. Browser scroll anchoring
 is disabled in detached scrollers so it cannot select a different source block

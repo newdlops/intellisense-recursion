@@ -1,0 +1,32 @@
+{
+  "version": "0.2.6053",
+  "rendererPatch": 326,
+  "environment": {
+    "vscode": "1.142.0",
+    "platform": "darwin",
+    "architecture": "arm64"
+  },
+  "checks": {
+    "productionBundlePassed": 21,
+    "compatibilityAndPerformancePassed": 14,
+    "compactViewportRepeatedPassed": 3,
+    "distinctRegressionChecks": 35,
+    "sourceDetailLinesPreserved": 10025,
+    "viewports": [{ "width": 1440, "height": 900 }, { "width": 1024, "height": 768 }],
+    "viewportMethod": "Electron CDP device metrics, desktop mode",
+    "narrowDetachedPanelWidth": 250,
+    "interactions": ["keyboard Pin", "Shift+Tab and Enter Symbols", "type and arrow/Enter selection", "actual definition delivery", "Back and exact text/token/scroll restoration", "Escape picker cancellation", "editor focus on panel close", "pointer Symbols", "Command Palette replacement", "old dismissal ignored", "stale selection after page/close", "independent panels", "missing acknowledgement recovery", "delayed and failed reads", "user pointer input cancels late focus", "Pin recovery after one empty provider result"],
+    "reviewedStates": ["dense native list", "empty search", "delayed query", "connection error", "keyboard focus", "successful preview", "narrow independent panels", "highlighted full-source tail after Back", "native resize", "Retry"],
+    "providerScope": "Deterministic language providers for the new large fixture; real production preview builder, native renderer, Pin, Quick Pick, binding transport and definition delivery. Controlled binding for failure/late-response cases. Existing startup and detached protocol regressions remain separate.",
+    "sourceReview": ["UI Design Workflow", "Impeccable scoped detector and rendered polish", "Web Interface Guidelines scoped source review"]
+  },
+  "artifact": {
+    "name": "intellisense-recursion-0.2.6053.vsix",
+    "files": 19,
+    "bytes": 1926530,
+    "sha256": "6c80d0d8b8292e2c480298d5a2e427354d03de005060247d04671efbb92208ce",
+    "extensionSha256": "688936beca2fd15196c469227afb41be044e034d388ce01a0e0a65fd09e4e331",
+    "sidecarSha256": "b0aa881933ee4cff32e903cf21538f9ae5439983278eec041adfe8e1d57de620"
+  },
+  "limitations": ["Other operating systems and VS Code versions", "Physical multiple-window focus routing", "Light and high-contrast themes", "Screen readers", "Touch and mobile/tablet viewports", "Whole-process CPU/GPU and memory measurements"]
+}

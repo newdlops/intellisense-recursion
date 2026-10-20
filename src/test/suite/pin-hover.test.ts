@@ -90,9 +90,13 @@ suite('Explicit hover pinning', () => {
       const source = await vscode.workspace.openTextDocument(sourceUri);
       const preview = buildDefinitionPreviewResult('CompletePinnedDefinition', sourceUri, source, 0, 0, false);
       const anchor = await vscode.workspace.openTextDocument({ content: '\n'.repeat(18) + 'CompletePinnedDefinition\n', language: 'plaintext' });
+      let suppressNextHover = false;
       provider = vscode.languages.registerHoverProvider({ scheme: 'untitled', language: 'plaintext' }, {
-        provideHover: document => document.uri.toString() === anchor.uri.toString()
-          ? new vscode.Hover(new vscode.MarkdownString(preview.preview), new vscode.Range(18, 0, 18, 24)) : undefined,
+        provideHover: document => {
+          if (document.uri.toString() !== anchor.uri.toString()) { return undefined; }
+          if (suppressNextHover) { suppressNextHover = false; return undefined; }
+          return new vscode.Hover(new vscode.MarkdownString(preview.preview), new vscode.Range(18, 0, 18, 24));
+        },
       });
       const editor = await vscode.window.showTextDocument(anchor);
       editor.selection = new vscode.Selection(18, 4, 18, 4);
@@ -131,10 +135,12 @@ suite('Explicit hover pinning', () => {
         'When Back disappears, Close must retain keyboard focus');
       await evaluate(`(function(){var s=window.__irPinTest.first;s.left=48;s.top=100;s.width=s.naturalWidth=250;s.el.style.setProperty('left','48px','important');s.el.style.setProperty('top','100px','important');['width','min-width','max-width'].forEach(p=>s.el.style.setProperty(p,'250px','important'));})()`);
       await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+      suppressNextHover = true;
       const [a, b] = await Promise.all([
         vscode.commands.executeCommand<any>(PIN_HOVER_COMMAND), vscode.commands.executeCommand<any>(PIN_HOVER_COMMAND),
       ]);
       assert.ok(a?.ok, JSON.stringify(a));
+      assert.strictEqual(suppressNextHover, false, 'Pin must recover after the first native provider result is empty');
       assert.strictEqual(b?.id, a.id, 'Concurrent commands must share one Pin operation');
       assert.notStrictEqual(a.id, first.id);
       assert.strictEqual(await evaluate('(window.__irDetachedHovers||[]).length'), 2);

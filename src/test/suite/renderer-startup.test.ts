@@ -127,6 +127,9 @@ suite('Production renderer startup', () => {
           }
         } finally { await mouse('mouseReleased', handle.x + dx, handle.y + dy); }
         const resized = await snapshot();
+        // The sash extends outside the native wrapper. Move back into the
+        // content after releasing it, before waiting for screenshot/layout.
+        await mouse('mouseMoved', resized.rect.right - 24, resized.rect.top + 50);
         assert.ok(resized.rect.width > beforeResize.rect.width + dx - 10, 'Native width must follow the sash drag');
         if (dy) { assert.ok(resized.rect.height > beforeResize.rect.height + 25, 'Corner drag must expand short content vertically'); }
         assert.ok(Math.abs(resized.native.width - resized.rect.width) <= 2);

@@ -140,7 +140,7 @@
 // If the running window still logs v<300, the new build is NOT loaded yet.
 import { parsePreviewFileLink } from './preview-file-link';
 
-export const RENDERER_PATCH_VERSION = 325;
+export const RENDERER_PATCH_VERSION = 326;
 
 export function getHoverPatchScript(): string {
   return `(function(){
@@ -357,6 +357,9 @@ window.__irCleanup=function(reason){
     if(window.__irPatchEditorRetryTimer){clearTimeout(window.__irPatchEditorRetryTimer);window.__irPatchEditorRetryTimer=null;}
     window.irRefireNativeHoverAtAnchor=null;
     window.irPinVisibleHover=null;
+    window.irReadDetachedHoverSymbols=null;
+    window.irFinishDetachedHoverSymbols=null;
+    irCancelDetachedSymbolFocus();
     try{irRemoveNativePinActions();}catch(_){}
     try{irClearClickPinnedHover('patch-cleanup',false);}catch(_){}
     try{irClearDetachedHovers('patch-cleanup');}catch(_){}
@@ -686,6 +689,7 @@ style.textContent=[
   // not mistake it for the singleton widget. These high-specificity rules
   // restore the sizing that the pre-adoption .monaco-hover rule zeros out.
   '.ir-detached-hover-layer{position:fixed !important;inset:0 !important;width:100vw !important;height:100vh !important;overflow:visible !important;pointer-events:none !important;z-index:2147483646 !important}',
+  '.monaco-workbench.ir-has-detached-hovers .quick-input-widget{z-index:2147483647 !important}',
   '.ir-detached-hover.ir-detached-hover{position:absolute !important;box-sizing:border-box !important;display:flex !important;flex-direction:column !important;visibility:visible !important;overflow:hidden !important;transform:none !important;margin:0 !important;padding:0 !important;pointer-events:auto !important;cursor:default !important;background:var(--vscode-editorHoverWidget-background,var(--vscode-editor-background,Canvas)) !important;color:var(--vscode-editorHoverWidget-foreground,var(--vscode-editor-foreground,CanvasText)) !important;border:1px solid var(--vscode-focusBorder,var(--vscode-editorHoverWidget-border,rgba(128,128,128,0.85))) !important;border-radius:5px !important;box-shadow:0 6px 18px rgba(0,0,0,0.36) !important;z-index:var(--ir-detached-hover-z,1) !important}',
   '.ir-detached-hover-titlebar{position:relative !important;z-index:1 !important;display:flex !important;align-items:center !important;gap:5px !important;box-sizing:border-box !important;flex:0 0 28px !important;width:100% !important;height:28px !important;min-height:28px !important;padding:2px 3px 2px 7px !important;overflow:hidden !important;cursor:grab !important;touch-action:none !important;user-select:none !important;-webkit-user-select:none !important;background:var(--vscode-titleBar-activeBackground,var(--vscode-editorGroupHeader-tabsBackground,rgba(128,128,128,0.22))) !important;color:var(--vscode-titleBar-activeForeground,var(--vscode-foreground,CanvasText)) !important;border-bottom:1px solid var(--vscode-editorHoverWidget-border,var(--vscode-focusBorder,rgba(128,128,128,0.75))) !important}',
   '.ir-detached-hover-titlebar-grip{flex:0 0 auto !important;opacity:.72 !important;font:700 12px/1 var(--vscode-font-family,sans-serif) !important;letter-spacing:-2px !important;pointer-events:none !important}',
@@ -703,16 +707,16 @@ style.textContent=[
   '.ir-detached-hover.ir-detached-hover .ir-type-link,.ir-detached-hover.ir-detached-hover .ir-type-link *,.ir-detached-hover.ir-detached-hover a[data-ir-detached-safe-link="1"]{pointer-events:auto !important;cursor:pointer !important}',
   '.monaco-hover a:is([href^="command:intellisenseRecursion.openPreviewFile?"],[data-href^="command:intellisenseRecursion.openPreviewFile?"]){cursor:pointer !important;overflow-wrap:anywhere;text-decoration:underline}',
   '.monaco-hover a:is([href^="command:intellisenseRecursion.openPreviewFile?"],[data-href^="command:intellisenseRecursion.openPreviewFile?"]):focus-visible{outline:2px solid var(--vscode-focusBorder);outline-offset:2px}',
-  '.ir-detached-hover.ir-detached-hover button:not(.ir-detached-hover-close):not(.ir-detached-hover-back):not(.ir-detached-hover-retry),.ir-detached-hover.ir-detached-hover input,.ir-detached-hover.ir-detached-hover textarea,.ir-detached-hover.ir-detached-hover select,.ir-detached-hover.ir-detached-hover [contenteditable="true"],.ir-detached-hover.ir-detached-hover [role="button"]:not(.ir-detached-hover-close):not(.ir-detached-hover-back):not(.ir-detached-hover-retry){pointer-events:none !important}',
-  '.ir-detached-hover-back,.ir-detached-hover-close,.ir-detached-hover-retry{position:static !important;display:flex !important;align-items:center !important;justify-content:center !important;flex:0 0 24px !important;width:24px !important;height:24px !important;min-width:24px !important;min-height:24px !important;padding:0 !important;border:1px solid var(--vscode-contrastBorder,var(--vscode-focusBorder,rgba(255,255,255,0.48))) !important;border-radius:4px !important;background:var(--vscode-button-secondaryBackground,var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.42))) !important;color:var(--vscode-button-secondaryForeground,var(--vscode-foreground,CanvasText)) !important;font:700 17px/1 var(--vscode-font-family,sans-serif) !important;cursor:pointer !important;pointer-events:auto !important;opacity:1 !important;z-index:7 !important}',
+  '.ir-detached-hover.ir-detached-hover button:not(.ir-detached-hover-close):not(.ir-detached-hover-back):not(.ir-detached-hover-retry):not(.ir-detached-hover-symbols),.ir-detached-hover.ir-detached-hover input,.ir-detached-hover.ir-detached-hover textarea,.ir-detached-hover.ir-detached-hover select,.ir-detached-hover.ir-detached-hover [contenteditable="true"],.ir-detached-hover.ir-detached-hover [role="button"]:not(.ir-detached-hover-close):not(.ir-detached-hover-back):not(.ir-detached-hover-retry):not(.ir-detached-hover-symbols){pointer-events:none !important}',
+  '.ir-detached-hover-back,.ir-detached-hover-close,.ir-detached-hover-retry,.ir-detached-hover-symbols{position:static !important;display:flex !important;align-items:center !important;justify-content:center !important;flex:0 0 24px !important;width:24px !important;height:24px !important;min-width:24px !important;min-height:24px !important;padding:0 !important;border:1px solid var(--vscode-contrastBorder,var(--vscode-focusBorder,rgba(255,255,255,0.48))) !important;border-radius:4px !important;background:var(--vscode-button-secondaryBackground,var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.42))) !important;color:var(--vscode-button-secondaryForeground,var(--vscode-foreground,CanvasText)) !important;font:700 17px/1 var(--vscode-font-family,sans-serif) !important;cursor:pointer !important;pointer-events:auto !important;opacity:1 !important;z-index:7 !important}',
   '.ir-detached-hover-back{display:none !important;font-size:15px !important}',
   '.ir-detached-hover-back.ir-detached-hover-back-visible{display:flex !important}',
   '.ir-detached-hover-retry{display:none !important;flex:0 0 auto !important;width:auto !important;min-width:42px !important;padding:0 6px !important;font-size:12px !important}',
   '.ir-detached-hover-retry.ir-detached-hover-retry-visible{display:flex !important}',
-  '.ir-detached-hover-retry:disabled{opacity:.6 !important;cursor:default !important}',
-  '.ir-detached-hover-back:hover,.ir-detached-hover-retry:hover{background:var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.58)) !important}',
+  '.ir-detached-hover-retry:disabled,.ir-detached-hover-symbols:disabled{opacity:.6 !important;cursor:default !important}',
+  '.ir-detached-hover-back:hover,.ir-detached-hover-retry:hover,.ir-detached-hover-symbols:not(:disabled):hover{background:var(--vscode-toolbar-hoverBackground,rgba(128,128,128,0.58)) !important}',
   '.ir-detached-hover-close:hover{background:var(--vscode-inputValidation-errorBackground,#c42b1c) !important;color:var(--vscode-button-foreground,#fff) !important}',
-  '.ir-detached-hover-back:focus-visible,.ir-detached-hover-close:focus-visible,.ir-detached-hover-retry:focus-visible{outline:2px solid var(--vscode-focusBorder,#007fd4) !important;outline-offset:-2px !important}',
+  '.ir-detached-hover-back:focus-visible,.ir-detached-hover-close:focus-visible,.ir-detached-hover-retry:focus-visible,.ir-detached-hover-symbols:focus-visible{outline:2px solid var(--vscode-focusBorder,#007fd4) !important;outline-offset:-2px !important}',
   '.ir-detached-hover-resize-handle{position:absolute !important;display:block !important;box-sizing:border-box !important;pointer-events:auto !important;touch-action:none !important;user-select:none !important;-webkit-user-select:none !important;z-index:6 !important}',
   '.ir-detached-hover-resize-right{top:28px !important;right:0 !important;bottom:10px !important;width:6px !important;cursor:ew-resize !important}',
   '.ir-detached-hover-resize-bottom{left:0 !important;right:10px !important;bottom:0 !important;height:6px !important;cursor:ns-resize !important}',
@@ -5082,6 +5086,7 @@ function irDetachedHoverThemeHost(source){
 function irEnsureDetachedHoverLayer(source){
   try{
     var host=irDetachedHoverThemeHost(source);
+    if(host&&host.classList)host.classList.add('ir-has-detached-hovers');
     var layer=window.__irDetachedHoverLayer;
     if(layer){
       // VS Code installs the active color theme (including --vscode-* custom
@@ -5089,7 +5094,10 @@ function irEnsureDetachedHoverLayer(source){
       // so a detached hover used to lose part of the native hover theme as
       // soon as it was reparented. Keep the portal inside the same workbench;
       // position:fixed still gives every detached window viewport geometry.
-      if(host&&layer.parentNode!==host)host.appendChild(layer);
+      if(host&&layer.parentNode!==host){
+        if(layer.parentNode&&layer.parentNode.classList)layer.parentNode.classList.remove('ir-has-detached-hovers');
+        host.appendChild(layer);
+      }
       return layer;
     }
     layer=document.createElement('div');
@@ -5358,8 +5366,14 @@ function irRemoveDetachedHover(stateOrEl,reason){
       window.__irHoverDragCandidate=null;
     }
     irCancelDetachedHoverResize(state);
+    irCancelDetachedSymbolFocus(state);
+    irCancelDetachedSymbolPicker(state,false);
     var list=window.__irDetachedHovers||[];
     for(var i=list.length-1;i>=0;i--)if(list[i]===state)list.splice(i,1);
+    if(!list.length){
+      var themeHost=window.__irDetachedHoverLayer&&window.__irDetachedHoverLayer.parentNode;
+      if(themeHost&&themeHost.classList)themeHost.classList.remove('ir-has-detached-hovers');
+    }
     try{irClearHoverInteractionRefsForRoot(state.root,'detached-close');}catch(_){ }
     try{
       if(window.__irHistoryFor&&(window.__irHistoryFor===state.root||state.root.contains(window.__irHistoryFor)))irReleaseDrillHistoryForRoot(window.__irHistoryFor,'detached-close');
@@ -5515,6 +5529,17 @@ function irCreateDetachedHoverSnapshot(pin){
     back.setAttribute('aria-label','Back in pinned hover');
     back.setAttribute('title','Back');
     back.textContent='←';
+    var symbols=document.createElement('button');
+    symbols.className='ir-detached-hover-symbols';
+    symbols.type='button';
+    symbols.setAttribute('aria-label','Browse symbols in pinned hover');
+    symbols.setAttribute('title','Browse symbols');
+    symbols.setAttribute('aria-haspopup','listbox');
+    symbols.setAttribute('aria-expanded','false');
+    var symbolIcon=document.createElement('span');
+    symbolIcon.className='codicon codicon-symbol-class';
+    symbolIcon.setAttribute('aria-hidden','true');
+    symbols.appendChild(symbolIcon);
     var title=document.createElement('span');
     title.className='ir-detached-hover-title';
     title.textContent='Pinned hover';
@@ -5534,6 +5559,7 @@ function irCreateDetachedHoverSnapshot(pin){
     close.setAttribute('title','Close pinned hover');
     close.textContent='×';
     titlebar.appendChild(grip);
+    titlebar.appendChild(symbols);
     titlebar.appendChild(back);
     titlebar.appendChild(title);
     titlebar.appendChild(retry);
@@ -5584,6 +5610,10 @@ function irCreateDetachedHoverSnapshot(pin){
       titlebar:titlebar,
       titleLabel:title,
       backButton:back,
+      symbolsButton:symbols,
+      symbolPicker:null,
+      symbolPickerSeq:0,
+      symbolError:'',
       retryButton:retry,
       closeButton:close,
       previewTarget:previewTarget,
@@ -5647,6 +5677,10 @@ function irCreateDetachedHoverSnapshot(pin){
       try{e.preventDefault();e.stopImmediatePropagation();}catch(_){ }
       var failure=state.previewError;
       if(failure&&!state.previewBusy)irRunDetachedTypeNameAction(state,failure.typeName,null);
+    });
+    symbols.addEventListener('click',function(e){
+      e.preventDefault();e.stopImmediatePropagation();
+      irOpenDetachedSymbolPicker(state);
     });
     var list=window.__irDetachedHovers||[];
     list.push(state);
@@ -5752,9 +5786,13 @@ function irUpdateDetachedHoverChrome(state){
     if(!state)return;
     var label=state.previewBusy&&state.pendingTypeName
       ? 'Loading '+state.pendingTypeName+'…'
-      :(state.previewError?irDetachedPreviewFailureLabel(state.previewError):(state.currentTypeName||'Pinned hover'));
+      :(state.previewError?irDetachedPreviewFailureLabel(state.previewError):(state.symbolError||state.currentTypeName||'Pinned hover'));
     if(state.titleLabel){state.titleLabel.textContent=label;state.titleLabel.setAttribute('title',label);}
     if(state.root)state.root.setAttribute('aria-busy',state.previewBusy?'true':'false');
+    if(state.symbolsButton){
+      state.symbolsButton.disabled=!!(state.previewBusy||state.symbolPicker);
+      state.symbolsButton.setAttribute('aria-expanded',state.symbolPicker?'true':'false');
+    }
     if(state.retryButton){
       var retryVisible=!!(state.previewError&&state.previewError.typeName)
         ||(state.previewBusy&&state.retryButton.classList.contains('ir-detached-hover-retry-visible'));
@@ -5877,6 +5915,8 @@ function irApplyDetachedPreview(sessionKey,requestId,typeName,md){
   if(state.lastAppliedPreview&&Number(state.lastAppliedPreview.requestId)===requestId){
     return {ok:true,id:state.id,typeName:String(state.lastAppliedPreview.typeName||''),depth:Number(state.lastAppliedPreview.depth)||0,idempotent:true};
   }
+  irCancelDetachedSymbolPicker(state,true);
+  state.symbolError='';
   if(state.previewRequestTimer){irClearTimer(state.previewRequestTimer);state.previewRequestTimer=null;}
   var target=irDetachedPreviewTarget(state);
   if(!target)return {ok:false,reason:'missing-target'};
@@ -5930,6 +5970,7 @@ function irCommitDetachedPreview(sessionKey,requestId){
   state.pendingTypeName='';
   state.previewError=null;
   irUpdateDetachedHoverChrome(state);
+  irCompleteDetachedSymbolFocus(state,requestId);
   return {ok:true,id:state.id,requestId:requestId,depth:Number(state.lastAppliedPreview.depth)||0};
 }
 function irFailDetachedPreview(sessionKey,requestId,reason){
@@ -5942,12 +5983,16 @@ function irFailDetachedPreview(sessionKey,requestId,reason){
   state.previewError={typeName:String(state.pendingTypeName||state.requestedTypeName||''),reason:String(reason||'failed')};
   state.pendingTypeName='';
   irUpdateDetachedHoverChrome(state);
+  irCompleteDetachedSymbolFocus(state,Number(requestId));
   irHERecord('hover-detached-preview-failed',{id:state.id,requestId:Number(requestId)||0,reason:String(reason||'failed')});
   return true;
 }
 function irDetachedHoverBack(state){
   try{
     if(!state||!state.el||state.previewBusy||!state.pageStack||!state.pageStack.length)return false;
+    irCancelDetachedSymbolFocus(state);
+    irCancelDetachedSymbolPicker(state,true);
+    state.symbolError='';
     var target=irDetachedPreviewTarget(state);
     if(!target)return false;
     var nextRequestId=(Number(state.previewRequestSeq)||0)+1;
@@ -5993,6 +6038,9 @@ function irRunDetachedTypeNameAction(state,typeName,e){
     if(e){try{e.preventDefault();e.stopImmediatePropagation();}catch(_){ }}
     if(state.previewBusy)return true;
     if(String(state.currentTypeName||'')===typeName)return true;
+    irCancelDetachedSymbolFocus(state);
+    irCancelDetachedSymbolPicker(state,true);
+    state.symbolError='';
     var requestId=(Number(state.previewRequestSeq)||0)+1;
     state.previewRequestSeq=requestId;
     state.previewError=null;
@@ -6024,6 +6072,144 @@ function irRunDetachedTypeNameAction(state,typeName,e){
 window.irApplyDetachedPreview=irApplyDetachedPreview;
 window.irCommitDetachedPreview=irCommitDetachedPreview;
 window.irFailDetachedPreview=irFailDetachedPreview;
+function irCancelDetachedSymbolFocus(state){
+  var pending=window.__irDetachedSymbolFocus;
+  if(!pending||(state&&pending.state!==state))return;
+  if(pending.frame)cancelAnimationFrame(pending.frame);
+  window.__irDetachedSymbolFocus=null;
+}
+function irCompleteDetachedSymbolFocus(state,requestId){
+  var pending=window.__irDetachedSymbolFocus;
+  if(!pending||pending.state!==state)return;
+  if(pending.requestId!==requestId){irCancelDetachedSymbolFocus(state);return;}
+  // Definition providers can restore editor focus after the native picker
+  // hides. Wait for delivery, then allow its queued focus/layout work to settle.
+  var frames=0;
+  function restore(){
+    if(window.__irDetachedSymbolFocus!==pending)return;
+    if(++frames<2){pending.frame=requestAnimationFrame(restore);return;}
+    if(!state.el||!state.el.isConnected||state.previewRequestSeq!==requestId||!document.hasFocus()){
+      irCancelDetachedSymbolFocus(state);return;
+    }
+    var input=document.querySelector('.quick-input-widget');
+    var inputOpen=input&&input.getBoundingClientRect().height>0;
+    if(inputOpen&&frames<4){pending.frame=requestAnimationFrame(restore);return;}
+    irCancelDetachedSymbolFocus(state);
+    if(inputOpen)return;
+    (pending.button||state.closeButton).focus({preventScroll:true});
+  }
+  pending.frame=requestAnimationFrame(restore);
+}
+function irCancelDetachedSymbolPicker(state,notify){
+  if(!state||!state.symbolPicker)return;
+  var pickerId=state.symbolPicker.id;
+  if(state.symbolPicker.timer)irClearTimer(state.symbolPicker.timer);
+  state.symbolPicker=null;
+  if(notify)irNotifyDetachedHover(state,'symbols-dismiss',{pickerId:pickerId});
+  irUpdateDetachedHoverChrome(state);
+}
+function irOpenDetachedSymbolPicker(state){
+  if(!state||!state.el||state.previewBusy||state.symbolPicker)return false;
+  var target=irDetachedPreviewTarget(state);
+  if(!target)return false;
+  var pickerId=(Number(state.symbolPickerSeq)||0)+1;
+  state.symbolPickerSeq=pickerId;
+  state.symbolError='';
+  // Held only while the explicit picker is open, never in navigation history.
+  state.symbolPicker={id:pickerId,requestId:state.previewRequestSeq,target:target,
+    text:String(target.textContent||''),queryId:0,names:[],timer:null};
+  var pendingPicker=state.symbolPicker;
+  pendingPicker.timer=irSetTimer(function(){
+    if(state.symbolPicker!==pendingPicker)return;
+    irCancelDetachedSymbolPicker(state,true);
+    state.symbolError='Symbol picker connection lost. Try Symbols again.';
+    irUpdateDetachedHoverChrome(state);
+  },5000);
+  irUpdateDetachedHoverChrome(state);
+  if(irNotifyDetachedHover(state,'symbols',{pickerId:pickerId}))return true;
+  irCancelDetachedSymbolPicker(state,false);
+  state.symbolError='Symbol picker connection lost. Try Symbols again.';
+  irUpdateDetachedHoverChrome(state);
+  state.symbolsButton.focus({preventScroll:true});
+  return false;
+}
+function irDetachedSymbolPickerIsCurrent(state,picker){
+  return !!(state&&state.el&&state.el.isConnected&&state.symbolPicker===picker
+    &&!state.previewBusy&&state.previewRequestSeq===picker.requestId
+    &&irDetachedPreviewTarget(state)===picker.target);
+}
+window.irReadDetachedHoverSymbols=async function(sessionKey,pickerId,queryId,query){
+  var state=irDetachedHoverStateForSessionKey(sessionKey),picker=state&&state.symbolPicker;
+  if(!picker||picker.id!==Number(pickerId)||!irDetachedSymbolPickerIsCurrent(state,picker))return {ok:false,reason:'stale-picker'};
+  queryId=Number(queryId)||0;
+  if(queryId<=picker.queryId)return {ok:false,reason:'stale-query'};
+  picker.queryId=queryId;
+  if(picker.timer){irClearTimer(picker.timer);picker.timer=null;}
+  picker.names=[];
+  query=String(query||'').trim().toLowerCase();
+  var names=[],seen=Object.create(null),more=false;
+  var known=picker.target.__irHoverLinkCandidates||{};
+  function add(name){
+    if(!name||name.length<=2||IR_HOVER_LINK_SKIP[name]||seen[name]||name===state.currentTypeName
+      ||(query&&name.toLowerCase().indexOf(query)<0))return;
+    seen[name]=1;
+    if(names.length<200)names.push(name);else more=true;
+  }
+  var seeds=picker.target.__irDetachedLinkTypes||[];
+  for(var si=0;si<seeds.length;si++)add(seeds[si]);
+  var text=picker.text,re=/[A-Za-z_$][A-Za-z0-9_$]*/g,m,chunkEnd=0;
+  // Selection is explicit, so scan the complete page, including the tail beyond
+  // pointer indexing's prefix. Yield without walking/measuring/mutating tokens.
+  while(!more&&(m=re.exec(text))!==null){
+    if(re.lastIndex>chunkEnd){
+      await new Promise(function(resolve){setTimeout(resolve,0);});
+      if(!irDetachedSymbolPickerIsCurrent(state,picker)||picker.queryId!==queryId)return {ok:false,reason:'stale-picker'};
+      chunkEnd=re.lastIndex+32768;
+    }
+    var name=m[0],before=m.index?text.charAt(m.index-1):'';
+    if(/[A-Za-z0-9_$]/.test(before))continue;
+    if(query&&name.toLowerCase().indexOf(query)<0)continue;
+    var callable=irLowerCallableName(name)&&(/^\\s*\\(/.test(text.slice(re.lastIndex,re.lastIndex+32))
+      ||/@\\s*$/.test(text.slice(Math.max(0,m.index-16),m.index))
+      ||/(?:^|\\s)(?:def|function)\\s+$/.test(text.slice(Math.max(0,m.index-48),m.index)));
+    if(known[name]||irTypeShapedName(name)||irConstantHoverLinkName(name)||callable)add(name);
+  }
+  if(!irDetachedSymbolPickerIsCurrent(state,picker)||picker.queryId!==queryId)return {ok:false,reason:'stale-picker'};
+  picker.names=names;
+  return {ok:true,names:names,more:more};
+};
+window.irFinishDetachedHoverSymbols=function(sessionKey,pickerId,queryId,selected,restoreFocus,error){
+  var state=irDetachedHoverStateForSessionKey(sessionKey),picker=state&&state.symbolPicker;
+  if(!picker||picker.id!==Number(pickerId)||!irDetachedSymbolPickerIsCurrent(state,picker))return {ok:false,reason:'stale-picker'};
+  selected=String(selected||'');
+  var staleSelection=!!(selected&&(picker.queryId!==Number(queryId)||picker.names.indexOf(selected)<0));
+  irCancelDetachedSymbolPicker(state,false);
+  state.symbolError=error?'Could not read symbols. Try Symbols again.':'';
+  irUpdateDetachedHoverChrome(state);
+  // Native Quick Pick first restores its own workbench focus. Return to the
+  // originating panel only while this document still owns focus.
+  var nativeInput=document.querySelector('.quick-input-widget');
+  var anotherInputOpen=nativeInput&&nativeInput.getBoundingClientRect().height>0;
+  if(restoreFocus&&document.hasFocus()){
+    if(selected&&!staleSelection){
+      if(!anotherInputOpen)state.closeButton.focus({preventScroll:true});
+    }else{
+      irCancelDetachedSymbolFocus();
+      window.__irDetachedSymbolFocus={state:state,requestId:state.previewRequestSeq,button:state.symbolsButton,frame:0};
+      irCompleteDetachedSymbolFocus(state,state.previewRequestSeq);
+    }
+  }
+  if(staleSelection)return {ok:false,reason:'stale-selection'};
+  if(selected){
+    var started=irRunDetachedTypeNameAction(state,selected,null);
+    if(started&&state.previewBusy){
+      irCancelDetachedSymbolFocus();
+      window.__irDetachedSymbolFocus={state:state,requestId:state.previewRequestSeq,frame:0};
+    }
+    return {ok:started};
+  }
+  return {ok:true};
+};
 function irNativeHoverPinSourceIsVisible(pin){
   try{
     if(!pin||!pin.wrapper||!document.body||!document.body.contains(pin.wrapper))return false;
@@ -6497,16 +6683,21 @@ window.irRefireNativeHoverAtAnchor=async function(anchor){
       return {ok:false,reason:'missing-native-hover-actions'};
     }
     var position={lineNumber:anchor.line+1,column:anchor.character+1};
+    function cursorMatches(){var p=editor.getPosition();return !!(p&&p.lineNumber===position.lineNumber&&p.column===position.column);}
+    if(anchor.onlyAtCursor&&!cursorMatches())return {ok:false,reason:'anchor-position-changed'};
     window.__irNativeHoverRefireUntil=Date.now()+1600;
     await hide.run();
     if(!matches(editor))return {ok:false,reason:'anchor-editor-changed'};
-    editor.setPosition(position);
-    if(typeof editor.revealPositionInCenterIfOutsideViewport==='function')editor.revealPositionInCenterIfOutsideViewport(position);
+    if(anchor.onlyAtCursor&&!cursorMatches())return {ok:false,reason:'anchor-position-changed'};
+    if(!anchor.onlyAtCursor){
+      editor.setPosition(position);
+      if(typeof editor.revealPositionInCenterIfOutsideViewport==='function')editor.revealPositionInCenterIfOutsideViewport(position);
+    }
     editor.focus();
     // These public Monaco actions capture this editor instance. Global
     // executeCommand can resolve both commands to a different input editor.
     // Native hide cancels the old result, so show re-queries the HoverProvider.
-    await show.run({focus:'autoFocusImmediately'});
+    await show.run({focus:anchor.onlyAtCursor?'noAutoFocus':'autoFocusImmediately'});
     return {ok:true,editorId:editor.getId(),uri:anchor.uri};
   }catch(err){return {ok:false,reason:String(err&&err.message||err)}}
 };
@@ -6700,6 +6891,7 @@ function irPinHoverControlPointerDown(e){
 }
 function irDetachedHoverEscape(e){
   if(!e)return;
+  irCancelDetachedSymbolFocus();
   var scrollKey=/^(ArrowUp|ArrowDown|ArrowLeft|ArrowRight|PageUp|PageDown|Home|End| )$/.test(e.key);
   if(e.key!=='Escape'&&!scrollKey)return;
   var state=irDetachedHoverStateFromElement(e.target);
@@ -6710,6 +6902,7 @@ function irDetachedHoverEscape(e){
   irRemoveDetachedHover(state,'keyboard-escape');
 }
 function irDetachedHoverWheel(e){
+  irCancelDetachedSymbolFocus();
   irCancelDetachedScrollRestore(irDetachedHoverStateFromElement(e&&e.target));
 }
 function irClearClickPinnedHover(reason,requestHide){
@@ -6746,6 +6939,7 @@ function irClearClickPinnedHover(reason,requestHide){
 function irClickPinPointerDown(e){
   try{
     if(!IR_HOVER_NATIVE_ONLY||!e)return;
+    irCancelDetachedSymbolFocus();
     if(window.PointerEvent&&e.type==='mousedown')return;
     if(typeof e.button==='number'&&e.button!==0)return;
     var target=irEventElement(e.target);

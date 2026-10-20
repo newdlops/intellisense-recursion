@@ -12,6 +12,7 @@ VS Code's hover tooltips show type information but the text is static. This exte
 - **Recursive navigation**: Types in the definition preview are also clickable — keep drilling down.
 - **Preview recovery**: Detached previews explain lookup failures and offer Retry while keeping the current source and scroll position visible.
 - **Pin without dragging**: Use Pin in a hover or run **IR: Pin Hover at Cursor** from the Command Palette. Close a focused pinned window with Escape to return to the editor.
+- **Keyboard symbol navigation**: In a pinned hover, choose **Browse symbols** to search the complete source in VS Code's Quick Pick. After keyboard Pin, press **Shift+Tab**, then **Enter** to open the list. Type part of a name, use the arrow keys and Enter to preview it, or Escape to return to the panel.
 
 ## How It Works
 

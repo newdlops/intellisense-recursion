@@ -32,19 +32,40 @@ export function createPinHoverCommand(dependencies: PinHoverDependencies): () =>
       await dependencies.ensureRenderer();
       const expression = `(function(){return typeof window.irPinVisibleHover==='function'
         ?window.irPinVisibleHover(${JSON.stringify(uri)},${JSON.stringify({ lineNumber: position.line + 1, column: position.character + 1 })}):{ok:false,reason:'controls-not-ready'};})()`;
+      const showHover = async () => {
+        if (!anchorIsCurrent()) { return; }
+        await vscode.commands.executeCommand('workbench.action.focusActiveEditorGroup');
+        if (!anchorIsCurrent()) { return; }
+        // Reuse the native refire path bound to this editor. A global command
+        // can resolve to a Quick Pick input instead of the document editor.
+        const shown = await dependencies.evaluate(`(function(){return typeof window.irRefireNativeHoverAtAnchor==='function'
+          ?window.irRefireNativeHoverAtAnchor(${JSON.stringify({ uri, line: position.line, character: position.character, onlyAtCursor: true })}):{ok:false};})()`);
+        if (!shown.ok && anchorIsCurrent()) {
+          await vscode.commands.executeCommand('editor.action.hideHover');
+          if (anchorIsCurrent()) { await vscode.commands.executeCommand('editor.action.showHover'); }
+        }
+      };
       if (!anchorIsCurrent()) { return { ok: false, reason: 'anchor-editor-changed' }; }
       let result = await dependencies.evaluate(expression);
       if (result.ok) { return result; }
       const retryable = (reason?: string) => reason === 'no-native-hover' || reason === 'rendering-pending';
       if (!retryable(result.reason)) { throw new Error(result.reason || 'pin-failed'); }
-      if (result.reason === 'no-native-hover') { await vscode.commands.executeCommand('editor.action.showHover'); }
+      if (result.reason === 'no-native-hover') { await showHover(); }
       const deadline = Date.now() + 3000;
+      let nextShow = Date.now() + 500;
       while (Date.now() < deadline && anchorIsCurrent()) {
         await new Promise(resolve => setTimeout(resolve, 100));
         if (!anchorIsCurrent()) { break; }
         result = await dependencies.evaluate(expression);
         if (result.ok) { return result; }
         if (!retryable(result.reason)) { throw new Error(result.reason || 'pin-failed'); }
+        // A preceding native dismissal or a temporarily empty provider can
+        // win the first Show Hover. Retry only while no hover is visible;
+        // never restart an asynchronously highlighting source block.
+        if (result.reason === 'no-native-hover' && Date.now() >= nextShow) {
+          await showHover();
+          nextShow = Date.now() + 500;
+        }
       }
       if (!anchorIsCurrent()) { return { ok: false, reason: 'anchor-editor-changed' }; }
       void vscode.window.showInformationMessage(result.reason === 'rendering-pending'
