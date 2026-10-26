@@ -21,9 +21,9 @@ export interface MainInspectorStartup<T> {
 }
 const creationTimes = new Map<number, Promise<string>>();
 
-function capture(file: string, args: string[], allowEmptyExit = false): Promise<string> {
+function capture(file: string, args: string[], allowEmptyExit = false, timeoutMs = 3000): Promise<string> {
   return new Promise((resolve, reject) => {
-    execFile(file, args, { encoding: 'utf8', timeout: 3000, maxBuffer: 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
+    execFile(file, args, { encoding: 'utf8', timeout: timeoutMs, maxBuffer: 1024 * 1024, windowsHide: true }, (error, stdout, stderr) => {
       if (error && !(allowEmptyExit && error.code === 1 && !stdout.trim() && !stderr.trim())) { reject(error); }
       else { resolve(stdout); }
     });
@@ -35,8 +35,9 @@ async function creationIdentity(pid: number): Promise<string> {
   let pending = creationTimes.get(pid);
   if (!pending) {
     pending = (async () => {
+      // Cold PowerShell startup can exceed the fast listener-query budget; identity is still required.
       const stamp = process.platform === 'win32'
-        ? await capture('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks`])
+        ? await capture('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', `(Get-Process -Id ${pid}).StartTime.ToUniversalTime().Ticks`], false, 10_000)
         : await capture(process.platform === 'darwin' ? '/bin/ps' : 'ps', ['-p', String(pid), '-o', 'lstart=']);
       if (!stamp.trim()) { throw new Error(`Cannot verify creation time of main PID ${pid}`); }
       return `${pid}:${stamp.trim()}`;

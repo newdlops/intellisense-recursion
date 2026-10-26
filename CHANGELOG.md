@@ -5,6 +5,11 @@ All notable changes to the IntelliSense Recursion extension.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.6056] - 2026-10-26
+
+- Allow up to 10 seconds for cold Windows process creation-time verification, while keeping listener probes at 3 seconds and never repeating debugger activation.
+- Cover slow metadata subprocess startup, cached reconnects and the single-activation invariant with an actual delayed child-process regression.
+
 ## [0.2.6055] - 2026-10-26
 
 ### Fixed
