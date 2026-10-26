@@ -5,6 +5,19 @@ All notable changes to the IntelliSense Recursion extension.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/).
 
+## [0.2.6055] - 2026-10-26
+
+### Fixed
+
+- Coordinate main-inspector activation with IntelliJ Styled Search across extension hosts.
+  Retry discovery without repeatedly signalling the Electron main process.
+- Reuse the verified endpoint during periodic renderer patch refreshes and reconnects.
+- Clean up only renderers owned by this extension host; preserve peer-window and shared-workspace patches during reloads.
+- Discover PID-owned loopback listeners, including dedicated addresses and arbitrary ports;
+  refuse unrelated main-process fallbacks. Hover navigation, pinning, resizing, symbol
+  search and their existing renderer optimizations remain available.
+- Add multi-process startup, PID-reuse, endpoint-ownership and renderer-reconnect regressions.
+
 ## [0.2.6054] - 2026-10-20
 
 ### Changed

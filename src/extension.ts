@@ -233,6 +233,7 @@ import {
   findInspectorWebSocketUrlForPid,
   setCdpDiscoveryLogger,
 } from './cdp-discovery';
+import { acquireMainInspector } from './main-inspector-lifecycle';
 import {
   makeRendererEvalExpression,
   cdpRequest,
@@ -367,6 +368,8 @@ let hoverPatchActive = false;
 // Current main-process CDP WebSocket, tracked so reconnect cleanup only
 // clears the listener that originally owned the socket.
 let mainWsRef: WebSocket | null = null;
+// Unique to this extension-host lifetime, including extension-host-only reloads.
+const rendererOwnerId = `${process.pid}:${Date.now()}:${Math.random().toString(36).slice(2)}`;
 
 // NativeHoverRefireAnchor interface moved to ./native-refire (Phase 14 split).
 
@@ -2409,13 +2412,6 @@ async function injectRendererViaTestRemoteDebugging() {
   }
 }
 
-// L112 (2026-06-01): how many extra discovery rounds to run before giving up to the
-// 5-minute reinject safety timer. The renderer's V8 inspector occasionally takes longer
-// than the initial 500ms to start listening after SIGUSR1 (window-reload race);
-// without these retries a single miss leaves the renderer patch uninjected for
-// up to 5 minutes (drill/scan dead). cf. 2026-06-01 10:46 injection failure.
-const IR_INJECT_DISCOVERY_RETRIES = 4;
-
 async function injectRenderer() {
   if (isTestRendererDebugMode()) {
     await injectRendererViaTestRemoteDebugging();
@@ -2434,38 +2430,16 @@ async function injectRenderer() {
     }
     log.info(`[inject] Main process PID: ${mainPid}`);
 
-    process.kill(mainPid, 'SIGUSR1');
-    log.info('[inject] SIGUSR1 sent, waiting for inspector...');
-    await new Promise(r => setTimeout(r, 500));
-
-    // The renderer's V8 inspector can take longer than 500ms to start listening
-    // after SIGUSR1 — especially right after a window reload, when the renderer
-    // process is still coming up. A single miss here used to fall straight
-    // through to the 5-minute reinject safety timer (setInterval in activate),
-    // leaving the renderer patch UNINJECTED: hovers still render (ext-host
-    // $provideHover is patched) but nothing wraps type-links or handles drill
-    // clicks, so drill silently dies for minutes. Observed 2026-06-01 10:46 —
-    // "no inspector WebSocket matched main PID" once on reload and drill was dead
-    // for the rest of the session. Retry discovery a few times with backoff,
-    // re-arming the inspector each round in case the first SIGUSR1 raced ahead of
-    // Electron's handler. SIGUSR1 is idempotent (re-sending when the inspector is
-    // already open is a no-op).
-    let wsUrl = await findInspectorWebSocketUrlForPid(mainPid);
-    for (let attempt = 1; !wsUrl && attempt <= IR_INJECT_DISCOVERY_RETRIES; attempt++) {
-      if (extensionDeactivated) { return; }
-      const backoffMs = 500 * attempt;
-      log.warn(`[inject] inspector not found yet (attempt ${attempt}/${IR_INJECT_DISCOVERY_RETRIES}) — re-arming + waiting ${backoffMs}ms`);
-      try { process.kill(mainPid, 'SIGUSR1'); } catch {}
-      await new Promise(r => setTimeout(r, backoffMs));
-      wsUrl = await findInspectorWebSocketUrlForPid(mainPid);
-    }
-    if (!wsUrl) {
-      log.warn('[inject] No matching CDP WebSocket URL found');
-      return;
-    }
+    const wsUrl = await acquireMainInspector(mainPid, {
+      discover: async () => (await findInspectorWebSocketUrlForPid(mainPid)) ?? undefined,
+      request: () => { if (!extensionDeactivated) { process.kill(mainPid, 'SIGUSR1'); } },
+      log: message => log.info(`[inject] ${message}`),
+    });
+    if (extensionDeactivated) { return; }
     log.info('[inject] inspector found, injecting renderer patch');
     log.info(`[inject] Connecting WebSocket...`);
     const ws = new WebSocket(wsUrl);
+    (ws as any).__irTargetWsUrl = wsUrl;
     const workspacePathForRenderer = workspaceRootFsPath() ?? '';
     const workspaceNameForRenderer = workspacePathForRenderer ? path.basename(workspacePathForRenderer) : '';
 
@@ -2502,6 +2476,7 @@ async function injectRenderer() {
             var wins = BW.getAllWindows();
             var workspacePath = ${JSON.stringify(workspacePathForRenderer)};
             var workspaceName = ${JSON.stringify(workspaceNameForRenderer)};
+            var ownerId = ${JSON.stringify(rendererOwnerId)};
             var results = [];
             function decodeMaybe(s) { try { return decodeURIComponent(String(s || '')); } catch (_) { return String(s || ''); } }
             function windowTitle(w) { try { return String((w.getTitle && w.getTitle()) || ''); } catch (_) { return ''; } }
@@ -2582,6 +2557,10 @@ async function injectRenderer() {
             }
             async function setRendererMeta(w, phase) {
               try {
+                if (!global.__irRendererOwners) { global.__irRendererOwners = new Map(); }
+                var owners = global.__irRendererOwners.get(w.id);
+                if (!owners) { owners = new Set(); global.__irRendererOwners.set(w.id, owners); }
+                owners.add(ownerId);
                 var title = windowTitle(w);
                 var url = windowUrl(w);
                 var meta = {
@@ -2702,9 +2681,9 @@ async function reinjectRenderer() {
       testMode: extensionRunsInTestMode,
     });
     if (!mainPid) { return; }
-    process.kill(mainPid, 'SIGUSR1');
-    await new Promise(r => setTimeout(r, 150));
-    const wsUrl = await findInspectorWebSocketUrlForPid(mainPid);
+    // A live client already proves the endpoint. Reapply through it without restarting Node's
+    // shared inspector or re-running process/port discovery on the periodic safety pass.
+    const wsUrl = mainWsRefTargetUrl ?? await findInspectorWebSocketUrlForPid(mainPid);
     if (!wsUrl) { return; }
 
     const ws = new WebSocket(wsUrl);
@@ -2733,6 +2712,7 @@ async function reinjectRenderer() {
             var wins = BW.getAllWindows();
             var workspacePath = ${JSON.stringify(workspacePathForRenderer)};
             var workspaceName = ${JSON.stringify(workspaceNameForRenderer)};
+            var ownerId = ${JSON.stringify(rendererOwnerId)};
             var n = 0;
             function decodeMaybe(s) { try { return decodeURIComponent(String(s || '')); } catch (_) { return String(s || ''); } }
             function windowTitle(w) { try { return String((w.getTitle && w.getTitle()) || ''); } catch (_) { return ''; } }
@@ -2800,6 +2780,10 @@ async function reinjectRenderer() {
             }
             async function setRendererMeta(w, phase) {
               try {
+                if (!global.__irRendererOwners) { global.__irRendererOwners = new Map(); }
+                var owners = global.__irRendererOwners.get(w.id);
+                if (!owners) { owners = new Set(); global.__irRendererOwners.set(w.id, owners); }
+                owners.add(ownerId);
                 var title = windowTitle(w);
                 var url = windowUrl(w);
                 var meta = {
@@ -3221,19 +3205,43 @@ async function cleanupRendererInjection(reason: string): Promise<void> {
       (async function() {
         var BW = require('electron').BrowserWindow;
         var wins = BW.getAllWindows();
+        var ownerId = ${JSON.stringify(rendererOwnerId)};
+        var ownership = global.__irRendererOwners;
         var n = 0;
         for (var i = 0; i < wins.length; i++) {
           try {
             var w = wins[i];
+            var owners = ownership && ownership.get(w.id);
+            if (!owners || !owners.delete(ownerId)) { continue; }
+            // A surviving extension host may share this renderer (e.g. the same workspace
+            // in multiple windows). Remove only confirmed dead host reservations.
+            for (var otherOwner of owners) {
+              var hostPid = Number(String(otherOwner).split(':')[0]);
+              if (!Number.isSafeInteger(hostPid) || hostPid <= 1) { continue; }
+              try { process.kill(hostPid, 0); }
+              catch(eOwner) { if (eOwner && eOwner.code === 'ESRCH') { owners.delete(otherOwner); } }
+            }
+            if (owners.size) { continue; }
+            var bridge = global.__irGoToTypeBridgeListeners && global.__irGoToTypeBridgeListeners.get(w.id);
             var attached = false;
             try { attached = w.webContents.debugger.isAttached(); } catch(eIs) {}
-            if (!attached) {
-              try { w.webContents.debugger.attach('1.3'); } catch(eAttach) { continue; }
+            if (attached) {
+              await w.webContents.debugger.sendCommand('Runtime.evaluate', {
+                expression: ${JSON.stringify(rendererExpr)}, returnByValue: true
+              });
+            } else {
+              await w.webContents.executeJavaScript(${JSON.stringify(rendererExpr)}, true);
             }
-            await w.webContents.debugger.sendCommand('Runtime.evaluate', {
-              expression: ${JSON.stringify(rendererExpr)},
-              returnByValue: true
-            });
+            // An owner can register while renderer evaluation is pending. Its replacement
+            // patch and listener must survive this older host's cleanup completion.
+            if (owners.size || ownership.get(w.id) !== owners) { continue; }
+            ownership.delete(w.id);
+            if (bridge) {
+              try { w.webContents.debugger.removeListener('message', bridge); } catch(eRemove) {}
+              if (global.__irGoToTypeBridgeListeners.get(w.id) === bridge) {
+                global.__irGoToTypeBridgeListeners.delete(w.id);
+              }
+            }
             n++;
           } catch(e) {}
         }

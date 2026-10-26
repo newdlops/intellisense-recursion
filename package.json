@@ -2,7 +2,7 @@
   "name": "intellisense-recursion",
   "displayName": "IntelliSense Recursion",
   "description": "Cmd+Click on type names in hover tooltips to navigate to definitions — like IntelliJ IDEA",
-  "version": "0.2.6054",
+  "version": "0.2.6055",
   "publisher": "newdlops",
   "license": "MIT",
   "repository": {
@@ -88,7 +88,8 @@
     "perf:1m": "npm run compile && npm run perf:generate:1m && npm run perf:run",
     "perf:keep": "PERF_CLEANUP=false npm run perf",
     "package": "npx @vscode/vsce package",
-    "deploy:local": "npm run package && code --install-extension intellisense-recursion-$npm_package_version.vsix --force && echo 'Installed! Restart VS Code to activate.'"
+    "deploy:local": "npm run package && code --install-extension intellisense-recursion-$npm_package_version.vsix --force && echo 'Installed! Restart VS Code to activate.'",
+    "test:unit": "node --test out/test/unit/*.test.js"
   },
   "devDependencies": {
     "@types/glob": "^8.1.0",

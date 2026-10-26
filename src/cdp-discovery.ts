@@ -6,13 +6,11 @@
 //   * deriveUserDataDirHint() + commandHasUserDataDir() — pair globalStorage
 //     path with `--user-data-dir=` so we can disambiguate concurrent VS Code
 //     instances.
-//   * findCurrentVSCodeMainPid() — locate THIS window's main process via
-//     user-data-dir hint, parent chain, VSCODE_PID env, then single-main
-//     fallback. Pure: the caller supplies the hint + test-mode flag.
+//   * findCurrentVSCodeMainPid() — locate THIS window's proven main ancestor.
+//     A global or environment-only PID never authorizes renderer injection.
 //   * httpGet() / evaluateInspectorExpression() /
-//     findInspectorWebSocketUrlForPid() — probe ports 9229..9249 after
-//     SIGUSR1, ask each candidate inspector for process.pid, and return the
-//     matching webSocketDebuggerUrl.
+//     findInspectorWebSocketUrlForPid() — read this PID's actual loopback listeners,
+//     verify advertised endpoint ownership and process.pid, then return its WebSocket URL.
 //
 // Cross-module dependencies kept wire-in (not imported) to avoid circular
 // imports back into extension.ts:
@@ -24,6 +22,7 @@
 
 import * as path from 'node:path';
 import WebSocket from 'ws';
+import { readMainInspectorEndpoints, mainInspectorHttpOrigin, mainInspectorWebSocketMatches } from './main-inspector-lifecycle';
 
 type Logger = { info: (msg: string) => void; warn: (msg: string) => void };
 let _logger: Logger | null = null;
@@ -93,18 +92,6 @@ export function findCurrentVSCodeMainPid(opts: FindMainPidOptions): number | nul
   for (const row of rows) { byPid.set(row.pid, row); }
   const mainRows = rows.filter(row => isVSCodeMainProcessCommand(row.command));
 
-  if (userDataDirHint) {
-    const hinted = mainRows.filter(row => commandHasUserDataDir(row.command, userDataDirHint));
-    if (hinted.length === 1) { return hinted[0].pid; }
-    if (hinted.length > 1) {
-      _logger?.warn(`[inject] multiple VS Code main processes match user-data-dir hint; skipping renderer injection (${hinted.map(row => row.pid).join(',')})`);
-      return null;
-    }
-    if (testMode) {
-      _logger?.warn(`[inject] test-mode renderer injection: no VS Code main process matched user-data-dir ${userDataDirHint}; trying extension-host parent/env PID only`);
-    }
-  }
-
   const seen = new Set<number>();
   let pid = process.pid;
   for (let depth = 0; depth < 32 && pid > 0 && !seen.has(pid); depth++) {
@@ -115,19 +102,7 @@ export function findCurrentVSCodeMainPid(opts: FindMainPidOptions): number | nul
     pid = row.ppid;
   }
 
-  const envPid = Number(process.env.VSCODE_PID || '');
-  if (envPid && byPid.has(envPid) && isVSCodeMainProcessCommand(byPid.get(envPid)!.command)) {
-    return envPid;
-  }
-
-  if (process.env.IR_SKIP_RENDERER_INJECTION === '1') {
-    _logger?.warn('[inject] test-mode renderer injection could not identify a matching VS Code main process');
-    return null;
-  }
-  if (mainRows.length === 1) { return mainRows[0].pid; }
-  if (mainRows.length > 1) {
-    _logger?.warn(`[inject] multiple VS Code main processes found; skipping ambiguous renderer injection (${mainRows.map(row => row.pid).join(',')})`);
-  }
+  _logger?.warn(`[inject] no owning VS Code ancestor found; refusing global fallback (test=${testMode}, hinted=${!!userDataDirHint}, candidates=${mainRows.length})`);
   return null;
 }
 
@@ -188,21 +163,22 @@ export function evaluateInspectorExpression(wsUrl: string, expression: string, t
 
 export async function findInspectorWebSocketUrlForPid(mainPid: number): Promise<string | null> {
   const seen = new Set<string>();
-  for (let port = 9229; port <= 9249; port++) {
+  for (const endpoint of await readMainInspectorEndpoints(mainPid)) {
     let targets: any[];
     try {
-      targets = JSON.parse(await httpGet(`http://127.0.0.1:${port}/json/list`));
+      targets = JSON.parse(await httpGet(`${mainInspectorHttpOrigin(endpoint)}/json/list`));
     } catch {
       continue;
     }
-    for (const target of targets || []) {
+    if (!Array.isArray(targets)) { continue; }
+    for (const target of targets) {
       const wsUrl = String(target?.webSocketDebuggerUrl || '');
-      if (!wsUrl || seen.has(wsUrl)) { continue; }
+      if (!mainInspectorWebSocketMatches(wsUrl, endpoint) || seen.has(wsUrl)) { continue; }
       seen.add(wsUrl);
       try {
         const pid = Number(await evaluateInspectorExpression(wsUrl, 'process.pid', 800));
         if (pid === mainPid) {
-          _logger?.info(`[inject] matched inspector port ${port} for main PID ${mainPid}`);
+          _logger?.info(`[inject] matched inspector ${endpoint.host}:${endpoint.port} for main PID ${mainPid}`);
           return wsUrl;
         }
       } catch {}
